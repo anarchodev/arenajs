@@ -310,6 +310,11 @@ typedef struct JSRequestState {
     /* Step 6: generic shadow map for base JSObjects. See JSObjectShadow
        above. Linked list rooted here, allocated lazily. */
     struct JSObjectShadow *shadow_map;
+    /* Per-request override for ctx->std_array_prototype: once a request
+       does anything that would have set ctx->std_array_prototype = false
+       on a non-arena runtime, we set this flag instead. Reads of
+       std_array_prototype in arena mode AND this flag together. */
+    bool std_array_prototype_dirty;
 } JSRequestState;
 
 struct JSRuntime {
@@ -3340,6 +3345,25 @@ static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
     entry->next = ctx->rt->req->shadow_map;
     ctx->rt->req->shadow_map = entry;
     return shadow;
+}
+
+/* arena: return the effective std_array_prototype flag — base value AND
+   no per-request dirty mark. Lets the fast-path readers stay
+   optimization-correct even when a request has done something to
+   Array.prototype (the write went to a per-request flag, base is clean). */
+static inline bool js_std_array_prototype_active(JSContext *ctx)
+{
+    return ctx->std_array_prototype && !ctx->rt->req->std_array_prototype_dirty;
+}
+
+/* arena: in non-arena mode write the base flag; in arena mode set the
+   per-request dirty mark instead so base ctx is not mutated. */
+static inline void js_std_array_prototype_mark_dirty(JSContext *ctx)
+{
+    if (js_arena_base_lo)
+        ctx->rt->req->std_array_prototype_dirty = true;
+    else
+        ctx->std_array_prototype = false;
 }
 
 /* v1 wrappers — kept so the existing global_var_obj call sites still
@@ -8856,7 +8880,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     if (p->is_prototype) {
         /* track modification of Array.prototype */
         if (unlikely(p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]))) {
-            ctx->std_array_prototype = false;
+            js_std_array_prototype_mark_dirty(ctx);
         }
     }
     return true;
@@ -10318,7 +10342,7 @@ static JSProperty *add_property(JSContext *ctx,
         if (unlikely((p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
                       p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) &&
                      __JS_AtomIsTaggedInt(prop))) {
-            ctx->std_array_prototype = false;
+            js_std_array_prototype_mark_dirty(ctx);
         }
     }
     sh = p->shape;
@@ -11007,7 +11031,7 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                              !p->fast_array ||
                              !p->extensible ||
                              p->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
-                             !ctx->std_array_prototype)) {
+                             !js_std_array_prototype_active(ctx))) {
                     goto slow_path;
                 }
                 /* add element */
@@ -19969,7 +19993,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                    p->fast_array &&
                                    p->extensible &&
                                    p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
-                                   ctx->std_array_prototype)) {
+                                   js_std_array_prototype_active(ctx))) {
                             /* fast path to add an element */
                             uint32_t array_len;
                             if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
@@ -39686,8 +39710,12 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     BCReaderState ss, *s = &ss;
     JSValue obj;
 
-    ctx->binary_object_count += 1;
-    ctx->binary_object_size += buf_len;
+    /* arena: stats only, written into base ctx; consumer is
+       JS_ComputeMemoryUsage which is a diagnostic. Skip. */
+    if (!js_arena_base_lo) {
+        ctx->binary_object_count += 1;
+        ctx->binary_object_size += buf_len;
+    }
 
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
@@ -43187,7 +43215,7 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                    p->fast_array &&
                    p->extensible &&
                    p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
-                   ctx->std_array_prototype)) {
+                   js_std_array_prototype_active(ctx))) {
             uint32_t array_len, new_len;
             if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
                        (p->shape->prop->flags & JS_PROP_WRITABLE))) {
