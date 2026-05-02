@@ -18,9 +18,13 @@
 #include "qjs-arena.h"
 
 #include <assert.h>
+#include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define ARENA_ALIGN          16
 #define ARENA_HEADER_SIZE    16   /* 8B size + 8B pad, keeps payload 16B-aligned */
@@ -65,13 +69,19 @@ static int arena_init(JSArena *a, size_t capacity)
 {
     if (capacity == 0)
         capacity = ARENA_DEFAULT_SIZE;
-    /* round capacity up to ARENA_ALIGN; aligned_alloc requires it */
-    capacity = (capacity + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
+    /* round capacity up to page size — we use mmap for page-aligned starts
+       so the thermometer can mprotect this buffer without affecting any
+       neighbouring allocation. */
+    long pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0)
+        pagesz = 4096;
+    capacity = (capacity + (size_t)pagesz - 1) & ~(size_t)(pagesz - 1);
     if (capacity < ARENA_PREFIX_LEN + ARENA_HEADER_SIZE + ARENA_ALIGN)
         return -1;
 
-    void *buf = aligned_alloc(ARENA_ALIGN, capacity);
-    if (!buf)
+    void *buf = mmap(NULL, capacity, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED)
         return -1;
     a->buf = buf;
     a->capacity = capacity;
@@ -83,7 +93,8 @@ static int arena_init(JSArena *a, size_t capacity)
 
 static void arena_destroy(JSArena *a)
 {
-    free(a->buf);
+    if (a->buf)
+        munmap(a->buf, a->capacity);
     memset(a, 0, sizeof(*a));
 }
 
@@ -192,6 +203,11 @@ void js_dual_arena_free(JSDualArena *da)
 {
     if (!da)
         return;
+    /* If the thermometer is still active on this arena, disable it before
+       tearing down — otherwise the SIGSEGV handler stays installed pointing
+       into munmap'd memory. */
+    if (js_arena_base_lo == da->base.buf)
+        js_arena_thermometer_disable();
     /* Clear the global range if it pointed at this arena, so a stale
        check after teardown doesn't read freed memory. */
     if (js_arena_base_lo == da->base.buf) {
@@ -320,3 +336,142 @@ void JS_ResetRequestArena(JSRuntime *rt)
 {
     js_dual_arena_reset_request(JS_GetDualArena(rt));
 }
+
+/* ----- thermometer -----
+ *
+ * Counts writes to the base arena via mprotect+SIGSEGV. The handler chains
+ * to the previous handler for faults outside base. Single-threaded.
+ */
+
+static volatile sig_atomic_t therm_enabled = 0;
+static struct sigaction therm_prev_sa;
+static long therm_page_size = 0;
+static size_t therm_base_pages = 0;
+static uint8_t *therm_dirty_bitmap = NULL;   /* one bit per page, 1 = dirtied since last reset */
+static size_t therm_writes = 0;
+static size_t therm_pages_dirty = 0;
+
+static void therm_chain(int sig, siginfo_t *info, void *ctx)
+{
+    if (therm_prev_sa.sa_flags & SA_SIGINFO) {
+        if (therm_prev_sa.sa_sigaction)
+            therm_prev_sa.sa_sigaction(sig, info, ctx);
+    } else if (therm_prev_sa.sa_handler == SIG_DFL) {
+        /* restore default and re-raise so we get a proper crash */
+        struct sigaction dfl = {0};
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, NULL);
+        raise(sig);
+    } else if (therm_prev_sa.sa_handler != SIG_IGN
+            && therm_prev_sa.sa_handler != NULL) {
+        therm_prev_sa.sa_handler(sig);
+    }
+}
+
+static void therm_sigsegv(int sig, siginfo_t *info, void *ctx)
+{
+    if (!therm_enabled) {
+        therm_chain(sig, info, ctx);
+        return;
+    }
+    uintptr_t addr = (uintptr_t)info->si_addr;
+    uintptr_t lo = (uintptr_t)js_arena_base_lo;
+    uintptr_t hi = (uintptr_t)js_arena_base_hi;
+    if (addr < lo || addr >= hi) {
+        therm_chain(sig, info, ctx);
+        return;
+    }
+
+    therm_writes++;
+    size_t page_idx = (addr - lo) / (size_t)therm_page_size;
+    size_t byte_idx = page_idx >> 3;
+    uint8_t bit = (uint8_t)(1u << (page_idx & 7));
+    if (!(therm_dirty_bitmap[byte_idx] & bit)) {
+        therm_dirty_bitmap[byte_idx] |= bit;
+        therm_pages_dirty++;
+    }
+
+    void *page_addr = (void *)(lo + page_idx * (size_t)therm_page_size);
+    /* mprotect is not on POSIX's async-signal-safe list, but is in practice
+       safe on Linux/glibc. If a future platform breaks this, switch to
+       userfaultfd or a snapshot+memcmp scheme. */
+    mprotect(page_addr, (size_t)therm_page_size, PROT_READ | PROT_WRITE);
+}
+
+int js_arena_thermometer_enable(void)
+{
+    if (therm_enabled)
+        return 0;
+    if (!js_arena_base_lo || !js_arena_base_hi)
+        return -1; /* freeze hasn't published the range yet */
+
+    therm_page_size = sysconf(_SC_PAGESIZE);
+    if (therm_page_size <= 0)
+        return -1;
+
+    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    if ((uintptr_t)js_arena_base_lo & (uintptr_t)(therm_page_size - 1))
+        return -1; /* base must be page-aligned (it is when mmap'd) */
+
+    therm_base_pages = base_size / (size_t)therm_page_size;
+    size_t bitmap_bytes = (therm_base_pages + 7) / 8;
+    therm_dirty_bitmap = calloc(1, bitmap_bytes ? bitmap_bytes : 1);
+    if (!therm_dirty_bitmap)
+        return -1;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = therm_sigsegv;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGSEGV, &sa, &therm_prev_sa) < 0) {
+        free(therm_dirty_bitmap);
+        therm_dirty_bitmap = NULL;
+        return -1;
+    }
+
+    if (mprotect((void *)js_arena_base_lo, base_size, PROT_READ) < 0) {
+        sigaction(SIGSEGV, &therm_prev_sa, NULL);
+        free(therm_dirty_bitmap);
+        therm_dirty_bitmap = NULL;
+        return -1;
+    }
+
+    therm_writes = 0;
+    therm_pages_dirty = 0;
+    therm_enabled = 1;
+    return 0;
+}
+
+void js_arena_thermometer_disable(void)
+{
+    if (!therm_enabled)
+        return;
+    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    mprotect((void *)js_arena_base_lo, base_size, PROT_READ | PROT_WRITE);
+    sigaction(SIGSEGV, &therm_prev_sa, NULL);
+    free(therm_dirty_bitmap);
+    therm_dirty_bitmap = NULL;
+    therm_writes = 0;
+    therm_pages_dirty = 0;
+    therm_enabled = 0;
+}
+
+void js_arena_thermometer_reset(void)
+{
+    if (!therm_enabled)
+        return;
+    /* Re-protect the entire base region in one syscall (cheap for our
+       sizes) and clear the bitmap. Pages dirtied during the next request
+       will fault and be made writable again. */
+    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    mprotect((void *)js_arena_base_lo, base_size, PROT_READ);
+    size_t bitmap_bytes = (therm_base_pages + 7) / 8;
+    memset(therm_dirty_bitmap, 0, bitmap_bytes);
+    therm_writes = 0;
+    therm_pages_dirty = 0;
+}
+
+size_t js_arena_thermometer_pages(void)  { return therm_pages_dirty; }
+size_t js_arena_thermometer_writes(void) { return therm_writes; }

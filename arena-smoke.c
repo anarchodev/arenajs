@@ -54,6 +54,11 @@ int main(void)
     JS_FreezeRuntime(rt);
     printf("frozen=%d\n", js_dual_arena_is_frozen(da));
 
+    if (js_arena_thermometer_enable() < 0) {
+        fprintf(stderr, "thermometer enable failed\n"); return 1;
+    }
+    js_arena_thermometer_reset();
+
     if (eval_print(ctx,
         "let xs = []; for (let i = 0; i < 1000; i++) xs.push(i*i); "
         "GREET('arena') + ' sum=' + xs.reduce((a,b)=>a+b,0)",
@@ -61,9 +66,15 @@ int main(void)
 
     size_t base_after_req1 = js_dual_arena_base_used(da);
     size_t req_after_req1  = js_dual_arena_request_used(da);
+    size_t pages_req1  = js_arena_thermometer_pages();
+    size_t writes_req1 = js_arena_thermometer_writes();
     printf("after request#1: base_used=%zu (delta=%zu)  request_used=%zu (delta=%zu)\n",
            base_after_req1, base_after_req1 - base_after_snapshot,
            req_after_req1,  req_after_req1  - req_after_snapshot);
+    printf("  thermometer: %zu base pages dirtied, %zu writes\n",
+           pages_req1, writes_req1);
+
+    js_arena_thermometer_reset();
 
     /* second request: expect more growth in request arena */
     if (eval_print(ctx,
@@ -71,9 +82,18 @@ int main(void)
         "ys.length",
         "request#2")) return 1;
 
+    size_t pages_req2  = js_arena_thermometer_pages();
+    size_t writes_req2 = js_arena_thermometer_writes();
     printf("after request#2: base_used=%zu  request_used=%zu\n",
            js_dual_arena_base_used(da),
            js_dual_arena_request_used(da));
+    printf("  thermometer: %zu base pages dirtied, %zu writes\n",
+           pages_req2, writes_req2);
+
+    /* Disable before the determinism checks — they call setters that
+       legitimately mutate ctx fields living in base, and we don't want
+       to count those. */
+    js_arena_thermometer_disable();
 
     /* --- determinism patch checks --- */
     /* Math.random() must return 0 until JS_SetRandomSeed is called

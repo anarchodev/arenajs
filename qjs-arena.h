@@ -75,6 +75,37 @@ JS_EXTERN void JS_FreezeRuntime(JSRuntime *rt);
 JS_EXTERN void JS_ResetRequestArena(JSRuntime *rt);
 JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
 
+/* Page-fault-based base-arena write detector — the "CoW thermometer" in
+ * ARENA_PLAN.md. After enabling, the base arena buffer is mprotect'd
+ * read-only and a SIGSEGV handler counts every write that touches it.
+ * The handler marks the offending page in a bitmap, makes the page
+ * writable, and returns so the faulting instruction succeeds.
+ *
+ * Workflow:
+ *   js_dual_arena_freeze(da);
+ *   js_arena_thermometer_enable();
+ *   for each request:
+ *     js_arena_thermometer_reset();
+ *     ... run request ...
+ *     printf("%zu pages, %zu writes\n",
+ *            js_arena_thermometer_pages(),
+ *            js_arena_thermometer_writes());
+ *   js_arena_thermometer_disable();
+ *
+ * Returns 0 on success, -1 if base hasn't been frozen yet or if installing
+ * the SIGSEGV handler / mprotect failed.
+ *
+ * Single-threaded only. The handler uses mprotect, which is not strictly
+ * async-signal-safe per POSIX but works on Linux/glibc in practice — same
+ * pattern as incremental GCs. The previous SIGSEGV handler is chained for
+ * faults outside the base arena.
+ */
+JS_EXTERN int    js_arena_thermometer_enable(void);
+JS_EXTERN void   js_arena_thermometer_disable(void);
+JS_EXTERN void   js_arena_thermometer_reset(void);
+JS_EXTERN size_t js_arena_thermometer_pages(void);
+JS_EXTERN size_t js_arena_thermometer_writes(void);
+
 #ifdef __cplusplus
 }
 #endif

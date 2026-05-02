@@ -121,6 +121,23 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   objects always take the safe (clone) path. Mechanism: process-global
   `(js_arena_base_lo, js_arena_base_hi)` set by `js_dual_arena_freeze`. One
   arena-runtime per process; documented in `qjs-arena.h`.
-- Currently on **step 1b** — guarding the internal direct-touch inc/dec
-  sites (shape, var_ref, atom) and setting up the CoW restore thermometer
-  so we can measure progress.
+- Thermometer in place. Both arenas now mmap-backed (page-aligned).
+  `js_arena_thermometer_*` mprotects base read-only and counts SIGSEGV
+  faults; the handler marks each dirtied page in a bitmap and makes the
+  page writable so the faulting instruction can succeed. Reset re-protects
+  the entire base region in one syscall.
+
+  **Baseline measurement** (post-chokepoint guard, before internal-site
+  guards) on the smoke-test workload:
+  - request#1 (loop + reduce + closure): 12 base pages dirtied, 12 writes
+  - request#2 (loop + object literals): 7 base pages dirtied, 7 writes
+
+  writes == pages because each first-write makes the page writable for the
+  rest of the request. So the metric is unique-pages-dirtied; CoW would
+  copy that many pages per request.
+
+- Currently on **step 1b** — guard the internal direct-touch inc/dec sites
+  (shape `++`/`--`, var_ref bumps, atom inc/dec) and watch the thermometer
+  drop. Then attribute any residual writes to runtime-state mutations
+  (`current_exception`, `gc_obj_list` head, `malloc_state` counters) and
+  plan their move into a per-request `JSRequestState`.
