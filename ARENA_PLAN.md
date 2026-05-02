@@ -15,6 +15,26 @@ collapses to a single bump-cursor write (~10 ns) instead of a memcpy.
 - The base arena can also be `mmap`'d shared across worker processes, but that
   is an optimization not required by the design.
 
+### Inviolate base — the load-bearing invariant
+
+The point of the design is that **no JS code can write to base, including
+pathological user code**. `globalThis.X = ...`, `Array.prototype.foo = ...`,
+`Object.defineProperty(Object, "x", ...)` — all of these must redirect to
+request-arena allocations and leave base untouched.
+
+This is the goal that justifies the entire CoW-thermometer regime. "Most
+real workloads wouldn't do this" is not an argument — if any sequence of
+JS calls can dirty a base byte, the snapshot isn't shareable across
+workers, the bump-cursor reset isn't sound, and we've built a faster
+version of the wrong thing.
+
+Practical consequence: every chokepoint that touches a base allocation
+(JSObject, JSShape, JSAtomStruct, JSString, JSContext) must either
+short-circuit (read-only) or path-copy into the request arena. The
+shape/atom overlays (steps 4 and 5) cover the property-table side of
+this. Mutations of the base JSObjects themselves require a different
+mechanism (shadowing or per-context request state) — see step 6.
+
 ## The Constraint That Shapes the Plan
 
 Prior art at `~/src/rove/src/qjs/snap.zig` ships the memcpy-restore approach:
@@ -63,7 +83,24 @@ continuous measurable variable.
    falls back to the in-place pointer.
 5. **Atom interning of new atoms.** Two-tier atom table: base atoms read-only,
    request atoms in request arena, lookup falls through.
-6. **Inline caches.** Either disable IC for base-arena shapes, or store IC
+6. **Mutations to base JSObjects themselves.** Pathological user code can do
+   `globalThis.X = ...`, `Array.prototype.foo = ...`, `Object.defineProperty(...)`
+   etc. Even with steps 4 and 5, the property-set chokepoint still writes into
+   the JSObject in base (`p->shape = new_sh`, `p->prop = new_prop`, and the
+   `pr->u.value = val` write itself if `p->prop` wasn't reallocated). Two
+   complementary sub-fixes:
+   a. **Per-context request state** — `ctx->creq` indirection like `rt->req`.
+      Move per-request mutable ctx fields (current global var bindings,
+      class_proto overrides, std_array_prototype flag, etc.) into a struct
+      in the request arena. Catches mutations rooted at ctx (the common case).
+   b. **Shadow-on-write for arbitrary base JSObjects** — when a write would
+      modify a base JSObject, allocate a fresh request-arena copy, register
+      it in a per-request shadow map (base p → request shadow), and route
+      future references via the map. Reads on unshadowed base objects stay
+      direct. This is the fully general fix and the one the original
+      "immutable internal data structures" framing pointed at; full
+      persistent-data-structure semantics for the JS object graph.
+7. **Inline caches.** Either disable IC for base-arena shapes, or store IC
    entries in a request-arena side table.
 
 ## Prerequisites
@@ -228,14 +265,15 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
     overlay (step 4).
   - **+28672 (14 B)** — `JS_DefineGlobalVar` writes a new property's
     `pr->u.value` into `ctx->global_var_obj->prop[i]`, where both `p`
-    and `p->prop` are in base. Cloning `p->prop` would help only the
-    property array; `p->shape = new_sh` already writes to base too.
-    Real workloads call snapshot-defined functions whose locals don't
-    touch the global object, so this is a smoke-test artefact rather
-    than a steady-state cost — but we'd still want it gone for
-    determinism.
+    and `p->prop` are in base. This is exactly the case step 6
+    addresses: any JS code that adds a property to a base JSObject
+    (top-level `let`, `globalThis.X = ...`, prototype monkey-patching,
+    etc.) currently mutates base. Not a smoke artefact — a real
+    correctness gap against the "no JS code can write to base"
+    invariant.
 
 - Currently on **step 4 (shape overlay)** — relocate request-discovered
   shape transitions and their `shape_hash[h]` chain entries into the
   request arena. Eliminates the +20480 page entirely and makes shape
-  table mutations safe under reset.
+  table mutations safe under reset. Step 6 is the bigger structural
+  change that closes the global-object hole.
