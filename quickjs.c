@@ -11935,7 +11935,11 @@ static int JS_DefineGlobalVar(JSContext *ctx, JSAtom prop, int def_flags)
             JS_PROP_CONFIGURABLE;
         val = JS_UNINITIALIZED;
     } else {
-        p = JS_VALUE_GET_OBJ(ctx->global_obj);
+        /* arena: var declarations land on global_obj (in base);
+           shadow it before add_property mutates p->shape / p->prop. */
+        p = js_object_for_write(ctx, JS_VALUE_GET_OBJ(ctx->global_obj));
+        if (!p)
+            return -1;
         flags = JS_PROP_ENUMERABLE | JS_PROP_WRITABLE |
             (def_flags & JS_PROP_CONFIGURABLE);
         val = JS_UNDEFINED;
