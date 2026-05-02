@@ -315,6 +315,11 @@ typedef struct JSRequestState {
        on a non-arena runtime, we set this flag instead. Reads of
        std_array_prototype in arena mode AND this flag together. */
     bool std_array_prototype_dirty;
+    /* Per-request promise/microtask job queue. Originally lived on
+       JSRuntime; moved here so list_add/del don't dirty base. The head
+       is re-initialised in JS_RelocateReqState (so the self-referential
+       next/prev pointers are correct for the new location). */
+    struct list_head job_list;
 } JSRequestState;
 
 struct JSRuntime {
@@ -373,7 +378,8 @@ struct JSRuntime {
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
 
-    struct list_head job_list; /* list of JSJobEntry.link */
+    /* job_list moved to JSRequestState (rt->req->job_list) so request-
+       side promise/microtask enqueues don't dirty base. */
 
     bool module_normalize_has_attr;
     union {
@@ -2092,7 +2098,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     init_list_head(&rt->string_list);
 #endif
-    init_list_head(&rt->job_list);
+    init_list_head(&rt->req->job_list);
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2175,6 +2181,10 @@ int JS_RelocateReqState(JSRuntime *rt)
     *new_req = rt->req_state;
     new_req->atom_overlay_base = rt->atom_size;
     new_req->atom_overlay_free_index = 0;
+    /* job_list head is self-referential; the memcpy left next/prev
+       pointing at the old struct's location, so re-init for the new
+       address. */
+    init_list_head(&new_req->job_list);
     rt->req = new_req;
     return 0;
 }
@@ -2193,7 +2203,6 @@ void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
     F(gc_zero_ref_count_list);
     F(req_state);
     F(req);
-    F(job_list);
     F(shape_hash);
 #undef F
     fprintf(out, "  --- backing buffers ---\n");
@@ -2332,19 +2341,19 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
-    list_add_tail(&e->link, &rt->job_list);
+    list_add_tail(&e->link, &rt->req->job_list);
     return 0;
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
 {
-    return !list_empty(&rt->job_list);
+    return !list_empty(&rt->req->job_list);
 }
 
 JSContext *JS_GetPendingJobContext(JSRuntime *rt)
 {
     if (JS_IsJobPending(rt)) {
-        return list_entry(rt->job_list.next, JSJobEntry, link)->ctx;
+        return list_entry(rt->req->job_list.next, JSJobEntry, link)->ctx;
     }
     return NULL;
 }
@@ -2358,13 +2367,13 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
-    if (list_empty(&rt->job_list)) {
+    if (list_empty(&rt->req->job_list)) {
         *pctx = NULL;
         return 0;
     }
 
     /* get the first pending job and execute it */
-    e = list_entry(rt->job_list.next, JSJobEntry, link);
+    e = list_entry(rt->req->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
     res = e->job_func(e->ctx, e->argc, vc(e->argv));
@@ -2477,13 +2486,13 @@ void JS_FreeRuntime(JSRuntime *rt)
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->req->current_exception);
 
-    list_for_each_safe(el, el1, &rt->job_list) {
+    list_for_each_safe(el, el1, &rt->req->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
         js_free_rt(rt, e);
     }
-    init_list_head(&rt->job_list);
+    init_list_head(&rt->req->job_list);
 
     JS_RunGC(rt);
 
@@ -29762,7 +29771,15 @@ static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
     m->resolving_funcs[0] = JS_UNDEFINED;
     m->resolving_funcs[1] = JS_UNDEFINED;
     m->private_value = JS_UNDEFINED;
-    list_add_tail(&m->link, &ctx->loaded_modules);
+    /* arena: ctx->loaded_modules head is in base; linking here would
+       dirty base on every module load. Self-loop the link instead so
+       lookups won't find this module via the list (re-resolution will
+       re-load it; acceptable for now — proper fix is a per-request
+       module registry). */
+    if (js_arena_base_lo)
+        init_list_head(&m->link);
+    else
+        list_add_tail(&m->link, &ctx->loaded_modules);
     return m;
 }
 
