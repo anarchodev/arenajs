@@ -32,8 +32,25 @@ Practical consequence: every chokepoint that touches a base allocation
 (JSObject, JSShape, JSAtomStruct, JSString, JSContext) must either
 short-circuit (read-only) or path-copy into the request arena. The
 shape/atom overlays (steps 4 and 5) cover the property-table side of
-this. Mutations of the base JSObjects themselves require a different
-mechanism (shadowing or per-context request state) — see step 6.
+this. Mutations of the base JSObjects themselves require shadow-on-write
+(step 6).
+
+### Snapshot stays maximal — the symmetric invariant
+
+The other side of the invariant: **as much of the runtime as possible
+stays in the immutable snapshot**. JSRequestState (and any future
+`ctx->creq`) is for the genuinely tiny per-request mutable bits — flags,
+the current exception slot, a stack-frame pointer, the shadow-map root.
+It must not become a junk drawer for relocating large structures out of
+base. If we move atom_array, class_proto, the global object, etc. into a
+per-request struct, every request reallocs/copies them and we've defeated
+the "shareable immutable snapshot" half of the design.
+
+Concretely: when a step finds new mutation sources, the question is
+"can I make the existing structure read-only and path-copy on write?"
+not "can I move this whole structure into per-request state?" Path
+copying keeps the unchanged spine in base; bulk relocation duplicates
+the whole thing. Always prefer the former.
 
 ## The Constraint That Shapes the Plan
 
@@ -87,19 +104,26 @@ continuous measurable variable.
    `globalThis.X = ...`, `Array.prototype.foo = ...`, `Object.defineProperty(...)`
    etc. Even with steps 4 and 5, the property-set chokepoint still writes into
    the JSObject in base (`p->shape = new_sh`, `p->prop = new_prop`, and the
-   `pr->u.value = val` write itself if `p->prop` wasn't reallocated). Two
-   complementary sub-fixes:
-   a. **Per-context request state** — `ctx->creq` indirection like `rt->req`.
-      Move per-request mutable ctx fields (current global var bindings,
-      class_proto overrides, std_array_prototype flag, etc.) into a struct
-      in the request arena. Catches mutations rooted at ctx (the common case).
-   b. **Shadow-on-write for arbitrary base JSObjects** — when a write would
-      modify a base JSObject, allocate a fresh request-arena copy, register
-      it in a per-request shadow map (base p → request shadow), and route
-      future references via the map. Reads on unshadowed base objects stay
-      direct. This is the fully general fix and the one the original
-      "immutable internal data structures" framing pointed at; full
-      persistent-data-structure semantics for the JS object graph.
+   `pr->u.value = val` write itself if `p->prop` wasn't reallocated).
+
+   **Shadow-on-write for arbitrary base JSObjects.** When a write would modify
+   a base JSObject, allocate a sparse copy in the request arena, register it
+   in a per-request shadow map (base p → request shadow), and route subsequent
+   reads/writes for that object via the map. Reads on unshadowed base objects
+   stay direct (no map lookup overhead). This is the persistent-data-structure
+   form from the original conversation — Clojure-style path copying, not bulk
+   copying.
+
+   **Don't bulk-relocate ctx fields.** It's tempting to add a
+   `JSContextRequestState` and dump `global_obj`, `global_var_obj`,
+   `class_proto[]`, etc. into it; that path leads to copying kilobytes per
+   request and defeats the whole "snapshot is the shared, immutable bulk"
+   model. The shadow map is the right shape: sparse, allocated only for the
+   handful of objects a given request actually mutates. The map root and
+   any genuinely tiny per-request ctx state (`std_array_prototype` flag,
+   etc.) can live in a small `ctx->creq` indirection — the same discipline
+   as `rt->req`: kept small, *not* a junk drawer for moving stuff out of
+   the snapshot.
 7. **Inline caches.** Either disable IC for base-arena shapes, or store IC
    entries in a request-arena side table.
 
