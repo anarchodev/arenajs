@@ -307,10 +307,9 @@ typedef struct JSRequestState {
     int      atom_overlay_free_index;   /* relative to atom_overlay_base */
     uint32_t *atom_hash_overlay;        /* request-arena chain heads */
     uint32_t atom_hash_overlay_size;    /* power of two; 0 = not allocated */
-    /* Step 6: per-ctx shadow state. Linked list of (ctx, creq state),
-       lazily allocated. Lookup walks the list — typical use has 1-2
-       contexts so this is fine. */
-    struct JSContextCreq *creq_list;
+    /* Step 6: generic shadow map for base JSObjects. See JSObjectShadow
+       above. Linked list rooted here, allocated lazily. */
+    struct JSObjectShadow *shadow_map;
 } JSRequestState;
 
 struct JSRuntime {
@@ -524,32 +523,21 @@ enum {
    enough to call the interrupt callback often. */
 #define JS_INTERRUPT_COUNTER_INIT 10000
 
-/* arena: per-context request state. Same discipline as JSRequestState
-   on JSRuntime: tiny, only genuinely transient ctx fields. NOT a junk
-   drawer for relocating large ctx fields out of the snapshot.
+/* arena: generic per-request shadow map for base JSObjects.
+   Pathological JS code (globalThis.X = ..., Array.prototype.foo = ...,
+   Object.defineProperty(Object, ...)) can target any base JSObject for
+   mutation. The shadow map intercepts at the property-access chokepoints:
+   if the target is a base JSObject, we look up or lazily allocate a
+   request-arena shadow and route the operation to it.
 
-   Lives indirected: ctx itself is in base (immutable), so we cannot
-   stash a per-ctx creq pointer on ctx without dirtying base. Instead,
-   creq nodes live in a linked list rooted at rt->req->creq_list, keyed
-   by ctx. js_creq(ctx) walks the list (1-2 entries in typical use).
-   Sparse: a node is allocated lazily on first shadow op, and shadow
-   JSValues stay JS_UNDEFINED until the corresponding base ctx-rooted
-   JSObject is first mutated.
-
-   Bigger ambition: handle arbitrary base JSObjects via a generic shadow
-   map (base p -> shadow p). This struct is the start; right now it
-   only carries shadow_global_var_obj because that's the residue of
-   our smoke test. Add more sparse fields here as the thermometer
-   surfaces them. */
-typedef struct JSContextRequestState {
-    JSValue shadow_global_var_obj; /* JS_UNDEFINED until first write */
-} JSContextRequestState;
-
-typedef struct JSContextCreq {
-    JSContext *ctx;
-    JSContextRequestState state;
-    struct JSContextCreq *next;
-} JSContextCreq;
+   Linked list keyed by base pointer. Sparse: only the JSObjects a
+   given request actually mutates appear here. Reads on unshadowed
+   base objects walk past zero or one entry, then fall through. */
+typedef struct JSObjectShadow {
+    JSObject *base;
+    JSObject *shadow;
+    struct JSObjectShadow *next;
+} JSObjectShadow;
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
@@ -2161,16 +2149,26 @@ void *JS_GetMallocOpaque(JSRuntime *rt)
    arena instead of dirtying the JSRuntime page in base. */
 int JS_RelocateReqState(JSRuntime *rt)
 {
+    /* Allocates a fresh JSRequestState via js_mallocz_rt — lands in the
+       request arena (in arena mode). Called twice in the lifecycle:
+        - once at JS_FreezeRuntime (initial relocation; one base write
+          to set rt->req).
+        - on every JS_ResetRequestArena (re-init after cursor rewind;
+          allocation lands at the same address as the original because
+          the cursor was reset and JSRequestState is the first
+          post-reset allocation, so rt->req does not need to be
+          re-written — verified by assert below). */
     JSRequestState *new_req = js_mallocz_rt(rt, sizeof(*new_req));
     if (!new_req)
         return -1;
+    /* On reset, new_req must equal rt->req (address-stable). On the
+       initial freeze, rt->req still points at the embedded req_state;
+       new_req is the first arena allocation, the assignment below
+       moves rt->req to it. */
+    if (rt->req != &rt->req_state && new_req != rt->req)
+        abort(); /* address shifted across reset; broken invariant */
     *new_req = rt->req_state;
-    /* arena: lock the atom-overlay dispatch threshold to current
-       atom_size so any new atom interned post-freeze gets an index
-       >= base atom_size and lands in the overlay. */
     new_req->atom_overlay_base = rt->atom_size;
-    /* atom_overlay_free_index = 0 means "no overlay slot free" (matches
-       atom_array's free-index convention; 0 is the sentinel for empty). */
     new_req->atom_overlay_free_index = 0;
     rt->req = new_req;
     return 0;
@@ -3260,31 +3258,6 @@ static int js_atom_hash_overlay_ensure(JSRuntime *rt)
     return 0;
 }
 
-/* arena: per-context request state. Lookup/alloc by ctx in the
-   rt->req->creq_list linked list. */
-static JSContextRequestState *js_creq(JSContext *ctx)
-{
-    for (JSContextCreq *c = ctx->rt->req->creq_list; c; c = c->next)
-        if (c->ctx == ctx)
-            return &c->state;
-    return NULL;
-}
-
-static JSContextRequestState *js_creq_ensure(JSContext *ctx)
-{
-    JSContextRequestState *existing = js_creq(ctx);
-    if (existing)
-        return existing;
-    JSContextCreq *node = js_mallocz_rt(ctx->rt, sizeof(*node));
-    if (!node)
-        return NULL;
-    node->ctx = ctx;
-    node->state.shadow_global_var_obj = JS_UNDEFINED;
-    node->next = ctx->rt->req->creq_list;
-    ctx->rt->req->creq_list = node;
-    return &node->state;
-}
-
 /* arena: shallow-clone a JSObject into the request arena.
    - Header reset (ref=1, type=JSObject, mark=0, link self-loop).
    - shape: shared with base (base shape is immutable; future shape
@@ -3295,9 +3268,9 @@ static JSContextRequestState *js_creq_ensure(JSContext *ctx)
      we don't inc their refcounts.
    - u: shallow-copied. For non-trivial classes (arrays, functions,
      etc.) the variant data may contain pointers needing care; the
-     current callers only shadow ctx->global_var_obj which has no
-     exotic class, so a memcpy is correct. Generalize when other
-     classes need shadowing.
+     current callers shadow ctx->global_var_obj and ctx->global_obj
+     which have no exotic class, so a memcpy is correct. Generalize
+     when other classes need shadowing.
    - first_weak_ref: NULL (shadow has no inherited weak refs). */
 static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
 {
@@ -3322,34 +3295,63 @@ static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
     return shadow;
 }
 
-/* Read access: returns the active global_var_obj — shadow if present,
-   else base. */
-static inline JSObject *js_global_var_obj_active(JSContext *ctx)
+/* arena: walk the shadow_map for a matching base entry. Returns the
+   shadow JSObject, or NULL if not yet shadowed. */
+static JSObject *js_object_shadow_lookup(JSRuntime *rt, JSObject *p)
 {
-    JSContextRequestState *creq = js_creq(ctx);
-    if (creq && !JS_IsUndefined(creq->shadow_global_var_obj))
-        return JS_VALUE_GET_OBJ(creq->shadow_global_var_obj);
-    return JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    for (JSObjectShadow *e = rt->req->shadow_map; e; e = e->next) {
+        if (e->base == p)
+            return e->shadow;
+    }
+    return NULL;
 }
 
-/* Write access: returns the writable shadow, allocating it if needed.
-   Pre-freeze (or if base is already in request arena), returns base
-   directly. */
-static JSObject *js_global_var_obj_for_write(JSContext *ctx)
+/* Read path: returns the active object. If `p` is a base JSObject and
+   has a shadow, the shadow is returned; otherwise `p` is returned
+   unchanged. Pre-freeze and request-arena pointers are passed through
+   without map walks (the common case). */
+static inline JSObject *js_object_active(JSRuntime *rt, JSObject *p)
 {
-    JSObject *base = JS_VALUE_GET_OBJ(ctx->global_var_obj);
-    if (!js_arena_base_lo || !js_arena_ptr_is_base(base))
-        return base;
-    JSContextRequestState *creq = js_creq_ensure(ctx);
-    if (!creq)
-        return NULL;
-    if (!JS_IsUndefined(creq->shadow_global_var_obj))
-        return JS_VALUE_GET_OBJ(creq->shadow_global_var_obj);
-    JSObject *shadow = js_clone_jsobject_for_write(ctx, base);
+    if (likely(!js_arena_base_lo))
+        return p;
+    if (likely(!js_arena_ptr_is_base(p)))
+        return p;
+    JSObject *shadow = js_object_shadow_lookup(rt, p);
+    return shadow ? shadow : p;
+}
+
+/* Write path: returns the writable shadow for `p`, lazily creating it
+   on first call. Pre-freeze / non-base pass through unchanged. */
+static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
+{
+    if (!js_arena_base_lo || !js_arena_ptr_is_base(p))
+        return p;
+    JSObject *shadow = js_object_shadow_lookup(ctx->rt, p);
+    if (shadow)
+        return shadow;
+    shadow = js_clone_jsobject_for_write(ctx, p);
     if (!shadow)
         return NULL;
-    creq->shadow_global_var_obj = JS_MKPTR(JS_TAG_OBJECT, shadow);
+    JSObjectShadow *entry = js_mallocz_rt(ctx->rt, sizeof(*entry));
+    if (!entry)
+        return NULL;
+    entry->base = p;
+    entry->shadow = shadow;
+    entry->next = ctx->rt->req->shadow_map;
+    ctx->rt->req->shadow_map = entry;
     return shadow;
+}
+
+/* v1 wrappers — kept so the existing global_var_obj call sites still
+   compile, now backed by the generic shadow_map. */
+static inline JSObject *js_global_var_obj_active(JSContext *ctx)
+{
+    return js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ctx->global_var_obj));
+}
+
+static JSObject *js_global_var_obj_for_write(JSContext *ctx)
+{
+    return js_object_for_write(ctx, JS_VALUE_GET_OBJ(ctx->global_var_obj));
 }
 
 JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v)
@@ -9207,6 +9209,20 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     JSShapeProperty *prs;
     uint32_t tag;
 
+    /* arena: redirect a base-JSObject target to its shadow if one
+       exists. Pass-through for unshadowed base or request-arena
+       objects. Reads only — does not allocate a shadow. */
+    if (js_arena_base_lo && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        JSObject *p_orig = JS_VALUE_GET_OBJ(obj);
+        JSObject *p_active = js_object_active(ctx->rt, p_orig);
+        if (p_active != p_orig) {
+            obj = JS_MKPTR(JS_TAG_OBJECT, p_active);
+            if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT
+                && JS_VALUE_GET_OBJ(this_obj) == p_orig)
+                this_obj = obj;
+        }
+    }
+
     tag = JS_VALUE_GET_TAG(obj);
     if (unlikely(tag != JS_TAG_OBJECT)) {
         switch(tag) {
@@ -10642,6 +10658,25 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
     int desc_flags;
     int ret;
 
+    /* arena: redirect a base-JSObject target to its writable shadow,
+       allocating one on first write. Both `obj` and `this_obj` may
+       reference the same base; swap them in lockstep. */
+    if (js_arena_base_lo
+        && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        JSObject *p_orig = JS_VALUE_GET_OBJ(obj);
+        if (js_arena_ptr_is_base(p_orig)) {
+            JSObject *p_shadow = js_object_for_write(ctx, p_orig);
+            if (!p_shadow) {
+                JS_FreeValue(ctx, val);
+                return -1;
+            }
+            obj = JS_MKPTR(JS_TAG_OBJECT, p_shadow);
+            if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT
+                && JS_VALUE_GET_OBJ(this_obj) == p_orig)
+                this_obj = obj;
+        }
+    }
+
     switch(JS_VALUE_GET_TAG(this_obj)) {
     case JS_TAG_NULL:
         JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of null", prop);
@@ -11320,6 +11355,12 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
         return -1;
     }
     p = JS_VALUE_GET_OBJ(this_obj);
+    /* arena: redirect base target to shadow on write. */
+    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+        p = js_object_for_write(ctx, p);
+        if (!p)
+            return -1;
+    }
 
  redo_prop_update:
     prs = find_own_property(&pr, p, prop);
@@ -19444,6 +19485,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* arena: the fast-path read inlines find_own_property
+                       and bypasses JS_GetPropertyInternal. Redirect to
+                       shadow if one exists. */
+                    if (js_arena_base_lo)
+                        p = js_object_active(ctx->rt, p);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -19492,6 +19538,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* arena: same redirect as OP_get_field. */
+                    if (js_arena_base_lo)
+                        p = js_object_active(ctx->rt, p);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {

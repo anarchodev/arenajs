@@ -338,7 +338,14 @@ void JS_FreezeRuntime(JSRuntime *rt)
 
 void JS_ResetRequestArena(JSRuntime *rt)
 {
+    /* Cursor → PREFIX_LEN, then re-allocate JSRequestState as the very
+       first post-reset allocation. Since the cursor is rewound, the
+       allocation lands at the same address it had after the initial
+       JS_RelocateReqState, so rt->req (a one-time base write at freeze)
+       remains valid without further base writes. JS_RelocateReqState
+       is the canonical re-init path; call it here too. */
     js_dual_arena_reset_request(JS_GetDualArena(rt));
+    JS_RelocateReqState(rt);
 }
 
 /* ----- thermometer -----
