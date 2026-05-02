@@ -101,19 +101,20 @@ int main(void)
         "if (globalThis.GREETING !== undefined) throw 'C: delete no stick';\n"
         "'ok'";
 
-    /* TODO Test D was a more substantive workload (array push + reduce
-       with an inline closure). It triggers a latent bug: after 1-2 reset
-       cycles, calling an Array.prototype method with an inline arrow
-       function returns "not a function" — base method lookup intermittently
-       returns undefined. The bug is reproducible under both Release and
-       ASan, predates step-6, and likely lives in the bytecode interpreter's
-       interaction with closure creation across reset. Deliberately skipped
-       here so the rest of the benchmark numbers remain comparable; tracked
-       in ARENA_PLAN.md as an open follow-up. */
+    /* Test D: substantive workload — array push + reduce with inline
+       closure. Exercises base prototype method calls (Array.prototype.push,
+       reduce) across reset, which used to mutate base via the autoinit
+       lazy-init path. Now safe because JS_ForceAllAutoinit pre-evaluates
+       all autoinit properties at JS_FreezeRuntime. */
+    const char *script_d =
+        "let xs = []; for (let i = 0; i < 100; i++) xs.push(i*i);\n"
+        "if (xs.reduce((a,b) => a+b, 0) !== 328350) throw 'D: bad sum';\n"
+        "'ok'";
 
     bench_eval_reset(ctx, rt, "A: globalThis.blah set",      script_a, ITER_COUNT);
     bench_eval_reset(ctx, rt, "B: override base GREETING",   script_b, ITER_COUNT);
     bench_eval_reset(ctx, rt, "C: delete base GREETING",     script_c, ITER_COUNT);
+    bench_eval_reset(ctx, rt, "D: 100x push + reduce",       script_d, ITER_COUNT / 5);
 
     /* Reset alone — floor */
     if (eval_check(ctx, script_a)) return 1;

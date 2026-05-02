@@ -82,6 +82,14 @@ JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
    has flipped to request mode. Returns 0 on success, -1 on OOM. */
 JS_EXTERN int JS_RelocateReqState(JSRuntime *rt);
 
+/* arena: pre-force every JS_PROP_AUTOINIT property on every base JSObject
+   so no lazy initialization remains by freeze time. Called by
+   JS_FreezeRuntime BEFORE js_dual_arena_freeze (writes still land in
+   base normally). Returns the number of autoinit properties forced.
+   Eliminates the "first read of a base prototype method writes to base"
+   class of post-freeze base mutations. */
+JS_EXTERN int JS_ForceAllAutoinit(JSRuntime *rt);
+
 /* Page-fault-based base-arena write detector — the "CoW thermometer" in
  * ARENA_PLAN.md. After enabling, the base arena buffer is mprotect'd
  * read-only and a SIGSEGV handler counts every write that touches it.

@@ -436,23 +436,34 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   All three pass the leak detector across 50000 iterations under both
   Release and Debug+ASan.
 
-- **Open: latent bug in call-method + inline-closure across reset.** A
-  D-script of the form
-  > `[1,2,3].reduce((a,b) => a+b, 0)`
-  works on the first 1–2 iterations but then `OP_get_field2(reduce)` on
-  `[1,2,3]` returns `JS_UNDEFINED` from `JS_GetPropertyInternal`'s
-  prototype walk — even though the array's shape and proto are
-  identical to prior iterations, and `Array.prototype.reduce` itself is
-  immortal in base. Reproducible without any of the v2 hooks (verified
-  by reverting them); bug is older than step 6 and likely sits in how
-  bytecode allocation / inline closure creation interacts with
-  request-arena lifecycle across `JS_ResetRequestArena`. Bench's D test
-  is documented and left out so the A/B/C numbers remain comparable.
+- **Resolved: lazy-init wrote to base on first prototype-method access.**
+  Tracked back to `JS_AutoInitProperty` calling `js_shape_prepare_update`
+  on a base prototype: the path cloned the shape (request arena) and
+  wrote `p->shape = clone` into the base JSObject. After the first
+  request, `Array.prototype->shape` (and others) pointed at request-
+  arena memory; reset wiped that memory; subsequent reads found garbage.
 
-  Investigation TODO: trace exactly where the prototype walk in
-  `JS_GetPropertyInternal` diverges between iter 1 (returns the
-  function) and iter 2 (returns undefined) for identical-looking
-  inputs. Likely culprit: `find_own_property`'s prop-hash walk
-  encountering a `pr->atom` that was a request-arena atom from a
-  previous iteration and is now garbage post-reset, so the comparison
-  silently fails.
+  **Fix: pre-force all autoinit properties at snapshot init**
+  (`JS_ForceAllAutoinit`, called by `JS_FreezeRuntime` *before* the
+  dual arena flips). Walks `rt->gc_obj_list`, finds every JSObject
+  property with `JS_PROP_AUTOINIT`, runs the autoinit function. Iterates
+  to fixpoint because instantiating one autoinit (e.g. a function value)
+  registers new objects with their own autoinit properties. After this,
+  no `JS_AutoInitProperty` ever fires post-freeze, no
+  `js_shape_prepare_update` runs on base, no base writes from prototype-
+  method reads.
+
+  This is the right shape for our model: lazy init is an antipattern
+  for a snapshot-based runtime. Anything that *can* be init at
+  snapshot-build time *should* be — the cost amortizes across all
+  workers via the shared mmap, and per-request work (the metric we
+  optimize) goes down. Lazy init also creates latency variance: the
+  first request pays a cost subsequent ones don't, bad for tail
+  percentiles. Generalize: revisit any other lazy-init path that fires
+  during request execution (`js_module_ns_autoinit`,
+  `js_bytecode_autoinit`, etc.) and pre-force at freeze.
+
+  **Bench D restored** — `[1,2,3].reduce((a,b)=>a+b,0)` and similar
+  workloads now stable across 1000+ resets. Snapshot grew by ~150 KB
+  (all the prototype methods now eagerly allocated), reset cost
+  unchanged at 8 ns/iter.

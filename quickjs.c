@@ -5635,6 +5635,7 @@ static inline void *get_alloc_from_shape(JSShape *sh)
     return prop_hash_end(sh) - ((intptr_t)sh->prop_hash_mask + 1);
 }
 
+
 static int init_shape_hash(JSRuntime *rt)
 {
     rt->shape_hash_bits = 6;   /* 64 shapes */
@@ -9205,6 +9206,60 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
         return -1;
     pr->u.value = val;
     return 0;
+}
+
+/* arena: pre-force every JS_PROP_AUTOINIT property on every base JSObject
+   so that no lazy initialization remains by the time we freeze. Called
+   before js_dual_arena_freeze (i.e. while still in BASE mode), so
+   instantiated values land in base normally. After this, no JS_AutoInitProperty
+   call ever fires post-freeze, which means no js_shape_prepare_update on a
+   base shape, which means no `p->shape = clone` base write — closing the
+   prototype-method-after-reset hole.
+
+   Iterates to fixpoint: instantiating one autoinit can register new
+   JSObjects (e.g. function objects with their own autoinit `length` /
+   `name` properties), so we re-walk until a pass finds zero remaining
+   autoinit properties. Bounded: each iteration strictly decreases the
+   total autoinit count across the runtime.
+
+   We snapshot the list head at each pass start to avoid traversing newly-
+   appended objects in the same pass — those get picked up in the next
+   pass. Safe because gc_obj_list is doubly-linked and we only ever
+   append (we don't remove during iteration). */
+int JS_ForceAllAutoinit(JSRuntime *rt)
+{
+    int passes = 0;
+    int total_forced = 0;
+    /* Cap to avoid runaway (shouldn't happen — each iteration strictly
+       reduces the global autoinit count). */
+    while (passes++ < 32) {
+        int forced_this_pass = 0;
+        struct list_head *el, *el1;
+        list_for_each_safe(el, el1, &rt->gc_obj_list) {
+            JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+            if (h->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+                continue;
+            JSObject *p = (JSObject *)h;
+            JSShape *sh = p->shape;
+            for (int i = 0; i < sh->prop_count; i++) {
+                JSShapeProperty *prs = &sh->prop[i];
+                if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+                    JSContext *realm = js_autoinit_get_realm(&p->prop[i]);
+                    if (JS_AutoInitProperty(realm, p, prs->atom,
+                                            &p->prop[i], prs) == 0) {
+                        forced_this_pass++;
+                    }
+                    /* sh may have been cloned by js_shape_prepare_update;
+                       re-fetch and re-bound the loop. */
+                    sh = p->shape;
+                }
+            }
+        }
+        total_forced += forced_this_pass;
+        if (forced_this_pass == 0)
+            break;
+    }
+    return total_forced;
 }
 
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
