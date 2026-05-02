@@ -8785,6 +8785,13 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
             goto not_obj;
     }
     p = JS_VALUE_GET_OBJ(obj);
+    /* arena: prototype mutation is a write to the JSObject's shape;
+       redirect base target to shadow. */
+    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+        p = js_object_for_write(ctx, p);
+        if (!p)
+            return -1;
+    }
     if (JS_VALUE_GET_TAG(proto_val) != JS_TAG_OBJECT) {
         if (JS_VALUE_GET_TAG(proto_val) != JS_TAG_NULL) {
         not_obj:
@@ -12078,6 +12085,14 @@ int JS_DeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int flags)
     if (JS_IsException(obj1))
         return -1;
     p = JS_VALUE_GET_OBJ(obj1);
+    /* arena: redirect base target to shadow on delete (a write op). */
+    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+        p = js_object_for_write(ctx, p);
+        if (!p) {
+            JS_FreeValue(ctx, obj1);
+            return -1;
+        }
+    }
     res = delete_property(ctx, p, prop);
     JS_FreeValue(ctx, obj1);
     if (res != false)
@@ -19589,6 +19604,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* arena: if writing through an existing property
+                       slot, redirect to shadow first so set_value lands
+                       in shadow->prop, not base->prop. */
+                    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+                        p = js_object_for_write(ctx, p);
+                        if (!p)
+                            goto exception;
+                    }
                     prs = find_own_property(&pr, p, atom);
                     if (!prs)
                         goto put_field_slow_path;

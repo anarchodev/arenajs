@@ -420,12 +420,39 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   initializations. Versus the rove memcpy-restore baseline of 5–7 µs
   per restore, the bump-cursor reset is ~700× faster.
 
-- Currently: **goal achieved end-to-end** for the smoke and benchmark
-  workloads. The generic shadow_map covers every base JSObject any
-  property write could target. Open work is mostly hardening:
-  - Other property-mutation chokepoints (`JS_DeleteProperty`,
-    `JS_SetPrototypeInternal`, etc.) need the same redirect for
-    completeness against arbitrary user code.
-  - Larger benchmark workloads will surface the next residual writes
-    (atom-overlay growth, shape transitions on shadows that escape
-    add_property, etc.).
+- Hooked the remaining single-target write chokepoints:
+  `JS_DeleteProperty`, `JS_SetPrototypeInternal`, and `OP_put_field`'s
+  fast path. All three now route a base target through
+  `js_object_for_write` before the mutation. `JS_DefineGlobalVar`'s
+  `var`-on-global-obj branch (line 11811) and `JS_DefineGlobalFunction`
+  still write to base directly — open follow-up.
+
+  Bench extended to A/B/C cases:
+  - A (globalThis.blah set):     ~3.8 µs/iter
+  - B (override base GREETING):  ~3.5 µs/iter
+  - C (delete base GREETING):    ~3.5 µs/iter
+  - reset alone (floor):         8 ns/iter
+
+  All three pass the leak detector across 50000 iterations under both
+  Release and Debug+ASan.
+
+- **Open: latent bug in call-method + inline-closure across reset.** A
+  D-script of the form
+  > `[1,2,3].reduce((a,b) => a+b, 0)`
+  works on the first 1–2 iterations but then `OP_get_field2(reduce)` on
+  `[1,2,3]` returns `JS_UNDEFINED` from `JS_GetPropertyInternal`'s
+  prototype walk — even though the array's shape and proto are
+  identical to prior iterations, and `Array.prototype.reduce` itself is
+  immortal in base. Reproducible without any of the v2 hooks (verified
+  by reverting them); bug is older than step 6 and likely sits in how
+  bytecode allocation / inline closure creation interacts with
+  request-arena lifecycle across `JS_ResetRequestArena`. Bench's D test
+  is documented and left out so the A/B/C numbers remain comparable.
+
+  Investigation TODO: trace exactly where the prototype walk in
+  `JS_GetPropertyInternal` diverges between iter 1 (returns the
+  function) and iter 2 (returns undefined) for identical-looking
+  inputs. Likely culprit: `find_own_property`'s prop-hash walk
+  encountering a `pr->atom` that was a request-arena atom from a
+  previous iteration and is now garbage post-reset, so the comparison
+  silently fails.

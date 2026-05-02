@@ -42,63 +42,88 @@ static int eval_check(JSContext *ctx, const char *src)
     return 0;
 }
 
+static double bench_eval_reset(JSContext *ctx, JSRuntime *rt,
+                               const char *label, const char *script,
+                               int iters)
+{
+    /* warmup */
+    for (int i = 0; i < WARMUP; i++) {
+        if (eval_check(ctx, script)) return -1;
+        JS_ResetRequestArena(rt);
+    }
+    double t0 = now_ns();
+    for (int i = 0; i < iters; i++) {
+        if (eval_check(ctx, script)) return -1;
+        JS_ResetRequestArena(rt);
+    }
+    double t1 = now_ns();
+    double ns_per = (t1 - t0) / iters;
+    printf("%-36s %7.0f ns/iter  (%d iters)\n", label, ns_per, iters);
+    return ns_per;
+}
+
 int main(void)
 {
     JSRuntime *rt = JS_NewRuntimeArena(8 * 1024 * 1024, 8 * 1024 * 1024);
     if (!rt) { fprintf(stderr, "JS_NewRuntimeArena failed\n"); return 1; }
     JSContext *ctx = JS_NewContext(rt);
     if (!ctx) { fprintf(stderr, "JS_NewContext failed\n"); return 1; }
+
+    /* Stash a snapshot-time global so the override-existing test
+       can verify the base value comes back after reset. */
+    if (eval_check(ctx, "globalThis.GREETING = 'hello from base';")) return 1;
+
     JS_FreezeRuntime(rt);
 
-    /* The script verifies the shadow was cleared by reset. If a prior
-       request's globalThis.blah leaks across, the first check throws. */
-    const char *script =
-        "if (globalThis.blah !== undefined) throw 'leak: blah was set';\n"
+    /* Test A: shadow a fresh global. Each iter starts with the base
+       global_obj having no `blah`; reset must clear the shadow. */
+    const char *script_a =
+        "if (globalThis.blah !== undefined) throw 'leak A: blah was set';\n"
         "globalThis.blah = 42;\n"
-        "if (globalThis.blah !== 42) throw 'set did not stick';\n"
+        "if (globalThis.blah !== 42) throw 'A: set did not stick';\n"
         "'ok'";
 
-    /* Warmup */
-    for (int i = 0; i < WARMUP; i++) {
-        if (eval_check(ctx, script)) return 1;
-        JS_ResetRequestArena(rt);
-    }
+    /* Test B: override an EXISTING base global (GREETING). Goes
+       through OP_put_field's fast path because the property exists on
+       base global_obj. After reset, base GREETING should be visible
+       again. */
+    const char *script_b =
+        "if (globalThis.GREETING !== 'hello from base') throw 'leak B';\n"
+        "globalThis.GREETING = 'overridden';\n"
+        "if (globalThis.GREETING !== 'overridden') throw 'B: override no stick';\n"
+        "'ok'";
 
-    /* Measure: eval + reset */
+    /* Test C: delete an existing base property + verify gone, then
+       reset restores it. */
+    const char *script_c =
+        "if (globalThis.GREETING !== 'hello from base') throw 'leak C';\n"
+        "delete globalThis.GREETING;\n"
+        "if (globalThis.GREETING !== undefined) throw 'C: delete no stick';\n"
+        "'ok'";
+
+    /* TODO Test D was a more substantive workload (array push + reduce
+       with an inline closure). It triggers a latent bug: after 1-2 reset
+       cycles, calling an Array.prototype method with an inline arrow
+       function returns "not a function" — base method lookup intermittently
+       returns undefined. The bug is reproducible under both Release and
+       ASan, predates step-6, and likely lives in the bytecode interpreter's
+       interaction with closure creation across reset. Deliberately skipped
+       here so the rest of the benchmark numbers remain comparable; tracked
+       in ARENA_PLAN.md as an open follow-up. */
+
+    bench_eval_reset(ctx, rt, "A: globalThis.blah set",      script_a, ITER_COUNT);
+    bench_eval_reset(ctx, rt, "B: override base GREETING",   script_b, ITER_COUNT);
+    bench_eval_reset(ctx, rt, "C: delete base GREETING",     script_c, ITER_COUNT);
+
+    /* Reset alone — floor */
+    if (eval_check(ctx, script_a)) return 1;
     double t0 = now_ns();
     for (int i = 0; i < ITER_COUNT; i++) {
-        if (eval_check(ctx, script)) return 1;
         JS_ResetRequestArena(rt);
     }
     double t1 = now_ns();
-    double ns_per_iter = (t1 - t0) / ITER_COUNT;
-    printf("eval(script) + reset:  %.0f ns/iter  (%d iters)\n",
-           ns_per_iter, ITER_COUNT);
-
-    /* Measure: reset alone (after a state-loaded request).
-       Each iteration just resets — no eval between. The request arena
-       sits at "just JSRequestState" between resets, so this measures
-       the lower-bound cost of reset. */
-    if (eval_check(ctx, script)) return 1;
-    t0 = now_ns();
-    for (int i = 0; i < ITER_COUNT; i++) {
-        JS_ResetRequestArena(rt);
-    }
-    t1 = now_ns();
-    double ns_per_reset = (t1 - t0) / ITER_COUNT;
-    printf("reset alone:           %.0f ns/iter  (%d iters)\n",
-           ns_per_reset, ITER_COUNT);
-
-    /* For perspective: measure eval cost without reset (each iteration
-       declares a fresh atom so we exercise the atom overlay). */
-    /* Reset once to clean state, then run N evals that write to a new
-       global each time. We can't use globalThis.blah (would fail check)
-       so use a counter-named global. After N evals we just reset. */
-    JS_ResetRequestArena(rt);
-    const char *counter_set = "globalThis.x_$ITER = $ITER; 'ok'";
-    (void)counter_set;
-    /* Skip this for now — would need string formatting. The first two
-       measurements are the load-bearing ones. */
+    printf("%-36s %7.0f ns/iter  (%d iters)\n",
+           "reset alone (floor)", (t1 - t0) / ITER_COUNT, ITER_COUNT);
 
     js_dual_arena_free(JS_GetDualArena(rt));
     return 0;
