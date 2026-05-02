@@ -75,6 +75,22 @@ int main(void)
            js_dual_arena_base_used(da),
            js_dual_arena_request_used(da));
 
+    /* --- determinism patch checks --- */
+    /* Math.random() must return 0 until JS_SetRandomSeed is called
+       (xorshift64 with zero state is identically zero). */
+    if (eval_print(ctx, "Math.random()", "rand-unseeded")) return 1;
+    /* performance.timeOrigin must be 0 until JS_SetTimeOrigin is called. */
+    if (eval_print(ctx, "performance.timeOrigin", "timeOrigin-unset")) return 1;
+
+    JS_SetRandomSeed(ctx, 0xdeadbeefcafef00dULL);
+    JS_SetTimeOrigin(ctx, 12345.5);
+
+    if (eval_print(ctx, "Math.random()", "rand-seeded")) return 1;
+    if (eval_print(ctx, "performance.timeOrigin", "timeOrigin-set")) return 1;
+    /* now() should be huge-positive (hrtime - 12345.5) since hrtime is
+       monotonic since boot. */
+    if (eval_print(ctx, "performance.now() > 0", "now-positive")) return 1;
+
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     js_dual_arena_free(da);

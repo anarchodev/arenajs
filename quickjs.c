@@ -46958,10 +46958,17 @@ static uint64_t xorshift64star(uint64_t *pstate)
 
 static void js_random_init(JSContext *ctx)
 {
-    ctx->random_state = js__gettimeofday_us();
-    /* the state must be non zero */
-    if (ctx->random_state == 0)
-        ctx->random_state = 1;
+    /* arena: deterministic init. Caller seeds via JS_SetRandomSeed
+       after snapshot restore. Math.random() before seeding will return
+       0.0 every call (xorshift64 with zero state); that's intentional
+       and means "you forgot to seed". */
+    ctx->random_state = 0;
+}
+
+void JS_SetRandomSeed(JSContext *ctx, uint64_t seed)
+{
+    /* xorshift64 requires a non-zero state */
+    ctx->random_state = seed != 0 ? seed : 1;
 }
 
 static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
@@ -59949,24 +59956,37 @@ static JSValue js_perf_now(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     return js_float64(js__now_ms() - ctx->time_origin);
 }
 
+static JSValue js_perf_time_origin_get(JSContext *ctx, JSValueConst this_val)
+{
+    /* arena: live getter rather than a stored value, so that
+       JS_SetTimeOrigin updates both performance.timeOrigin and the
+       performance.now() anchor through a single field write. */
+    return js_float64(ctx->time_origin);
+}
+
 static const JSCFunctionListEntry js_perf_proto_funcs[] = {
     JS_CFUNC_DEF2("now", 0, js_perf_now, JS_PROP_ENUMERABLE),
+    JS_CGETSET_DEF("timeOrigin", js_perf_time_origin_get, NULL),
 };
 
 int JS_AddPerformance(JSContext *ctx)
 {
-    ctx->time_origin = js__now_ms();
+    /* arena: deterministic init. Caller seeds via JS_SetTimeOrigin
+       after snapshot restore. */
+    ctx->time_origin = 0;
 
     JSValue performance = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, performance, js_perf_proto_funcs, countof(js_perf_proto_funcs));
-    JS_DefinePropertyValueStr(ctx, performance, "timeOrigin",
-                           js_float64(ctx->time_origin),
-                           JS_PROP_ENUMERABLE);
     JS_DefinePropertyValueStr(ctx, ctx->global_obj, "performance",
                            js_dup(performance),
                            JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE);
     JS_FreeValue(ctx, performance);
     return 0;
+}
+
+void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms)
+{
+    ctx->time_origin = time_origin_ms;
 }
 
 /* Equality comparisons and sameness */

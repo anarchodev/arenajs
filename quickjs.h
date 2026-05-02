@@ -562,6 +562,11 @@ JS_EXTERN int JS_AddIntrinsicPromise(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicBigInt(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicWeakRef(JSContext *ctx);
 JS_EXTERN int JS_AddPerformance(JSContext *ctx);
+/* arena: deterministic-init companions. After JS_NewContext, ctx->time_origin
+   defaults to 0 and ctx->random_state defaults to 0 (Math.random returns 0
+   until seeded). Call these to inject wall-clock values post-init/restore. */
+JS_EXTERN void JS_SetRandomSeed(JSContext *ctx, uint64_t seed);
+JS_EXTERN void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms);
 JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);
 

@@ -76,7 +76,7 @@ continuous measurable variable.
   chunk list. Cursor lives at offset 0 inside the buffer (rove trick — keeps
   pointers self-relocating if we ever add snapshot persistence). Reset
   becomes `*(uint64_t *)buf = ARENA_PREFIX_LEN`.
-- [ ] **0c. Apply the rove determinism patch.** `random_state = 0` by default
+- [x] **0c. Apply the rove determinism patch.** `random_state = 0` by default
   with `JS_SetRandomSeed` to inject post-restore. `time_origin = 0` by default
   with `JS_SetTimeOrigin`. `performance.timeOrigin` becomes a getter reading
   `ctx->time_origin` live so a single setter call updates both surfaces.
@@ -109,4 +109,9 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   (chunk header gone). `arena_reset()` is now three stores: cursor + two
   last-alloc fields (the cursor is the only one that affects correctness; the
   others just disable the realloc-extend-in-place fast path until refilled).
-- Currently on 0c.
+- 0c complete. `Math.random()` returns 0 unseeded, deterministic from seed
+  after `JS_SetRandomSeed`. `performance.timeOrigin` returns 0 unset,
+  whatever `JS_SetTimeOrigin` wrote afterwards. Two consecutive runs of the
+  smoke test produce identical `base_used` numbers, which is the necessary
+  (not yet sufficient) condition for byte-deterministic init.
+- Currently on **step 1** (refcount inc/dec guard for base-arena objects).
