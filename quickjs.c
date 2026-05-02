@@ -19990,6 +19990,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     idx = JS_VALUE_GET_INT(sp[-2]);
                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
                         p = JS_VALUE_GET_OBJ(sp[-3]);
+                        /* arena: both fast paths below mutate base when
+                           p is a base array (writing p->u.array.u.values
+                           or extending the array). Skip both and let the
+                           slow path route through JS_SetPropertyValue →
+                           JS_SetPropertyInternal2 (already hooked). */
+                        if (unlikely(js_arena_base_lo
+                                     && js_arena_ptr_is_base(p)))
+                            goto put_array_el_slow_path;
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
                                    idx < (uint32_t)p->u.array.count)) {
                             set_value(ctx, &p->u.array.u.values[idx], val);
@@ -20021,6 +20029,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                     }
                 }
+            put_array_el_slow_path:
                 sf->cur_pc = pc;
                 ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
                 JS_FreeValue(ctx, sp[-3]);
