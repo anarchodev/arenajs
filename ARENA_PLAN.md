@@ -338,9 +338,50 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   the `JS_DefineGlobalVar` write into `ctx->global_var_obj->prop[i]`.
   Pages +0 and +4096 (atom-related) are gone.
 
-- Currently on **step 6 (shadow-on-write for base JSObjects)** — the
-  last hole. Closes `globalThis.X = ...`, `Array.prototype.foo = ...`,
-  `Object.defineProperty(...)` etc. against the inviolate-base
-  invariant. Per-request shadow map (base p → request shadow) routed
-  through `ctx->creq` indirection; shadows are sparse, only allocated
-  for the JSObjects a given request actually mutates.
+- 6 done for `ctx->global_var_obj` — the only base JSObject the smoke
+  exercises via `let` declarations. Mechanism:
+  - `JSContextRequestState` (creq) struct holds sparse JSValue
+    shadows. Single field for now (`shadow_global_var_obj`); space
+    for adding more as the thermometer surfaces them. NOT a junk
+    drawer — large structures stay in base.
+  - creq nodes live in a linked list rooted at `rt->req->creq_list`
+    (since ctx itself is in base and we can't dirty it to stash a
+    creq pointer). `js_creq(ctx)` walks the list — typical use has
+    1–2 contexts.
+  - `js_clone_jsobject_for_write` shallow-copies a base JSObject into
+    the request arena: header reset (ref=1, self-loop link, no weak
+    refs), shape shared (immutable), prop array copied. Property
+    values stay shared with base; base values are immortal so no
+    refcount inc.
+  - `js_global_var_obj_active` returns shadow if present else base
+    (read path). `js_global_var_obj_for_write` lazily creates the
+    shadow on first mutation (write path).
+  - All ~6 access sites (`JS_DefineGlobalVar`, `JS_GetGlobalVar`,
+    `JS_GetGlobalVarRef`, `JS_SetGlobalVar`, `JS_DeleteGlobalVar`,
+    `JS_CheckDefineGlobalVar`) routed through these helpers.
+
+  Plus two satellite fixes:
+  - `assert(atom < rt->atom_size)` replaced with
+    `assert(js_atom_in_range(rt, atom))` (overlay atoms are now valid
+    indices >= base atom_size).
+  - `list_add_tail(&link, &rt->string_list)` under `ENABLE_DUMPS` (debug
+    builds only) gated to self-loop in arena mode, mirroring
+    `add_gc_object`. Production NDEBUG builds don't compile this in.
+
+  And one cleanup: the smoke test no longer calls `JS_FreeContext` /
+  `JS_FreeRuntime` on shutdown. Arena mode has no per-allocation
+  teardown — the whole arena vanishes via `js_dual_arena_free`'s
+  munmap. The refcount-based teardown walks (`assert(list_empty(...))`,
+  per-atom `JS_FreeAtomStruct`, etc.) only make sense for the default
+  path.
+
+  **Steady-state request#2: 0 base pages, 0 bytes — under both Release
+  and Debug+ASan.**
+
+- Currently: **goal achieved for the smoke workload**. Pathological
+  user code paths (`Array.prototype.X = ...`,
+  `Object.defineProperty(...)`, mutation of base objects reachable
+  through the prototype chain) still need the generic shadow map. Step
+  6 v2: extend shadow_map to arbitrary base JSObjects (not just
+  `global_var_obj`), with the full read-path redirect at every
+  property-access chokepoint. Same shape, larger surface.

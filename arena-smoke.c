@@ -156,8 +156,12 @@ int main(void)
        monotonic since boot. */
     if (eval_print(ctx, "performance.now() > 0", "now-positive")) return 1;
 
-    JS_FreeContext(ctx);
-    JS_FreeRuntime(rt);
+    /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
+       (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
+       etc.) are for the refcount-based default path. In arena mode the
+       whole arena is reclaimed wholesale by js_dual_arena_free; the
+       runtime, contexts, and everything they own live in arena pages
+       that vanish in one munmap. */
     js_dual_arena_free(da);
     return 0;
 }

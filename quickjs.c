@@ -307,6 +307,10 @@ typedef struct JSRequestState {
     int      atom_overlay_free_index;   /* relative to atom_overlay_base */
     uint32_t *atom_hash_overlay;        /* request-arena chain heads */
     uint32_t atom_hash_overlay_size;    /* power of two; 0 = not allocated */
+    /* Step 6: per-ctx shadow state. Linked list of (ctx, creq state),
+       lazily allocated. Lookup walks the list — typical use has 1-2
+       contexts so this is fine. */
+    struct JSContextCreq *creq_list;
 } JSRequestState;
 
 struct JSRuntime {
@@ -519,6 +523,33 @@ enum {
 /* must be large enough to have a negligible runtime cost and small
    enough to call the interrupt callback often. */
 #define JS_INTERRUPT_COUNTER_INIT 10000
+
+/* arena: per-context request state. Same discipline as JSRequestState
+   on JSRuntime: tiny, only genuinely transient ctx fields. NOT a junk
+   drawer for relocating large ctx fields out of the snapshot.
+
+   Lives indirected: ctx itself is in base (immutable), so we cannot
+   stash a per-ctx creq pointer on ctx without dirtying base. Instead,
+   creq nodes live in a linked list rooted at rt->req->creq_list, keyed
+   by ctx. js_creq(ctx) walks the list (1-2 entries in typical use).
+   Sparse: a node is allocated lazily on first shadow op, and shadow
+   JSValues stay JS_UNDEFINED until the corresponding base ctx-rooted
+   JSObject is first mutated.
+
+   Bigger ambition: handle arbitrary base JSObjects via a generic shadow
+   map (base p -> shadow p). This struct is the start; right now it
+   only carries shadow_global_var_obj because that's the residue of
+   our smoke test. Add more sparse fields here as the thermometer
+   surfaces them. */
+typedef struct JSContextRequestState {
+    JSValue shadow_global_var_obj; /* JS_UNDEFINED until first write */
+} JSContextRequestState;
+
+typedef struct JSContextCreq {
+    JSContext *ctx;
+    JSContextRequestState state;
+    struct JSContextCreq *next;
+} JSContextCreq;
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
@@ -2376,7 +2407,12 @@ static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char
     str->hash = 0;          /* optional but costless */
     str->hash_next = 0;     /* optional */
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-    list_add_tail(&str->link, &rt->string_list);
+    /* arena: skip linking to base string_list (a debug-only diagnostic
+       list); self-loop instead so subsequent list_del is a no-op. */
+    if (js_arena_base_lo)
+        init_list_head(&str->link);
+    else
+        list_add_tail(&str->link, &rt->string_list);
 #endif
     return str;
 }
@@ -3167,6 +3203,20 @@ static JSAtomStruct *js_atom_struct(JSRuntime *rt, uint32_t i)
     return rt->req->atom_overlay[i - rt->req->atom_overlay_base];
 }
 
+/* arena: returns true if `i` is a valid atom index in either the base
+   atom_array or the per-request overlay. Used in place of the older
+   `i < rt->atom_size` bound check, which doesn't know about overlays. */
+static inline bool js_atom_in_range(JSRuntime *rt, uint32_t i)
+{
+    if (i < rt->atom_size)
+        return true;
+    if (rt->req->atom_overlay
+        && i >= rt->req->atom_overlay_base
+        && (i - rt->req->atom_overlay_base) < rt->req->atom_overlay_size)
+        return true;
+    return false;
+}
+
 #define ATOM_OVERLAY_INITIAL 64
 #define ATOM_HASH_OVERLAY_INITIAL 64
 
@@ -3208,6 +3258,98 @@ static int js_atom_hash_overlay_ensure(JSRuntime *rt)
         return -1;
     rt->req->atom_hash_overlay_size = ATOM_HASH_OVERLAY_INITIAL;
     return 0;
+}
+
+/* arena: per-context request state. Lookup/alloc by ctx in the
+   rt->req->creq_list linked list. */
+static JSContextRequestState *js_creq(JSContext *ctx)
+{
+    for (JSContextCreq *c = ctx->rt->req->creq_list; c; c = c->next)
+        if (c->ctx == ctx)
+            return &c->state;
+    return NULL;
+}
+
+static JSContextRequestState *js_creq_ensure(JSContext *ctx)
+{
+    JSContextRequestState *existing = js_creq(ctx);
+    if (existing)
+        return existing;
+    JSContextCreq *node = js_mallocz_rt(ctx->rt, sizeof(*node));
+    if (!node)
+        return NULL;
+    node->ctx = ctx;
+    node->state.shadow_global_var_obj = JS_UNDEFINED;
+    node->next = ctx->rt->req->creq_list;
+    ctx->rt->req->creq_list = node;
+    return &node->state;
+}
+
+/* arena: shallow-clone a JSObject into the request arena.
+   - Header reset (ref=1, type=JSObject, mark=0, link self-loop).
+   - shape: shared with base (base shape is immutable; future shape
+     transitions on the shadow will clone the shape into the request
+     arena via the existing add_property path).
+   - prop: copy of the base prop array (new request-arena allocation).
+     Property values stay shared with base; base values are immortal so
+     we don't inc their refcounts.
+   - u: shallow-copied. For non-trivial classes (arrays, functions,
+     etc.) the variant data may contain pointers needing care; the
+     current callers only shadow ctx->global_var_obj which has no
+     exotic class, so a memcpy is correct. Generalize when other
+     classes need shadowing.
+   - first_weak_ref: NULL (shadow has no inherited weak refs). */
+static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
+{
+    JSObject *shadow = js_mallocz(ctx, sizeof(JSObject));
+    if (!shadow)
+        return NULL;
+    *shadow = *base;
+    shadow->header.ref_count = 1;
+    shadow->header.gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
+    shadow->header.mark = 0;
+    init_list_head(&shadow->header.link);
+    shadow->first_weak_ref = NULL;
+    if (base->prop && base->shape->prop_size > 0) {
+        size_t bytes = sizeof(JSProperty) * (size_t)base->shape->prop_size;
+        shadow->prop = js_malloc(ctx, bytes);
+        if (!shadow->prop)
+            return NULL;
+        memcpy(shadow->prop, base->prop, bytes);
+    } else {
+        shadow->prop = NULL;
+    }
+    return shadow;
+}
+
+/* Read access: returns the active global_var_obj — shadow if present,
+   else base. */
+static inline JSObject *js_global_var_obj_active(JSContext *ctx)
+{
+    JSContextRequestState *creq = js_creq(ctx);
+    if (creq && !JS_IsUndefined(creq->shadow_global_var_obj))
+        return JS_VALUE_GET_OBJ(creq->shadow_global_var_obj);
+    return JS_VALUE_GET_OBJ(ctx->global_var_obj);
+}
+
+/* Write access: returns the writable shadow, allocating it if needed.
+   Pre-freeze (or if base is already in request arena), returns base
+   directly. */
+static JSObject *js_global_var_obj_for_write(JSContext *ctx)
+{
+    JSObject *base = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    if (!js_arena_base_lo || !js_arena_ptr_is_base(base))
+        return base;
+    JSContextRequestState *creq = js_creq_ensure(ctx);
+    if (!creq)
+        return NULL;
+    if (!JS_IsUndefined(creq->shadow_global_var_obj))
+        return JS_VALUE_GET_OBJ(creq->shadow_global_var_obj);
+    JSObject *shadow = js_clone_jsobject_for_write(ctx, base);
+    if (!shadow)
+        return NULL;
+    creq->shadow_global_var_obj = JS_MKPTR(JS_TAG_OBJECT, shadow);
+    return shadow;
 }
 
 JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v)
@@ -3378,7 +3520,10 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
             p->header.ref_count = 1;  /* not refcounted */
             p->atom_type = JS_ATOM_TYPE_SYMBOL;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-            list_add_tail(&p->link, &rt->string_list);
+            if (js_arena_base_lo)
+                init_list_head(&p->link);
+            else
+                list_add_tail(&p->link, &rt->string_list);
 #endif
             new_array[0] = p;
             rt->atom_count++;
@@ -3412,7 +3557,10 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
             p->len = str->len;
             p->kind = JS_STRING_KIND_NORMAL;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-            list_add_tail(&p->link, &rt->string_list);
+            if (js_arena_base_lo)
+                init_list_head(&p->link);
+            else
+                list_add_tail(&p->link, &rt->string_list);
 #endif
             memcpy(str8(p), str8(str), (str->len << str->is_wide_char) +
                    1 - str->is_wide_char);
@@ -3427,7 +3575,10 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         p->len = 0;
         p->kind = JS_STRING_KIND_NORMAL;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-        list_add_tail(&p->link, &rt->string_list);
+        if (js_arena_base_lo)
+            init_list_head(&p->link);
+        else
+            list_add_tail(&p->link, &rt->string_list);
 #endif
     }
 
@@ -3720,8 +3871,7 @@ static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
         snprintf(buf, buf_size, "%u", __JS_AtomToUInt32(atom));
     } else if (atom == JS_ATOM_NULL) {
         snprintf(buf, buf_size, "<null>");
-    } else if (atom >= rt->atom_size) {
-        assert(atom < rt->atom_size);
+    } else if (!js_atom_in_range(rt, atom)) {
         snprintf(buf, buf_size, "<invalid %x>", atom);
     } else {
         JSAtomStruct *p = js_atom_struct(rt, atom);
@@ -3756,7 +3906,7 @@ static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, bool force_string)
     } else {
         JSRuntime *rt = ctx->rt;
         JSAtomStruct *p;
-        assert(atom < rt->atom_size);
+        assert(js_atom_in_range(rt, atom));
         p = js_atom_struct(rt, atom);
         if (p->atom_type == JS_ATOM_TYPE_STRING) {
             goto ret_string;
@@ -3795,7 +3945,7 @@ static bool JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
         JSAtomStruct *p;
         uint32_t val;
 
-        assert(atom < rt->atom_size);
+        assert(js_atom_in_range(rt, atom));
         p = js_atom_struct(rt, atom);
         if (p->atom_type == JS_ATOM_TYPE_STRING &&
             is_num_string(&val, p) && val != -1) {
@@ -3821,7 +3971,7 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
 
     if (__JS_AtomIsTaggedInt(atom))
         return js_int32(__JS_AtomToUInt32(atom));
-    assert(atom < rt->atom_size);
+    assert(js_atom_in_range(rt, atom));
     p1 = js_atom_struct(rt, atom);
     if (p1->atom_type != JS_ATOM_TYPE_STRING)
         return JS_UNDEFINED;
@@ -4615,7 +4765,10 @@ static JSValue string_buffer_end(StringBuffer *s)
     if (!s->is_wide_char)
         str8(str)[s->len] = 0;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-    list_add_tail(&str->link, &s->ctx->rt->string_list);
+    if (js_arena_base_lo)
+        init_list_head(&str->link);
+    else
+        list_add_tail(&str->link, &s->ctx->rt->string_list);
 #endif
     str->is_wide_char = s->is_wide_char;
     str->len = s->len;
@@ -11650,7 +11803,7 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
         }
     }
     /* check if there already is a lexical declaration */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    p = js_global_var_obj_active(ctx);
     prs = find_own_property1(p, prop);
     if (prs) {
     fail_redeclaration:
@@ -11672,7 +11825,9 @@ static int JS_DefineGlobalVar(JSContext *ctx, JSAtom prop, int def_flags)
     int flags;
 
     if (def_flags & DEFINE_GLOBAL_LEX_VAR) {
-        p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+        p = js_global_var_obj_for_write(ctx);
+        if (!p)
+            return -1;
         flags = JS_PROP_ENUMERABLE | (def_flags & JS_PROP_WRITABLE) |
             JS_PROP_CONFIGURABLE;
         val = JS_UNINITIALIZED;
@@ -11725,7 +11880,7 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
     JSProperty *pr;
 
     /* no exotic behavior is possible in global_var_obj */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    p = js_global_var_obj_active(ctx);
     prs = find_own_property(&pr, p, prop);
     if (prs) {
         /* XXX: should handle JS_PROP_TMASK properties */
@@ -11753,7 +11908,7 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
     JSProperty *pr;
 
     /* no exotic behavior is possible in global_var_obj */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    p = js_global_var_obj_active(ctx);
     prs = find_own_property(&pr, p, prop);
     if (prs) {
         /* XXX: should handle JS_PROP_AUTOINIT properties? */
@@ -11766,7 +11921,7 @@ static int JS_GetGlobalVarRef(JSContext *ctx, JSAtom prop, JSValue *sp)
         if (unlikely(!(prs->flags & JS_PROP_WRITABLE))) {
             return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
         }
-        sp[0] = js_dup(ctx->global_var_obj);
+        sp[0] = js_dup(JS_MKPTR(JS_TAG_OBJECT, p));
     } else {
         int ret;
         ret = JS_HasProperty(ctx, ctx->global_obj, prop);
@@ -11794,7 +11949,14 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     int ret;
 
     /* no exotic behavior is possible in global_var_obj */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    /* arena: take the writable shadow up front; if the property exists
+       we'll write through pr, which must point into the shadow's prop
+       array (not base's). */
+    p = js_global_var_obj_for_write(ctx);
+    if (!p) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
     prs = find_own_property(&pr, p, prop);
     if (prs) {
         /* XXX: should handle JS_PROP_AUTOINIT properties? */
@@ -11846,8 +12008,9 @@ static int JS_DeleteGlobalVar(JSContext *ctx, JSAtom prop)
     JSProperty *pr;
     int ret;
 
-    /* 9.1.1.4.7 DeleteBinding ( N ) */
-    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    /* 9.1.1.4.7 DeleteBinding ( N ) — read-only path; if found, returns
+       false without mutation. Use _active. */
+    p = js_global_var_obj_active(ctx);
     prs = find_own_property(&pr, p, prop);
     if (prs)
         return false; /* lexical variables cannot be deleted */
