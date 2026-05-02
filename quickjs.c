@@ -293,6 +293,20 @@ typedef struct JSRequestState {
     JSShape **shape_overlay;        /* request-arena ptr to size buckets */
     uint32_t shape_overlay_size;    /* power of two; 0 = not allocated */
     uint32_t shape_overlay_count;   /* informational */
+    /* Step 5: atom overlay. Same model as the shape overlay. New atoms
+       interned during a request get indices >= atom_overlay_base, with
+       (idx - base) indexing into atom_overlay (request-arena). Lookups
+       dispatch on the index threshold. atom_hash_overlay holds the
+       request-side hash chain heads.
+       atom_overlay_base = UINT32_MAX pre-freeze (no overlay path); set
+       to rt->atom_size in JS_RelocateReqState. */
+    JSAtomStruct **atom_overlay;        /* request-arena slots [0..size) */
+    uint32_t atom_overlay_base;         /* index threshold; UINT32_MAX pre-freeze */
+    uint32_t atom_overlay_size;         /* capacity */
+    uint32_t atom_overlay_count;        /* informational */
+    int      atom_overlay_free_index;   /* relative to atom_overlay_base */
+    uint32_t *atom_hash_overlay;        /* request-arena chain heads */
+    uint32_t atom_hash_overlay_size;    /* power of two; 0 = not allocated */
 } JSRequestState;
 
 struct JSRuntime {
@@ -1209,6 +1223,9 @@ static int JS_InitAtoms(JSRuntime *rt);
 static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type);
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p);
+/* arena: js_atom_struct dispatches an atom index to base array or
+   request-arena overlay (see definition below near JS_DupAtomRT). */
+static JSAtomStruct *js_atom_struct(JSRuntime *rt, uint32_t i);
 static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b);
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -2039,6 +2056,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
        (in arena mode) repoints it at a fresh JSRequestState in the
        request arena. */
     rt->req = &rt->req_state;
+    /* atom_overlay_base = UINT32_MAX disables the overlay dispatch path
+       pre-freeze; JS_RelocateReqState lowers it to rt->atom_size. */
+    rt->req_state.atom_overlay_base = UINT32_MAX;
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -2114,6 +2134,13 @@ int JS_RelocateReqState(JSRuntime *rt)
     if (!new_req)
         return -1;
     *new_req = rt->req_state;
+    /* arena: lock the atom-overlay dispatch threshold to current
+       atom_size so any new atom interned post-freeze gets an index
+       >= base atom_size and lands in the overlay. */
+    new_req->atom_overlay_base = rt->atom_size;
+    /* atom_overlay_free_index = 0 means "no overlay slot free" (matches
+       atom_array's free-index convention; 0 is the sentinel for empty). */
+    new_req->atom_overlay_free_index = 0;
     rt->req = new_req;
     return 0;
 }
@@ -2478,7 +2505,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         bool header_done = false;
 
         for(i = 0; i < rt->atom_size; i++) {
-            JSAtomStruct *p = rt->atom_array[i];
+            JSAtomStruct *p = js_atom_struct(rt, i);
             if (!atom_is_free(p) /* && p->str*/) {
                 if (i >= JS_ATOM_END || p->header.ref_count != 1) {
                     if (!header_done) {
@@ -2532,7 +2559,7 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     /* free the atoms */
     for(i = 0; i < rt->atom_size; i++) {
-        JSAtomStruct *p = rt->atom_array[i];
+        JSAtomStruct *p = js_atom_struct(rt, i);
         if (!atom_is_free(p)) {
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
             list_del(&p->link);
@@ -3048,7 +3075,7 @@ static __maybe_unused void JS_DumpAtoms(JSRuntime *rt)
         if (h) {
             printf("  %d:", i);
             while (h) {
-                p = rt->atom_array[h];
+                p = js_atom_struct(rt, h);
                 printf(" ");
                 JS_DumpString(rt, p);
                 h = p->hash_next;
@@ -3059,7 +3086,7 @@ static __maybe_unused void JS_DumpAtoms(JSRuntime *rt)
     printf("}\n");
     printf("JSAtom table: {\n");
     for(i = 0; i < rt->atom_size; i++) {
-        p = rt->atom_array[i];
+        p = js_atom_struct(rt, i);
         if (!atom_is_free(p)) {
             printf("  %d: { %d %08x ", i, p->atom_type, p->hash);
             if (!(p->len == 0 && p->is_wide_char != 0))
@@ -3083,7 +3110,7 @@ static int JS_ResizeAtomHash(JSRuntime *rt, int new_hash_size)
     for(i = 0; i < rt->atom_hash_size; i++) {
         h = rt->atom_hash[i];
         while (h != 0) {
-            p = rt->atom_array[h];
+            p = js_atom_struct(rt, h);
             hash_next1 = p->hash_next;
             /* add in new hash table */
             j = p->hash & new_hash_mask;
@@ -3129,12 +3156,66 @@ static int JS_InitAtoms(JSRuntime *rt)
     return 0;
 }
 
+/* arena: atom-overlay dispatch helpers. Pre-freeze, atom_overlay_base
+   is UINT32_MAX so all indices go to the base array. Post-freeze,
+   indices >= atom_overlay_base land in the request-arena overlay.
+   Forward-declared above near JS_FreeAtomStruct. */
+static JSAtomStruct *js_atom_struct(JSRuntime *rt, uint32_t i)
+{
+    if (likely(i < rt->req->atom_overlay_base))
+        return rt->atom_array[i];
+    return rt->req->atom_overlay[i - rt->req->atom_overlay_base];
+}
+
+#define ATOM_OVERLAY_INITIAL 64
+#define ATOM_HASH_OVERLAY_INITIAL 64
+
+/* Ensure rt->req->atom_overlay has a free slot; grow on demand.
+   Returns -1 on OOM. Slot 0 of the overlay is reserved (mirrors base
+   atom_array's "0 = JS_ATOM_NULL" convention) so atom_overlay_free_index
+   == 0 means "no free slot". */
+static int js_atom_overlay_ensure_slot(JSRuntime *rt)
+{
+    if (rt->req->atom_overlay_free_index != 0)
+        return 0;
+    uint32_t old_size = rt->req->atom_overlay_size;
+    uint32_t new_size = old_size == 0 ? ATOM_OVERLAY_INITIAL : old_size * 2;
+    JSAtomStruct **na = js_realloc_rt(rt, rt->req->atom_overlay,
+                                      sizeof(JSAtomStruct *) * new_size);
+    if (!na)
+        return -1;
+    rt->req->atom_overlay = na;
+    rt->req->atom_overlay_size = new_size;
+    uint32_t start = old_size == 0 ? 1 : old_size;
+    for (uint32_t k = start; k < new_size; k++) {
+        uint32_t next = (k == new_size - 1) ? 0 : k + 1;
+        na[k] = atom_set_free(next);
+    }
+    if (old_size == 0)
+        na[0] = NULL; /* slot 0 unused */
+    rt->req->atom_overlay_free_index = start;
+    return 0;
+}
+
+/* Ensure atom_hash_overlay is allocated. */
+static int js_atom_hash_overlay_ensure(JSRuntime *rt)
+{
+    if (rt->req->atom_hash_overlay)
+        return 0;
+    rt->req->atom_hash_overlay =
+        js_mallocz_rt(rt, sizeof(uint32_t) * ATOM_HASH_OVERLAY_INITIAL);
+    if (!rt->req->atom_hash_overlay)
+        return -1;
+    rt->req->atom_hash_overlay_size = ATOM_HASH_OVERLAY_INITIAL;
+    return 0;
+}
+
 JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v)
 {
     JSAtomStruct *p;
 
     if (!__JS_AtomIsConst(v)) {
-        p = rt->atom_array[v];
+        p = js_atom_struct(rt, v);
         arena_rc_inc(&p->header);
     }
     return v;
@@ -3147,7 +3228,7 @@ JSAtom JS_DupAtom(JSContext *ctx, JSAtom v)
 
     if (!__JS_AtomIsConst(v)) {
         rt = ctx->rt;
-        p = rt->atom_array[v];
+        p = js_atom_struct(rt, v);
         arena_rc_inc(&p->header);
     }
     return v;
@@ -3161,7 +3242,7 @@ static JSAtomKindEnum JS_AtomGetKind(JSContext *ctx, JSAtom v)
     rt = ctx->rt;
     if (__JS_AtomIsTaggedInt(v))
         return JS_ATOM_KIND_STRING;
-    p = rt->atom_array[v];
+    p = js_atom_struct(rt, v);
     switch(p->atom_type) {
     case JS_ATOM_TYPE_STRING:
         return JS_ATOM_KIND_STRING;
@@ -3187,13 +3268,19 @@ static JSAtom js_get_atom_index(JSRuntime *rt, JSAtomStruct *p)
     uint32_t i = p->hash_next;  /* atom_index */
     if (p->atom_type != JS_ATOM_TYPE_SYMBOL) {
         JSAtomStruct *p1;
-
-        i = rt->atom_hash[p->hash & (rt->atom_hash_size - 1)];
-        p1 = rt->atom_array[i];
+        /* arena: overlay atoms live in the overlay hash chain only;
+           base atoms live in the base hash chain only. */
+        if (rt->req->atom_hash_overlay && !js_arena_ptr_is_base(p)) {
+            i = rt->req->atom_hash_overlay[p->hash &
+                (rt->req->atom_hash_overlay_size - 1)];
+        } else {
+            i = rt->atom_hash[p->hash & (rt->atom_hash_size - 1)];
+        }
+        p1 = js_atom_struct(rt, i);
         while (p1 != p) {
             assert(i != 0);
             i = p1->hash_next;
-            p1 = rt->atom_array[i];
+            p1 = js_atom_struct(rt, i);
         }
     }
     return i;
@@ -3221,10 +3308,28 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         len = str->len;
         h = hash_string(str, atom_type);
         h &= JS_ATOM_HASH_MASK;
+        /* arena: walk the request-side overlay chain first; new atoms
+           interned during the request live there. */
+        if (rt->req->atom_hash_overlay) {
+            uint32_t h1o = h & (rt->req->atom_hash_overlay_size - 1);
+            i = rt->req->atom_hash_overlay[h1o];
+            while (i != 0) {
+                p = js_atom_struct(rt, i);
+                if (p->hash == h &&
+                    p->atom_type == atom_type &&
+                    p->len == len &&
+                    js_string_memcmp(p, str, len) == 0) {
+                    if (!__JS_AtomIsConst(i))
+                        arena_rc_inc(&p->header);
+                    goto done;
+                }
+                i = p->hash_next;
+            }
+        }
         h1 = h & (rt->atom_hash_size - 1);
         i = rt->atom_hash[h1];
         while (i != 0) {
-            p = rt->atom_array[i];
+            p = js_atom_struct(rt, i);
             if (p->hash == h &&
                 p->atom_type == atom_type &&
                 p->len == len &&
@@ -3326,28 +3431,47 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
 #endif
     }
 
-    /* use an already free entry */
-    i = rt->atom_free_index;
-    rt->atom_free_index = atom_get_free(rt->atom_array[i]);
-    rt->atom_array[i] = p;
+    /* arena: allocate from the per-request overlay so atom_array (in
+       base) and atom_free_index (in base) are not written. */
+    if (js_arena_base_lo) {
+        if (js_atom_overlay_ensure_slot(rt) < 0)
+            goto fail;
+        uint32_t rel = (uint32_t)rt->req->atom_overlay_free_index;
+        rt->req->atom_overlay_free_index =
+            (int)atom_get_free(rt->req->atom_overlay[rel]);
+        rt->req->atom_overlay[rel] = p;
+        rt->req->atom_overlay_count++;
+        i = rt->req->atom_overlay_base + rel;
+    } else {
+        /* use an already free entry */
+        i = rt->atom_free_index;
+        rt->atom_free_index = atom_get_free(rt->atom_array[i]);
+        rt->atom_array[i] = p;
+    }
 
     p->hash = h;
     p->hash_next = i;   /* atom_index */
     p->atom_type = atom_type;
     p->first_weak_ref = NULL;
 
-    /* arena: skip atom_count++ on rt (in base) and the resize check.
-       atom_hash chains grow unboundedly; for request-scoped runtimes
-       this is bounded by request count. */
     if (!js_arena_base_lo)
         rt->atom_count++;
 
     if (atom_type != JS_ATOM_TYPE_SYMBOL) {
-        p->hash_next = rt->atom_hash[h1];
-        rt->atom_hash[h1] = i;
-        if (!js_arena_base_lo
-            && unlikely(rt->atom_count >= rt->atom_count_resize))
-            JS_ResizeAtomHash(rt, rt->atom_hash_size * 2);
+        if (js_arena_base_lo) {
+            /* arena: link into the per-request hash overlay rather than
+               base atom_hash. */
+            if (js_atom_hash_overlay_ensure(rt) < 0)
+                goto fail;
+            uint32_t h1o = h & (rt->req->atom_hash_overlay_size - 1);
+            p->hash_next = rt->req->atom_hash_overlay[h1o];
+            rt->req->atom_hash_overlay[h1o] = i;
+        } else {
+            p->hash_next = rt->atom_hash[h1];
+            rt->atom_hash[h1] = i;
+            if (unlikely(rt->atom_count >= rt->atom_count_resize))
+                JS_ResizeAtomHash(rt, rt->atom_hash_size * 2);
+        }
     }
 
     //    JS_DumpAtoms(rt);
@@ -3384,10 +3508,28 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
 
     h = hash_string8((const uint8_t *)str, len, JS_ATOM_TYPE_STRING);
     h &= JS_ATOM_HASH_MASK;
+    /* arena: walk the request-side overlay chain first. */
+    if (rt->req->atom_hash_overlay) {
+        uint32_t h1o = h & (rt->req->atom_hash_overlay_size - 1);
+        i = rt->req->atom_hash_overlay[h1o];
+        while (i != 0) {
+            p = js_atom_struct(rt, i);
+            if (p->hash == h &&
+                p->atom_type == JS_ATOM_TYPE_STRING &&
+                p->len == len &&
+                p->is_wide_char == 0 &&
+                memcmp(str8(p), str, len) == 0) {
+                if (!__JS_AtomIsConst(i))
+                    arena_rc_inc(&p->header);
+                return i;
+            }
+            i = p->hash_next;
+        }
+    }
     h1 = h & (rt->atom_hash_size - 1);
     i = rt->atom_hash[h1];
     while (i != 0) {
-        p = rt->atom_array[i];
+        p = js_atom_struct(rt, i);
         if (p->hash == h &&
             p->atom_type == JS_ATOM_TYPE_STRING &&
             p->len == len &&
@@ -3404,7 +3546,7 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
 
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
 {
-    /* arena: this would unlink from rt->atom_hash, rewrite rt->atom_array[i],
+    /* arena: this would unlink from rt->atom_hash, rewrite js_atom_struct(rt, i),
        update rt->atom_free_index and rt->atom_count — all base writes. We
        leak the atom slot instead; arena reset reclaims everything wholesale. */
     if (js_arena_base_lo)
@@ -3416,7 +3558,7 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
 
         h0 = p->hash & (rt->atom_hash_size - 1);
         i = rt->atom_hash[h0];
-        p1 = rt->atom_array[i];
+        p1 = js_atom_struct(rt, i);
         if (p1 == p) {
             rt->atom_hash[h0] = p1->hash_next;
         } else {
@@ -3424,7 +3566,7 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
                 assert(i != 0);
                 p0 = p1;
                 i = p1->hash_next;
-                p1 = rt->atom_array[i];
+                p1 = js_atom_struct(rt, i);
                 if (p1 == p) {
                     p0->hash_next = p1->hash_next;
                     break;
@@ -3451,7 +3593,7 @@ static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
 {
     JSAtomStruct *p;
 
-    p = rt->atom_array[i];
+    p = js_atom_struct(rt, i);
     if (arena_rc_dec(&p->header) > 0)
         return;
     JS_FreeAtomStruct(rt, p);
@@ -3534,7 +3676,7 @@ static JSValue JS_NewSymbolInternal(JSContext *ctx, JSString *p, int atom_type)
     atom = __JS_NewAtom(rt, p, atom_type);
     if (atom == JS_ATOM_NULL)
         return JS_ThrowOutOfMemory(ctx);
-    return JS_MKPTR(JS_TAG_SYMBOL, rt->atom_array[atom]);
+    return JS_MKPTR(JS_TAG_SYMBOL, js_atom_struct(rt, atom));
 }
 
 /* descr must be a non-numeric string atom */
@@ -3546,7 +3688,7 @@ static JSValue JS_NewSymbolFromAtom(JSContext *ctx, JSAtom descr,
 
     assert(!__JS_AtomIsTaggedInt(descr));
     assert(descr < rt->atom_size);
-    p = rt->atom_array[descr];
+    p = js_atom_struct(rt, descr);
     js_dup(JS_MKPTR(JS_TAG_STRING, p));
     return JS_NewSymbolInternal(ctx, p, atom_type);
 }
@@ -3582,7 +3724,7 @@ static const char *JS_AtomGetStrRT(JSRuntime *rt, char *buf, int buf_size,
         assert(atom < rt->atom_size);
         snprintf(buf, buf_size, "<invalid %x>", atom);
     } else {
-        JSAtomStruct *p = rt->atom_array[atom];
+        JSAtomStruct *p = js_atom_struct(rt, atom);
         *buf = '\0';
         if (atom_is_free(p)) {
             snprintf(buf, buf_size, "<free %x>", atom);
@@ -3615,13 +3757,13 @@ static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, bool force_string)
         JSRuntime *rt = ctx->rt;
         JSAtomStruct *p;
         assert(atom < rt->atom_size);
-        p = rt->atom_array[atom];
+        p = js_atom_struct(rt, atom);
         if (p->atom_type == JS_ATOM_TYPE_STRING) {
             goto ret_string;
         } else if (force_string) {
             if (p->len == 0 && p->is_wide_char != 0) {
                 /* no description string */
-                p = rt->atom_array[JS_ATOM_empty_string];
+                p = js_atom_struct(rt, JS_ATOM_empty_string);
             }
         ret_string:
             return js_dup(JS_MKPTR(JS_TAG_STRING, p));
@@ -3654,7 +3796,7 @@ static bool JS_AtomIsArrayIndex(JSContext *ctx, uint32_t *pval, JSAtom atom)
         uint32_t val;
 
         assert(atom < rt->atom_size);
-        p = rt->atom_array[atom];
+        p = js_atom_struct(rt, atom);
         if (p->atom_type == JS_ATOM_TYPE_STRING &&
             is_num_string(&val, p) && val != -1) {
             *pval = val;
@@ -3680,7 +3822,7 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
     if (__JS_AtomIsTaggedInt(atom))
         return js_int32(__JS_AtomToUInt32(atom));
     assert(atom < rt->atom_size);
-    p1 = rt->atom_array[atom];
+    p1 = js_atom_struct(rt, atom);
     if (p1->atom_type != JS_ATOM_TYPE_STRING)
         return JS_UNDEFINED;
     p = p1;
@@ -3782,7 +3924,7 @@ static bool JS_AtomSymbolHasDescription(JSContext *ctx, JSAtom v)
     rt = ctx->rt;
     if (__JS_AtomIsTaggedInt(v))
         return false;
-    p = rt->atom_array[v];
+    p = js_atom_struct(rt, v);
     return (((p->atom_type == JS_ATOM_TYPE_SYMBOL &&
               p->hash == JS_ATOM_HASH_SYMBOL) ||
              p->atom_type == JS_ATOM_TYPE_GLOBAL_SYMBOL) &&
@@ -4006,7 +4148,7 @@ int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def)
 
 static inline JSValue js_empty_string(JSRuntime *rt)
 {
-    JSAtomStruct *p = rt->atom_array[JS_ATOM_empty_string];
+    JSAtomStruct *p = js_atom_struct(rt, JS_ATOM_empty_string);
     return js_dup(JS_MKPTR(JS_TAG_STRING, p));
 }
 
@@ -7668,7 +7810,7 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
     s->atom_size = sizeof(rt->atom_array[0]) * rt->atom_size +
         sizeof(rt->atom_hash[0]) * rt->atom_hash_size;
     for(i = 0; i < rt->atom_size; i++) {
-        JSAtomStruct *p = rt->atom_array[i];
+        JSAtomStruct *p = js_atom_struct(rt, i);
         if (!atom_is_free(p)) {
             s->atom_size += (sizeof(*p) + (p->len << p->is_wide_char) +
                              1 - p->is_wide_char);
@@ -37916,7 +38058,7 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
                more efficient. */
             bc_put_u32(s, atom);
         } else {
-            JSAtomStruct *p = rt->atom_array[atom];
+            JSAtomStruct *p = js_atom_struct(rt, atom);
             uint8_t type = p->atom_type;
             assert(type != JS_ATOM_TYPE_PRIVATE);
             bc_put_u8(s, type);
@@ -39146,7 +39288,7 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
             if (__JS_AtomIsConst(atom)) {
                 obj = JS_AtomToValue(s->ctx, atom);
             } else {
-                JSAtomStruct *p = s->ctx->rt->atom_array[atom];
+                JSAtomStruct *p = js_atom_struct(s->ctx->rt, atom);
                 obj = JS_NewSymbolFromAtom(s->ctx, atom, p->atom_type);
             }
         }
@@ -39318,7 +39460,7 @@ static JSAtom find_atom(JSContext *ctx, const char *name)
         /* We assume 8 bit non null strings, which is the case for these
            symbols */
         for(atom = JS_ATOM_Symbol_toPrimitive; atom < JS_ATOM_END; atom++) {
-            JSAtomStruct *p = ctx->rt->atom_array[atom];
+            JSAtomStruct *p = js_atom_struct(ctx->rt, atom);
             JSString *str = p;
             if (str->len == len && !memcmp(str8(str), name, len))
                 return JS_DupAtom(ctx, atom);

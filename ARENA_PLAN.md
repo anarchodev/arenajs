@@ -319,8 +319,28 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   | global_var_obj prop | +28672 | 14 |
   | **total**     | 3 pages   | **39** |
 
-- Currently on **step 5 (atom overlay)** — same shape as step 4 but for
-  atoms. Two-tier `atom_array` + `atom_hash`: base is read-only, request
-  atoms live in a per-request overlay in the request arena. Eliminates
-  pages +0 and +4096. Then step 6 (shadow-on-write for base JSObjects)
-  closes the global-object hole and gets us to zero.
+- 5 done. JSRequestState gained `atom_overlay` (request-arena slot
+  array), `atom_overlay_base` (= base atom_size at freeze; UINT32_MAX
+  pre-freeze so the overlay path is dead), `atom_hash_overlay`, and
+  small bookkeeping fields. New atoms interned during a request get
+  index >= atom_overlay_base and live in the overlay; lookups dispatch
+  via `js_atom_struct(rt, i)`. `__JS_NewAtom` and `__JS_FindAtom` walk
+  the overlay hash chain first then fall through to the base chain.
+  `js_get_atom_index` walks the overlay or base chain depending on
+  whether `p` is in the base arena.
+
+  Mechanical work: `rt->atom_array[X]` reads (~30 sites) bulk-replaced
+  with `js_atom_struct(rt, X)` via sed. Three LHS write sites in
+  init/intern/free reverted to direct base access (those are pre-freeze
+  init or the gated free path).
+
+  **Steady-state request#2: 1 page, 14 bytes.** Only +28672 remains —
+  the `JS_DefineGlobalVar` write into `ctx->global_var_obj->prop[i]`.
+  Pages +0 and +4096 (atom-related) are gone.
+
+- Currently on **step 6 (shadow-on-write for base JSObjects)** — the
+  last hole. Closes `globalThis.X = ...`, `Array.prototype.foo = ...`,
+  `Object.defineProperty(...)` etc. against the inviolate-base
+  invariant. Per-request shadow map (base p → request shadow) routed
+  through `ctx->creq` indirection; shadows are sparse, only allocated
+  for the JSObjects a given request actually mutates.
