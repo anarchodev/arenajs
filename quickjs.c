@@ -4375,7 +4375,7 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
         slice = (void *)&q[1];
         slice->parent = p;
         slice->start = start << p->is_wide_char; // chars -> bytes
-        p->header.ref_count++;
+        arena_rc_inc(&p->header);
         return JS_MKPTR(JS_TAG_STRING, q);
     }
     if (p->is_wide_char) {
@@ -17668,7 +17668,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
         var_ref = sf->var_refs[var_ref_idx];
         if (var_ref) {
             /* reference to the already created local variable */
-            var_ref->header.ref_count++;
+            arena_rc_inc(&var_ref->header);
             return var_ref;
         }
 
@@ -17733,7 +17733,7 @@ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
             case JS_CLOSURE_REF:
             case JS_CLOSURE_GLOBAL_REF:
                 var_ref = cur_var_refs[cv->var_idx];
-                var_ref->header.ref_count++;
+                arena_rc_inc(&var_ref->header);
                 break;
             default:
                 abort();
@@ -19248,7 +19248,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
                 if (opcode == OP_make_var_ref_ref) {
                     var_ref = var_refs[idx];
-                    var_ref->header.ref_count++;
+                    arena_rc_inc(&var_ref->header);
                 } else {
                     var_ref = get_var_ref(ctx, sf, idx, opcode == OP_make_arg_ref);
                     if (!var_ref)
@@ -21354,7 +21354,7 @@ static void js_async_function_free0(JSRuntime *rt, JSAsyncFunctionData *s)
 
 static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s)
 {
-    if (--s->header.ref_count == 0) {
+    if (arena_rc_dec(&s->header) == 0) {
         js_async_function_free0(rt, s);
     }
 }
@@ -30544,7 +30544,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
                                   JS_PROP_VARREF);
                 if (!pr)
                     goto fail;
-                var_ref->header.ref_count++;
+                arena_rc_inc(&var_ref->header);
                 pr->u.var_ref = var_ref;
             }
             break;
@@ -30665,7 +30665,7 @@ static int js_create_module_bytecode_function(JSContext *ctx, JSModuleDef *m)
 
     p = JS_VALUE_GET_OBJ(func_obj);
     p->u.func.function_bytecode = b;
-    b->header.ref_count++;
+    arena_rc_inc(&b->header);
     p->u.func.home_object = NULL;
     p->u.func.var_refs = NULL;
     if (b->closure_var_count) {
@@ -30892,7 +30892,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                         p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
                         var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
                     }
-                    var_ref->header.ref_count++;
+                    arena_rc_inc(&var_ref->header);
                     var_refs[mi->var_idx] = var_ref;
 
                     module_trace(ctx, "local export (var_ref=%p)\n", (void *)var_ref);
@@ -30907,7 +30907,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             JSExportEntry *me = &m->export_entries[i];
             if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
                 var_ref = var_refs[me->u.local.var_idx];
-                var_ref->header.ref_count++;
+                arena_rc_inc(&var_ref->header);
                 me->u.local.var_ref = var_ref;
             }
         }
