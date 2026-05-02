@@ -136,8 +136,29 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   rest of the request. So the metric is unique-pages-dirtied; CoW would
   copy that many pages per request.
 
-- Currently on **step 1b** — guard the internal direct-touch inc/dec sites
-  (shape `++`/`--`, var_ref bumps, atom inc/dec) and watch the thermometer
-  drop. Then attribute any residual writes to runtime-state mutations
-  (`current_exception`, `gc_obj_list` head, `malloc_state` counters) and
-  plan their move into a per-request `JSRequestState`.
+- 1b complete. `arena_rc_inc(hdr)` / `arena_rc_dec(hdr)` inline helpers
+  applied to the internal direct-touch sites: atom inc/dec (`JS_DupAtom`,
+  `JS_DupAtomRT`, the two atom-hash hit paths, `__JS_FreeAtom`, the
+  string-dec inside the atom-intern path), shape inc/dec (`js_dup_shape`,
+  `js_free_shape`), `js_free_string`, `free_var_ref`. GC suppressed in
+  arena mode (cycle collector walks `gc_obj_list` and writes ref_counts
+  directly, would underflow our deliberately-small base ref_counts).
+  `js_calloc_rt` / `js_malloc_rt` / `js_realloc_rt` / `js_free_rt` skip
+  malloc_state tracking in arena mode — its only consumer was the GC
+  threshold and we'd be writing those counters into base on every alloc.
+
+  **Thermometer after 1b:**
+  - request#1: 12 → 9 base pages dirtied (saved 3)
+  - request#2:  7 → 5 base pages dirtied (saved 2)
+
+  Remaining writes look like genuine runtime-state mutation: assignments
+  to `rt->current_exception`, `rt->current_stack_frame` push/pop,
+  `gc_obj_list` link operations when new request-side GC objects are
+  inserted, `shape_hash` table writes when new shapes are linked. None
+  of these are refcount work — they're the runtime book-keeping fields
+  that step 2 (relocate to per-request state) targets.
+
+- Currently on **step 2** — move per-request mutable runtime state into
+  a `JSRequestState` struct allocated at the start of the request arena,
+  indirected through `rt->req`. Mechanical sed-style refactor; expect
+  another big drop in the thermometer.

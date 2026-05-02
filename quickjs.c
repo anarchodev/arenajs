@@ -1540,14 +1540,32 @@ static JSValue js_bool(bool v)
     return JS_MKVAL(JS_TAG_BOOL, (v != 0));
 }
 
+/* arena: base-arena objects are immortal. These inline helpers are used at
+   internal direct-touch ref_count sites (atom inc/dec, shape inc/dec, etc.)
+   so a single pointer-range test gates every refcount mutation.
+   The header pointer is also the start of its containing struct (because
+   `header` is the first member of every refcounted struct), so we can pass
+   it to js_arena_ptr_is_base directly. */
+static inline void arena_rc_inc(void *header)
+{
+    if (!js_arena_ptr_is_base(header))
+        ((JSRefCountHeader *)header)->ref_count++;
+}
+
+/* Returns the post-decrement count. For base objects, returns a positive
+   value so the caller's `if (... <= 0) free` branch never fires. */
+static inline int arena_rc_dec(void *header)
+{
+    if (js_arena_ptr_is_base(header))
+        return 1;
+    return --((JSRefCountHeader *)header)->ref_count;
+}
+
 static JSValue js_dup(JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        /* arena: base-arena objects are immortal — skip the inc so we
-           don't dirty their cache lines. */
-        if (!js_arena_ptr_is_base(p))
-            p->ref_count++;
+        arena_rc_inc(p);
     }
     return unsafe_unconst(v);
 }
@@ -1565,6 +1583,13 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
+    /* arena: the cycle collector walks gc_obj_list and directly decrements
+       ref_counts (bypassing our chokepoint), which would underflow the
+       deliberately-small ref_counts on base-arena objects. We don't need
+       GC anyway — the request arena is reset wholesale between requests
+       and base is immortal. Suppress here. */
+    if (js_arena_base_lo)
+        return;
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = true;
 #else
@@ -1601,6 +1626,11 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
             return NULL;
 
     s = &rt->malloc_state;
+    /* arena: skip the malloc_state tracking; arena enforces its own
+       capacity at the allocator level, and the tracking only feeds GC. */
+    if (js_arena_base_lo)
+        return rt->mf.js_calloc(s->opaque, count, size);
+
     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
     if (unlikely(s->malloc_size + (count * size) > s->malloc_limit - 1))
         return NULL;
@@ -1624,6 +1654,9 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
         return NULL;
 
     s = &rt->malloc_state;
+    if (js_arena_base_lo)
+        return rt->mf.js_malloc(s->opaque, size);
+
     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
     if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
         return NULL;
@@ -1643,6 +1676,15 @@ void js_free_rt(JSRuntime *rt, void *ptr)
 
     if (!ptr)
         return;
+
+    /* arena: the bump allocator reclaims everything wholesale on
+       js_dual_arena_free / arena reset. Per-allocation tracking exists
+       only to drive GC, and we disabled GC for arena mode. Skip the
+       bookkeeping; mf.js_free is itself a no-op. */
+    if (js_arena_base_lo) {
+        rt->mf.js_free(rt->malloc_state.opaque, ptr);
+        return;
+    }
 
     s = &rt->malloc_state;
     size_t free_size = rt->mf.js_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
@@ -1669,8 +1711,11 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
         js_free_rt(rt, ptr);
         return NULL;
     }
-    old_size = rt->mf.js_malloc_usable_size(ptr);
     s = &rt->malloc_state;
+    if (js_arena_base_lo)
+        return rt->mf.js_realloc(s->opaque, ptr, size);
+
+    old_size = rt->mf.js_malloc_usable_size(ptr);
     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
     if (s->malloc_size + size - old_size > s->malloc_limit - 1)
         return NULL;
@@ -2238,7 +2283,7 @@ static inline void js_free_string0(JSRuntime *rt, JSString *str);
 /* same as JS_FreeValueRT() but faster */
 static inline void js_free_string(JSRuntime *rt, JSString *str)
 {
-    if (--str->header.ref_count <= 0)
+    if (arena_rc_dec(&str->header) <= 0)
         js_free_string0(rt, str);
 }
 
@@ -3003,7 +3048,7 @@ JSAtom JS_DupAtomRT(JSRuntime *rt, JSAtom v)
 
     if (!__JS_AtomIsConst(v)) {
         p = rt->atom_array[v];
-        p->header.ref_count++;
+        arena_rc_inc(&p->header);
     }
     return v;
 }
@@ -3016,7 +3061,7 @@ JSAtom JS_DupAtom(JSContext *ctx, JSAtom v)
     if (!__JS_AtomIsConst(v)) {
         rt = ctx->rt;
         p = rt->atom_array[v];
-        p->header.ref_count++;
+        arena_rc_inc(&p->header);
     }
     return v;
 }
@@ -3082,7 +3127,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
             i = js_get_atom_index(rt, str);
             /* reduce string refcount and increase atom's unless constant */
             if (__JS_AtomIsConst(i))
-                str->header.ref_count--;
+                arena_rc_dec(&str->header);
             return i;
         }
         /* try and locate an already registered atom */
@@ -3098,7 +3143,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
                 p->len == len &&
                 js_string_memcmp(p, str, len) == 0) {
                 if (!__JS_AtomIsConst(i))
-                    p->header.ref_count++;
+                    arena_rc_inc(&p->header);
                 goto done;
             }
             i = p->hash_next;
@@ -3257,7 +3302,7 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
             p->is_wide_char == 0 &&
             memcmp(str8(p), str, len) == 0) {
             if (!__JS_AtomIsConst(i))
-                p->header.ref_count++;
+                arena_rc_inc(&p->header);
             return i;
         }
         i = p->hash_next;
@@ -3310,7 +3355,7 @@ static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
     JSAtomStruct *p;
 
     p = rt->atom_array[i];
-    if (--p->header.ref_count > 0)
+    if (arena_rc_dec(&p->header) > 0)
         return;
     JS_FreeAtomStruct(rt, p);
 }
@@ -5399,7 +5444,7 @@ static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
 
 static JSShape *js_dup_shape(JSShape *sh)
 {
-    sh->header.ref_count++;
+    arena_rc_inc(&sh->header);
     return sh;
 }
 
@@ -5425,7 +5470,7 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 
 static void js_free_shape(JSRuntime *rt, JSShape *sh)
 {
-    if (unlikely(--sh->header.ref_count <= 0)) {
+    if (unlikely(arena_rc_dec(&sh->header) <= 0)) {
         js_free_shape0(rt, sh);
     }
 }
@@ -6465,7 +6510,7 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
 {
     if (var_ref) {
         assert(var_ref->header.ref_count > 0);
-        if (--var_ref->header.ref_count == 0) {
+        if (arena_rc_dec(&var_ref->header) == 0) {
             if (var_ref->is_detached) {
                 JS_FreeValueRT(rt, var_ref->value);
                 remove_gc_object(&var_ref->header);
@@ -6774,11 +6819,7 @@ void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        /* arena: base-arena objects are immortal — skip the dec and
-           never enter the free path. */
-        if (js_arena_ptr_is_base(p))
-            return;
-        if (--p->ref_count <= 0) {
+        if (arena_rc_dec(p) <= 0) {
             js_free_value_rt(rt, v);
         }
     }
