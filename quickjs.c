@@ -11966,7 +11966,11 @@ static int JS_DefineGlobalFunction(JSContext *ctx, JSAtom prop,
     JSShapeProperty *prs;
     int flags;
 
-    p = JS_VALUE_GET_OBJ(ctx->global_obj);
+    /* arena: check the active (possibly shadowed) global_obj, so a
+       prior define on the shadow is visible to the redeclaration check.
+       The actual JS_DefineProperty below routes through the same shadow
+       on the write path. */
+    p = js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ctx->global_obj));
     prs = find_own_property1(p, prop);
     flags = JS_PROP_HAS_VALUE | JS_PROP_THROW;
     if (!prs || (prs->flags & JS_PROP_CONFIGURABLE)) {
