@@ -158,7 +158,25 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   of these are refcount work — they're the runtime book-keeping fields
   that step 2 (relocate to per-request state) targets.
 
-- Currently on **step 2** — move per-request mutable runtime state into
-  a `JSRequestState` struct allocated at the start of the request arena,
-  indirected through `rt->req`. Mechanical sed-style refactor; expect
-  another big drop in the thermometer.
+- 2a partial: skipped `gc_obj_list` link/unlink in arena mode
+  (`add_gc_object` initializes a self-loop link instead, `js_free_value_rt`
+  bypasses the `gc_zero_ref_count_list` queue and calls `free_gc_object`
+  directly). Skipped `JS_FreeAtomStruct` in arena mode (would otherwise
+  rewrite `rt->atom_array[i]`, `rt->atom_count`, `rt->atom_free_index`
+  and traverse `rt->atom_hash` chains — all in base).
+
+  Thermometer:
+  - request#1: 9 → 8 base pages dirtied (saved 1)
+  - request#2: 5 → 5 (unchanged this run)
+
+  Marginal drop because the eliminated bytes overlap with pages already
+  dirtied by other writes (probably the JSRuntime struct itself, which
+  spans a few pages and gets mutated for `current_exception`,
+  `current_stack_frame`, `shape_hash`, etc.).
+
+- Currently needed: **diagnostic on the thermometer** — report *which*
+  pages are dirty, not just how many. Then map page indices to JSRuntime
+  field offsets so we can see whether the residual writes are in the rt
+  struct (run-state move target) vs. shape_hash (overlay target) vs.
+  somewhere unexpected. Without that, surgical guards have diminishing
+  returns because we can't tell what's still firing.

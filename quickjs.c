@@ -3312,6 +3312,11 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
 
 static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
 {
+    /* arena: this would unlink from rt->atom_hash, rewrite rt->atom_array[i],
+       update rt->atom_free_index and rt->atom_count — all base writes. We
+       leak the atom slot instead; arena reset reclaims everything wholesale. */
+    if (js_arena_base_lo)
+        return;
     uint32_t i = p->hash_next;  /* atom_index */
     if (p->atom_type != JS_ATOM_TYPE_SYMBOL) {
         JSAtomStruct *p0, *p1;
@@ -6785,7 +6790,13 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
     case JS_TAG_FUNCTION_BYTECODE:
         {
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
-            if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
+            if (js_arena_base_lo) {
+                /* arena: bypass the gc_zero_ref_count_list dance whose
+                   head lives in base. Free directly; finalizers run as
+                   normal. Recursion through children is bounded by JS
+                   call depth in practice. */
+                free_gc_object(rt, p);
+            } else if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                 list_del(&p->link);
                 list_add(&p->link, &rt->gc_zero_ref_count_list);
                 if (rt->gc_phase == JS_GC_PHASE_NONE) {
@@ -6837,6 +6848,15 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
 {
     h->mark = 0;
     h->gc_obj_type = type;
+    if (js_arena_base_lo) {
+        /* arena: gc_obj_list head lives in base; linking into it would
+           dirty a base page on every allocation. We don't traverse the
+           list (GC is suppressed; teardown walks gated by ENABLE_DUMPS),
+           so just initialize the link to a self-loop so subsequent
+           list_del is a no-op. */
+        init_list_head(&h->link);
+        return;
+    }
     list_add_tail(&h->link, &rt->gc_obj_list);
 }
 
