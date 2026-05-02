@@ -267,6 +267,7 @@ set(qjs_sources
     dtoa.c
     libregexp.c
     libunicode.c
+    qjs-arena.c
     quickjs.c
 )
 
@@ -545,7 +546,7 @@ if (QJS_ENABLE_INSTALL)
         VERSION ${QJS_VERSION_MAJOR}.${QJS_VERSION_MINOR}.${QJS_VERSION_PATCH}
         SOVERSION ${QJS_VERSION_MAJOR}
     )
-    install(FILES quickjs.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES quickjs.h qjs-arena.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     if(QJS_BUILD_LIBC)
         install(FILES quickjs-libc.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
     endif()

@@ -525,6 +525,9 @@ JS_EXTERN JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 JS_EXTERN void JS_FreeRuntime(JSRuntime *rt);
 JS_EXTERN void *JS_GetRuntimeOpaque(JSRuntime *rt);
 JS_EXTERN void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
+/* Returns the opaque pointer that was passed to JS_NewRuntime2, i.e. the one
+   threaded through JSMallocFunctions callbacks. */
+JS_EXTERN void *JS_GetMallocOpaque(JSRuntime *rt);
 JS_EXTERN int JS_AddRuntimeFinalizer(JSRuntime *rt,
                                      JSRuntimeFinalizer *finalizer, void *arg);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);

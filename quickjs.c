@@ -2013,6 +2013,11 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
     rt->user_opaque = opaque;
 }
 
+void *JS_GetMallocOpaque(JSRuntime *rt)
+{
+    return rt->malloc_state.opaque;
+}
+
 int JS_AddRuntimeFinalizer(JSRuntime *rt, JSRuntimeFinalizer *finalizer,
                            void *arg)
 {

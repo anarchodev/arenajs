@@ -137,10 +137,12 @@ qjs_srcs = files(
   'dtoa.c',
   'libregexp.c',
   'libunicode.c',
+  'qjs-arena.c',
   'quickjs.c',
 )
 qjs_hdrs = files(
   'quickjs.h',
+  'qjs-arena.h',
 )
 
 qjs_libc = get_option('libc')
