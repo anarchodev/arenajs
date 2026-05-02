@@ -75,6 +75,13 @@ JS_EXTERN void JS_FreezeRuntime(JSRuntime *rt);
 JS_EXTERN void JS_ResetRequestArena(JSRuntime *rt);
 JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
 
+/* Internal coordination — relocates the per-request mutable runtime state
+   (current_exception, current_stack_frame, in_*, parent_promise) from its
+   embedded backing on JSRuntime to a freshly allocated JSRequestState in
+   the request arena. Called by JS_FreezeRuntime after the dual arena
+   has flipped to request mode. Returns 0 on success, -1 on OOM. */
+JS_EXTERN int JS_RelocateReqState(JSRuntime *rt);
+
 /* Page-fault-based base-arena write detector — the "CoW thermometer" in
  * ARENA_PLAN.md. After enabling, the base arena buffer is mprotect'd
  * read-only and a SIGSEGV handler counts every write that touches it.

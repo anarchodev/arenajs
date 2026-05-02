@@ -329,7 +329,10 @@ JSDualArena *JS_GetDualArena(JSRuntime *rt)
 
 void JS_FreezeRuntime(JSRuntime *rt)
 {
+    /* Order matters: flip to request mode FIRST so the JSRequestState
+       allocation lands in the request arena, then relocate. */
     js_dual_arena_freeze(JS_GetDualArena(rt));
+    JS_RelocateReqState(rt);
 }
 
 void JS_ResetRequestArena(JSRuntime *rt)

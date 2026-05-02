@@ -265,6 +265,22 @@ typedef struct JSValueLink {
     JSValueConst value;
 } JSValueLink;
 
+/* arena: per-request mutable runtime state. In non-arena mode, the
+   embedded `req_state` on JSRuntime is the storage and `req` points at
+   it; reads/writes land on rt as before. In arena mode after freeze,
+   JS_RelocateReqState allocates a fresh JSRequestState in the request
+   arena and re-points `rt->req` at it, so subsequent mutations of
+   these fields no longer dirty base pages. */
+typedef struct JSRequestState {
+    JSValue current_exception;
+    /* true if inside an out of memory error, to avoid recursing */
+    bool in_out_of_memory;
+    /* true if inside build_backtrace, to avoid recursing */
+    bool in_build_stack_trace;
+    struct JSStackFrame *current_stack_frame;
+    JSValueLink *parent_promise;
+} JSRequestState;
+
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -299,24 +315,24 @@ struct JSRuntime {
     uintptr_t stack_top;
     uintptr_t stack_limit; /* lower stack limit */
 
-    JSValue current_exception;
-    /* true if inside an out of memory error, to avoid recursing */
-    bool in_out_of_memory;
-    /* true if inside build_backtrace, to avoid recursing */
-    bool in_build_stack_trace;
     /* true if inside JS_FreeRuntime */
     bool in_free;
 
-    struct JSStackFrame *current_stack_frame;
+    /* arena: fields formerly here (current_exception, in_out_of_memory,
+       in_build_stack_trace, current_stack_frame, parent_promise) live
+       in JSRequestState now; access via rt->req. The embedded req_state
+       below is the backing for non-arena mode. */
+    JSRequestState req_state;
+    JSRequestState *req;
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
-    // for smuggling the parent promise from js_promise_then
-    // to js_promise_constructor
-    JSValueLink *parent_promise;
+    /* parent_promise moved to JSRequestState (rt->req->parent_promise);
+       smuggles the parent promise from js_promise_then to
+       js_promise_constructor */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -2005,6 +2021,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->malloc_state = ms;
     rt->malloc_gc_threshold = 256 * 1024;
 
+    /* arena: req points at the embedded backing until JS_FreezeRuntime
+       (in arena mode) repoints it at a fresh JSRequestState in the
+       request arena. */
+    rt->req = &rt->req_state;
+
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
     init_list_head(&rt->gc_zero_ref_count_list);
@@ -2044,7 +2065,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     JS_UpdateStackTop(rt);
 
-    rt->current_exception = JS_UNINITIALIZED;
+    rt->req->current_exception = JS_UNINITIALIZED;
 
     return rt;
  fail:
@@ -2067,6 +2088,22 @@ void *JS_GetMallocOpaque(JSRuntime *rt)
     return rt->malloc_state.opaque;
 }
 
+/* arena: at freeze time the dual-arena flips to request mode, so a
+   js_calloc here lands in the request arena. We copy the embedded
+   req_state contents (whatever transient state the snapshot left
+   behind, almost certainly clean) and re-point rt->req. From here
+   on, every read/write of one of these fields hits the request
+   arena instead of dirtying the JSRuntime page in base. */
+int JS_RelocateReqState(JSRuntime *rt)
+{
+    JSRequestState *new_req = js_mallocz_rt(rt, sizeof(*new_req));
+    if (!new_req)
+        return -1;
+    *new_req = rt->req_state;
+    rt->req = new_req;
+    return 0;
+}
+
 void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
 {
     FILE *out = (FILE *)out_FILE;
@@ -2079,8 +2116,8 @@ void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
     F(class_array);
     F(gc_obj_list);
     F(gc_zero_ref_count_list);
-    F(current_exception);
-    F(current_stack_frame);
+    F(req_state);
+    F(req);
     F(job_list);
     F(shape_hash);
 #undef F
@@ -2093,10 +2130,12 @@ void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
             (void *)rt->class_array, rt->class_count, sizeof(JSClass));
     fprintf(out, "  shape_hash   = %p (%d entries x 8B)\n",
             (void *)rt->shape_hash, rt->shape_hash_size);
-    fprintf(out, "  current_excn = %p (16B JSValue)\n",
-            (void *)&rt->current_exception);
-    fprintf(out, "  cur_frame    = %p (8B ptr)\n",
-            (void *)&rt->current_stack_frame);
+    fprintf(out, "  rt->req      = %p (sizeof JSRequestState = %zu)\n",
+            (void *)rt->req, sizeof(JSRequestState));
+    fprintf(out, "  current_excn = %p (16B JSValue, in *req)\n",
+            (void *)&rt->req->current_exception);
+    fprintf(out, "  cur_frame    = %p (8B ptr, in *req)\n",
+            (void *)&rt->req->current_stack_frame);
     fprintf(out, "  gc_obj_list  = %p (16B list_head)\n",
             (void *)&rt->gc_obj_list);
 }
@@ -2356,7 +2395,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
-    JS_FreeValueRT(rt, rt->current_exception);
+    JS_FreeValueRT(rt, rt->req->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -2838,7 +2877,7 @@ void JS_UpdateStackTop(JSRuntime *rt)
 
 static inline bool is_strict_mode(JSContext *ctx)
 {
-    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    JSStackFrame *sf = ctx->rt->req->current_stack_frame;
     return sf && sf->is_strict_mode;
 }
 
@@ -6310,15 +6349,15 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
         for(i = argc; i < arg_count; i++)
             arg_buf[i] = JS_UNDEFINED;
     }
-    prev_sf = rt->current_stack_frame;
+    prev_sf = rt->req->current_stack_frame;
     sf->prev_frame = prev_sf;
-    rt->current_stack_frame = sf;
+    rt->req->current_stack_frame = sf;
     // TODO(bnoordhuis) switch realms like js_call_c_function does
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
-    rt->current_stack_frame = sf->prev_frame;
+    rt->req->current_stack_frame = sf->prev_frame;
     return ret;
 }
 
@@ -6435,15 +6474,15 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
             arg_buf[i] = JS_UNDEFINED;
     }
 
-    prev_sf = rt->current_stack_frame;
+    prev_sf = rt->req->current_stack_frame;
     sf->prev_frame = prev_sf;
-    rt->current_stack_frame = sf;
+    rt->req->current_stack_frame = sf;
     // TODO(bnoordhuis) switch realms like js_call_c_function does
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
-    rt->current_stack_frame = sf->prev_frame;
+    rt->req->current_stack_frame = sf->prev_frame;
 
     return ret;
 }
@@ -7667,8 +7706,8 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
-    JS_FreeValue(ctx, rt->current_exception);
-    rt->current_exception = obj;
+    JS_FreeValue(ctx, rt->req->current_exception);
+    rt->req->current_exception = obj;
     return JS_EXCEPTION;
 }
 
@@ -7677,14 +7716,14 @@ JSValue JS_GetException(JSContext *ctx)
 {
     JSValue val;
     JSRuntime *rt = ctx->rt;
-    val = rt->current_exception;
-    rt->current_exception = JS_UNINITIALIZED;
+    val = rt->req->current_exception;
+    rt->req->current_exception = JS_UNINITIALIZED;
     return val;
 }
 
 bool JS_HasException(JSContext *ctx)
 {
-    return !JS_IsUninitialized(ctx->rt->current_exception);
+    return !JS_IsUninitialized(ctx->rt->req->current_exception);
 }
 
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
@@ -7855,9 +7894,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     int stack_trace_limit;
 
     rt = ctx->rt;
-    if (rt->in_build_stack_trace)
+    if (rt->req->in_build_stack_trace)
         return;
-    rt->in_build_stack_trace = true;
+    rt->req->in_build_stack_trace = true;
 
     // Save exception because conversion to double may fail.
     saved_exception = JS_GetException(ctx);
@@ -7910,7 +7949,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (filename && (backtrace_flags & JS_BACKTRACE_FLAG_SINGLE_LEVEL))
         goto done;
 
-    sf_start = rt->current_stack_frame;
+    sf_start = rt->req->current_stack_frame;
 
     /* Find the frame we want to start from. Note that when a filter is used the filter
        function will be the first, but we also specify we want to skip the first one. */
@@ -8031,7 +8070,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         JS_FreeValue(ctx, stack);
     }
 
-    rt->in_build_stack_trace = false;
+    rt->req->in_build_stack_trace = false;
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -8102,8 +8141,8 @@ JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
     bool add_backtrace;
 
     /* the backtrace is added later if called from a bytecode function */
-    sf = rt->current_stack_frame;
-    add_backtrace = !rt->in_out_of_memory &&
+    sf = rt->req->current_stack_frame;
+    add_backtrace = !rt->req->in_out_of_memory &&
         (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
     return JS_ThrowError2(ctx, error_num, add_backtrace, fmt, ap);
 }
@@ -8198,10 +8237,10 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
-    if (!rt->in_out_of_memory) {
-        rt->in_out_of_memory = true;
+    if (!rt->req->in_out_of_memory) {
+        rt->req->in_out_of_memory = true;
         JS_ThrowInternalError(ctx, "out of memory");
-        rt->in_out_of_memory = false;
+        rt->req->in_out_of_memory = false;
     }
     return JS_EXCEPTION;
 }
@@ -8286,7 +8325,7 @@ static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
 static void JS_ThrowInterrupted(JSContext *ctx)
 {
     JS_ThrowInternalError(ctx, "interrupted");
-    JS_SetUncatchableError(ctx, ctx->rt->current_exception);
+    JS_SetUncatchableError(ctx, ctx->rt->req->current_exception);
 }
 
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
@@ -11703,7 +11742,7 @@ void JS_ClearUncatchableError(JSContext *ctx, JSValueConst val)
 
 void JS_ResetUncatchableError(JSContext *ctx)
 {
-    js_set_uncatchable_error(ctx, ctx->rt->current_exception, false);
+    js_set_uncatchable_error(ctx, ctx->rt->req->current_exception, false);
 }
 
 int JS_SetOpaque(JSValueConst obj, void *opaque)
@@ -16315,7 +16354,7 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
 
     props[0].u.value = js_int32(argc); /* length */
     props[1].u.value = js_dup(ctx->array_proto_values); /* Symbol.iterator */
-    props[2].u.value = js_dup(ctx->rt->current_stack_frame->cur_func); /* callee */
+    props[2].u.value = js_dup(ctx->rt->req->current_stack_frame->cur_func); /* callee */
 
     val = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->mapped_arguments_shape),
                                 JS_CLASS_MAPPED_ARGUMENTS, props);
@@ -16678,8 +16717,8 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     int res;
 
     if (is_exception_pending) {
-        ex_obj = ctx->rt->current_exception;
-        ctx->rt->current_exception = JS_UNINITIALIZED;
+        ex_obj = ctx->rt->req->current_exception;
+        ctx->rt->req->current_exception = JS_UNINITIALIZED;
         res = -1;
     } else {
         ex_obj = JS_UNDEFINED;
@@ -17015,7 +17054,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
 /* only valid inside C functions */
 static JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
-    return ctx->rt->current_stack_frame->cur_func;
+    return ctx->rt->req->current_stack_frame->cur_func;
 }
 
 /* create a detached var ref */
@@ -17378,9 +17417,9 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     if (js_check_stack_overflow(rt, sizeof(arg_buf[0]) * arg_count))
         return JS_ThrowStackOverflow(ctx);
 
-    prev_sf = rt->current_stack_frame;
+    prev_sf = rt->req->current_stack_frame;
     sf->prev_frame = prev_sf;
-    rt->current_stack_frame = sf;
+    rt->req->current_stack_frame = sf;
     ctx = p->u.cfunc.realm; /* change the current realm */
 
     sf->is_strict_mode = false;
@@ -17483,7 +17522,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         abort();
     }
 
-    rt->current_stack_frame = sf->prev_frame;
+    rt->req->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
 
@@ -17613,8 +17652,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
-            sf->prev_frame = rt->current_stack_frame;
-            rt->current_stack_frame = sf;
+            sf->prev_frame = rt->req->current_stack_frame;
+            rt->req->current_stack_frame = sf;
             if (s->throw_flag)
                 goto exception;
             else
@@ -17680,8 +17719,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
-    sf->prev_frame = rt->current_stack_frame;
-    rt->current_stack_frame = sf;
+    sf->prev_frame = rt->req->current_stack_frame;
+    rt->req->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -20209,13 +20248,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
-    if (needs_backtrace(rt->current_exception)
+    if (needs_backtrace(rt->req->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
         sf->cur_pc = pc;
-        build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
+        build_backtrace(ctx, rt->req->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
     }
-    if (!JS_IsUncatchableError(rt->current_exception)) {
+    if (!JS_IsUncatchableError(rt->req->current_exception)) {
         while (sp > stack_buf) {
             JSValue val = *--sp;
             JS_FreeValue(ctx, val);
@@ -20227,8 +20266,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
-                    *sp++ = rt->current_exception;
-                    rt->current_exception = JS_UNINITIALIZED;
+                    *sp++ = rt->req->current_exception;
+                    rt->req->current_exception = JS_UNINITIALIZED;
                     JS_FreeValueRT(rt, ctx->error_back_trace);
                     ctx->error_back_trace = JS_UNDEFINED;
                     pc = b->byte_code_buf + pos;
@@ -20256,7 +20295,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, *pval);
         }
     }
-    rt->current_stack_frame = sf->prev_frame;
+    rt->req->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
 
@@ -20787,7 +20826,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
     func_ret = async_func_resume(ctx, &s->func_state);
     if (JS_IsException(func_ret)) {
     fail:
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+        if (unlikely(JS_IsUncatchableError(ctx->rt->req->current_exception))) {
             is_success = false;
         } else {
             JSValue error = JS_GetException(ctx);
@@ -20796,7 +20835,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
             JS_FreeValue(ctx, error);
         resolved:
             if (unlikely(JS_IsException(ret2))) {
-                if (JS_IsUncatchableError(ctx->rt->current_exception)) {
+                if (JS_IsUncatchableError(ctx->rt->req->current_exception)) {
                     is_success = false;
                 } else {
                     abort(); /* BUG */
@@ -21846,7 +21885,7 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
     backtrace_flags = 0;
     if (s->cur_func && s->cur_func->backtrace_barrier)
         backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
-    build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, s->filename,
+    build_backtrace(ctx, ctx->rt->req->current_exception, JS_UNDEFINED, s->filename,
                     s->line_num, s->col_num, backtrace_flags);
     return -1;
 }
@@ -26355,7 +26394,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 backtrace_flags = 0;
                 if (s->cur_func && s->cur_func->backtrace_barrier)
                     backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
-                build_backtrace(s->ctx, s->ctx->rt->current_exception, JS_UNDEFINED,
+                build_backtrace(s->ctx, s->ctx->rt->req->current_exception, JS_UNDEFINED,
                                 s->filename,
                                 s->token.line_num,
                                 s->token.col_num,
@@ -30361,7 +30400,7 @@ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
     /* XXX: currently we just use the filename of the englobing
        function. It does not work for eval(). Need to add a
        ScriptOrModule info in JSFunctionBytecode */
-    sf = ctx->rt->current_stack_frame;
+    sf = ctx->rt->req->current_stack_frame;
     if (!sf)
         return JS_ATOM_NULL;
     while (n_stack_levels-- > 0) {
@@ -36647,7 +36686,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     m = NULL;
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         JSObject *p;
-        sf = ctx->rt->current_stack_frame;
+        sf = ctx->rt->req->current_stack_frame;
         assert(sf != NULL);
         assert(JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT);
         p = JS_VALUE_GET_OBJ(sf->cur_func);
@@ -36752,7 +36791,7 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    if (!rt->current_stack_frame) {
+    if (!rt->req->current_stack_frame) {
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
     }
@@ -52901,7 +52940,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     }
     is_reject = JS_IsException(res);
     if (is_reject) {
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
+        if (unlikely(JS_IsUncatchableError(ctx->rt->req->current_exception)))
             return JS_EXCEPTION;
         res = JS_GetException(ctx);
     }
@@ -53213,8 +53252,8 @@ static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target,
     rt = ctx->rt;
     if (rt->promise_hook) {
         JSValueConst parent_promise = JS_UNDEFINED;
-        if (rt->parent_promise)
-            parent_promise = rt->parent_promise->value;
+        if (rt->req->parent_promise)
+            parent_promise = rt->req->parent_promise->value;
         rt->promise_hook(ctx, JS_PROMISE_HOOK_INIT, obj, parent_promise,
                          rt->promise_hook_opaque);
     }
@@ -53792,12 +53831,12 @@ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
     // always restore, even if js_new_promise_capability callee removes hook
     have_promise_hook = (rt->promise_hook != NULL);
     if (have_promise_hook) {
-        link = (JSValueLink){rt->parent_promise, this_val};
-        rt->parent_promise = &link;
+        link = (JSValueLink){rt->req->parent_promise, this_val};
+        rt->req->parent_promise = &link;
     }
     result_promise = js_new_promise_capability(ctx, resolving_funcs, ctor);
     if (have_promise_hook)
-        rt->parent_promise = link.next;
+        rt->req->parent_promise = link.next;
     JS_FreeValue(ctx, ctor);
     if (JS_IsException(result_promise))
         return result_promise;
@@ -61927,7 +61966,7 @@ bool JS_DetectModule(const char *input, size_t input_len)
     val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>", 1,
                             JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1);
     if (JS_IsException(val)) {
-        const char *msg = JS_ToCString(ctx, rt->current_exception);
+        const char *msg = JS_ToCString(ctx, rt->req->current_exception);
         // gruesome hack to recognize exceptions from import statements;
         // necessary because we don't pass in a module loader
         is_module = !!strstr(msg, "ReferenceError: could not load module");

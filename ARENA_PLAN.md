@@ -190,10 +190,30 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
     the chokepoints; closure creation involves bytecode reference count
     bumps (`b->header.ref_count++`) at sites we haven't guarded yet.
 
-- Currently on **step 2** — move per-request mutable state on JSRuntime
-  (`current_exception`, `current_stack_frame`, `gc_obj_list` head,
-  `gc_zero_ref_count_list` head, `tmp_obj_list` head, `gc_phase`,
-  `parent_promise`, `in_*` flags, `interrupt_handler`, `current_exception`,
-  job_list head) into a `JSRequestState` struct allocated at the start of
-  the request arena. Indirect through `rt->req`. Expect page +0 to drop
-  out of the dirty set entirely.
+- 2 structural complete. `JSRequestState` (current_exception,
+  current_stack_frame, in_out_of_memory, in_build_stack_trace,
+  parent_promise) lives embedded on `JSRuntime` as `req_state` and is
+  pointed at by `rt->req`. `JS_FreezeRuntime` now (after the dual-arena
+  flips to request mode) calls `JS_RelocateReqState` which `js_calloc`'s
+  a fresh `JSRequestState` — the allocation lands in the request arena —
+  copies the embedded state into it, and re-points `rt->req`. ~58 call
+  sites in quickjs.c rewritten via `replace_all`. GC list heads, gc_phase,
+  job_list stay on rt (GC is suppressed; job_list relocation requires
+  walking and rewriting list links, deferred).
+
+  **Thermometer page count unchanged: still 8/5 pages.** The page-
+  granularity metric isn't sensitive enough to reflect this win, because
+  page +0 is also dirtied by `atom_count++` (every new atom),
+  `shape_hash_count++` (every new shape transition), possibly
+  `atom_size`/`shape_hash_size` resize bumps, and other rt fields that
+  share the page with the now-relocated ones. Once any one of those fires,
+  the page is counted as dirty regardless of how many distinct mutations
+  contributed.
+
+- **Next: byte-level signal in the thermometer.** Snapshot the base
+  buffer at enable time, expose `js_arena_thermometer_changed_bytes()`
+  that memcmp's each dirty page against the baseline to count distinct
+  modified bytes. Only then can we confirm step 2's mutation count
+  actually dropped, and target subsequent steps (atom_count writes,
+  shape_hash writes) by their mutation footprint rather than by which
+  pages they happen to share.
