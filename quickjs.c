@@ -270,7 +270,13 @@ typedef struct JSValueLink {
    it; reads/writes land on rt as before. In arena mode after freeze,
    JS_RelocateReqState allocates a fresh JSRequestState in the request
    arena and re-points `rt->req` at it, so subsequent mutations of
-   these fields no longer dirty base pages. */
+   these fields no longer dirty base pages.
+
+   Discipline: this struct is for genuinely tiny per-request state. Do
+   NOT add large structures here (atom tables, class_proto arrays, etc.)
+   — that defeats the snapshot-stays-maximal invariant. For mutations of
+   large structures, path-copy or shadow-on-write into the request arena
+   keeping the unchanged spine in base. */
 typedef struct JSRequestState {
     JSValue current_exception;
     /* true if inside an out of memory error, to avoid recursing */
@@ -279,6 +285,14 @@ typedef struct JSRequestState {
     bool in_build_stack_trace;
     struct JSStackFrame *current_stack_frame;
     JSValueLink *parent_promise;
+    /* Step 4: shape overlay. Lazily-allocated request-arena shape hash
+       table for transitions discovered during this request. Lookups
+       (find_hashed_shape_*) check this first then fall through to the
+       immutable base shape_hash table. js_shape_hash_link routes
+       request-arena shapes here so the base table is never written. */
+    JSShape **shape_overlay;        /* request-arena ptr to size buckets */
+    uint32_t shape_overlay_size;    /* power of two; 0 = not allocated */
+    uint32_t shape_overlay_count;   /* informational */
 } JSRequestState;
 
 struct JSRuntime {
@@ -2707,7 +2721,7 @@ static void js_free_modules(JSContext *ctx, JSFreeModuleEnum flag)
 
 JSContext *JS_DupContext(JSContext *ctx)
 {
-    ctx->header.ref_count++;
+    arena_rc_inc(&ctx->header);
     return ctx;
 }
 
@@ -2772,7 +2786,7 @@ void JS_FreeContext(JSContext *ctx)
     JSRuntime *rt = ctx->rt;
     int i;
 
-    if (--ctx->header.ref_count > 0)
+    if (arena_rc_dec(&ctx->header) > 0)
         return;
     assert(ctx->header.ref_count == 0);
 
@@ -5383,15 +5397,48 @@ static int resize_shape_hash(JSRuntime *rt, int new_shape_hash_bits)
     return 0;
 }
 
+/* arena: shape overlay configuration. Initial bucket count for the
+   per-request shape hash; grows by doubling. Lives in JSRequestState. */
+#define JS_SHAPE_OVERLAY_INITIAL 32
+
+/* arena: ensure rt->req->shape_overlay is allocated. Returns -1 on OOM. */
+static int js_shape_overlay_ensure(JSRuntime *rt)
+{
+    if (likely(rt->req->shape_overlay))
+        return 0;
+    size_t bytes = sizeof(JSShape *) * JS_SHAPE_OVERLAY_INITIAL;
+    rt->req->shape_overlay = js_mallocz_rt(rt, bytes);
+    if (!rt->req->shape_overlay)
+        return -1;
+    rt->req->shape_overlay_size = JS_SHAPE_OVERLAY_INITIAL;
+    return 0;
+}
+
+static inline uint32_t js_shape_overlay_bucket(uint32_t hash, uint32_t size)
+{
+    /* size is always a power of two */
+    return hash & (size - 1);
+}
+
 static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
 {
     uint32_t h;
+    /* arena: request-arena shapes go into the per-request overlay so the
+       base shape_hash table is never written. Base shapes (snapshot init)
+       still link into the base table normally. */
+    if (js_arena_base_lo && !js_arena_ptr_is_base(sh)) {
+        if (js_shape_overlay_ensure(rt) < 0)
+            return;  /* on OOM, skip linking; lookups won't find this shape */
+        h = js_shape_overlay_bucket(sh->hash, rt->req->shape_overlay_size);
+        sh->shape_hash_next = rt->req->shape_overlay[h];
+        rt->req->shape_overlay[h] = sh;
+        rt->req->shape_overlay_count++;
+        return;
+    }
     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
     sh->shape_hash_next = rt->shape_hash[h];
     rt->shape_hash[h] = sh;
-    /* arena: skip the count bump on rt (in base); shape_hash never
-       resizes in arena mode and chains grow unboundedly. Bounded by
-       distinct shapes per runtime, which is small in practice. */
+    /* skip rt->shape_hash_count in arena mode (base write, no consumer) */
     if (!js_arena_base_lo)
         rt->shape_hash_count++;
 }
@@ -5401,12 +5448,26 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     uint32_t h;
     JSShape **psh;
 
+    /* arena: base shapes are immortal — never unlinked once frozen. */
+    if (js_arena_base_lo && js_arena_ptr_is_base(sh))
+        return;
+    /* arena: request-arena shape lives in the overlay. */
+    if (js_arena_base_lo && rt->req->shape_overlay) {
+        h = js_shape_overlay_bucket(sh->hash, rt->req->shape_overlay_size);
+        psh = &rt->req->shape_overlay[h];
+        while (*psh && *psh != sh)
+            psh = &(*psh)->shape_hash_next;
+        if (*psh) {
+            *psh = sh->shape_hash_next;
+            rt->req->shape_overlay_count--;
+        }
+        return;
+    }
     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
     psh = &rt->shape_hash[h];
     while (*psh != sh)
         psh = &(*psh)->shape_hash_next;
     *psh = sh->shape_hash_next;
-    /* arena: matching counter skip in js_shape_hash_link */
     if (!js_arena_base_lo)
         rt->shape_hash_count--;
 }
@@ -5602,11 +5663,17 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         if (!sh_alloc)
             return -1;
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-        list_del(&old_sh->header.link);
+        if (!js_arena_base_lo)
+            list_del(&old_sh->header.link);
         /* copy all the fields and the properties */
         memcpy(sh, old_sh,
                sizeof(JSShape) + sizeof(sh->prop[0]) * old_sh->prop_count);
-        list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+        /* arena: gc_obj_list lives in base; skip linking here, mirrors
+           add_gc_object's self-loop behaviour. */
+        if (js_arena_base_lo)
+            init_list_head(&sh->header.link);
+        else
+            list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
         new_hash_mask = new_hash_size - 1;
         sh->prop_hash_mask = new_hash_mask;
         memset(prop_hash_end(sh) - new_hash_size, 0,
@@ -5621,16 +5688,23 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         js_free(ctx, get_alloc_from_shape(old_sh));
     } else {
         /* only resize the properties */
-        list_del(&sh->header.link);
+        if (!js_arena_base_lo)
+            list_del(&sh->header.link);
         sh_alloc = js_realloc(ctx, get_alloc_from_shape(sh),
                               get_shape_size(new_hash_size, new_size));
         if (unlikely(!sh_alloc)) {
             /* insert again in the GC list */
-            list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+            if (js_arena_base_lo)
+                init_list_head(&sh->header.link);
+            else
+                list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
             return -1;
         }
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-        list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+        if (js_arena_base_lo)
+            init_list_head(&sh->header.link);
+        else
+            list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
     }
     *psh = sh;
     sh->prop_size = new_size;
@@ -5756,6 +5830,17 @@ static JSShape *find_hashed_shape_proto(JSRuntime *rt, JSObject *proto)
     uint32_t h, h1;
 
     h = shape_initial_hash(proto);
+    /* arena: check the per-request overlay first (newer transitions). */
+    if (rt->req->shape_overlay) {
+        h1 = js_shape_overlay_bucket(h, rt->req->shape_overlay_size);
+        for (sh1 = rt->req->shape_overlay[h1]; sh1; sh1 = sh1->shape_hash_next) {
+            if (sh1->hash == h &&
+                sh1->proto == proto &&
+                sh1->prop_count == 0) {
+                return sh1;
+            }
+        }
+    }
     h1 = get_shape_hash(h, rt->shape_hash_bits);
     for(sh1 = rt->shape_hash[h1]; sh1 != NULL; sh1 = sh1->shape_hash_next) {
         if (sh1->hash == h &&
@@ -5778,6 +5863,26 @@ static JSShape *find_hashed_shape_prop(JSRuntime *rt, JSShape *sh,
     h = sh->hash;
     h = shape_hash(h, atom);
     h = shape_hash(h, prop_flags);
+    /* arena: check the per-request overlay first (newer transitions). */
+    if (rt->req->shape_overlay) {
+        h1 = js_shape_overlay_bucket(h, rt->req->shape_overlay_size);
+        for (sh1 = rt->req->shape_overlay[h1]; sh1; sh1 = sh1->shape_hash_next) {
+            if (sh1->hash == h &&
+                sh1->proto == sh->proto &&
+                sh1->prop_count == ((n = sh->prop_count) + 1)) {
+                for (i = 0; i < n; i++) {
+                    if (unlikely(sh1->prop[i].atom != sh->prop[i].atom) ||
+                        unlikely(sh1->prop[i].flags != sh->prop[i].flags))
+                        goto overlay_next;
+                }
+                if (unlikely(sh1->prop[n].atom != atom) ||
+                    unlikely(sh1->prop[n].flags != prop_flags))
+                    goto overlay_next;
+                return sh1;
+            }
+        overlay_next: ;
+        }
+    }
     h1 = get_shape_hash(h, rt->shape_hash_bits);
     for(sh1 = rt->shape_hash[h1]; sh1 != NULL; sh1 = sh1->shape_hash_next) {
         /* we test the hash first so that the rest is done only if the
@@ -36831,8 +36936,14 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
     if (!rt->req->current_stack_frame) {
-        JS_FreeValueRT(rt, ctx->error_back_trace);
-        ctx->error_back_trace = JS_UNDEFINED;
+        /* arena: ctx is in base; writing JS_UNDEFINED into an already-
+           undefined field would still fault the page. Skip when there's
+           nothing to clear. The store-on-error path remains a base write
+           (handled separately when error reporting itself relocates). */
+        if (!JS_IsUndefined(ctx->error_back_trace)) {
+            JS_FreeValueRT(rt, ctx->error_back_trace);
+            ctx->error_back_trace = JS_UNDEFINED;
+        }
     }
     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
                               flags, scope_idx);

@@ -296,8 +296,31 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
     correctness gap against the "no JS code can write to base"
     invariant.
 
-- Currently on **step 4 (shape overlay)** — relocate request-discovered
-  shape transitions and their `shape_hash[h]` chain entries into the
-  request arena. Eliminates the +20480 page entirely and makes shape
-  table mutations safe under reset. Step 6 is the bigger structural
-  change that closes the global-object hole.
+- 4 done. `JSRequestState` gained a small `shape_overlay` (pointer +
+  size + count, lazily allocated). `js_shape_hash_link/unlink` route
+  request-arena shapes into the overlay and leave the base
+  `rt->shape_hash` table untouched. `find_hashed_shape_proto` and
+  `find_hashed_shape_prop` walk the overlay first, then fall through to
+  base. While doing this, also fixed two related residual base writes:
+  `JS_DupContext` / `JS_FreeContext` were doing direct `ctx->header.ref_count`
+  inc/dec (now routed through `arena_rc_inc/dec`), and
+  `__JS_EvalInternal` was clearing `ctx->error_back_trace` to
+  JS_UNDEFINED unconditionally on every top-level eval — even when
+  already undefined — which faulted the page without changing bytes
+  (now skipped if already undefined). Also gated the direct
+  `list_del`/`list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list)`
+  pairs in `resize_properties`.
+
+  **Page +20480 is gone.** Steady-state request#2:
+  | source        | offset    | bytes |
+  |---------------|-----------|-------|
+  | rt page       | +0        | 7     |
+  | atom_array    | +4096     | 18    |
+  | global_var_obj prop | +28672 | 14 |
+  | **total**     | 3 pages   | **39** |
+
+- Currently on **step 5 (atom overlay)** — same shape as step 4 but for
+  atoms. Two-tier `atom_array` + `atom_hash`: base is read-only, request
+  atoms live in a per-request overlay in the request arena. Eliminates
+  pages +0 and +4096. Then step 6 (shadow-on-write for base JSObjects)
+  closes the global-object hole and gets us to zero.
