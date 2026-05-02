@@ -60,6 +60,7 @@ int main(void)
     {
         printf("--- JSRuntime layout ---\n");
         JS_DumpRuntimeOffsets(rt, stdout);
+        printf("  ctx          = %p\n", (void *)ctx);
         printf("------------------------\n");
     }
     js_arena_thermometer_reset();
@@ -82,10 +83,12 @@ int main(void)
         size_t offs[64];
         size_t n = js_arena_thermometer_dirty_offsets(offs, 64);
         size_t ps = js_arena_thermometer_page_size();
-        printf("  dirty pages (page_size=%zu):", ps);
+        printf("  page_size=%zu, %zu changed bytes total\n",
+               ps, js_arena_thermometer_changed_bytes());
         for (size_t i = 0; i < n && i < 64; i++)
-            printf(" +%zu", offs[i]);
-        printf("\n");
+            printf("    +%-6zu  %5zu B changed\n",
+                   offs[i],
+                   js_arena_thermometer_changed_in_page(offs[i]));
     }
 
     js_arena_thermometer_reset();
@@ -106,10 +109,12 @@ int main(void)
     {
         size_t offs[64];
         size_t n = js_arena_thermometer_dirty_offsets(offs, 64);
-        printf("  dirty pages:");
+        printf("  %zu changed bytes total\n",
+               js_arena_thermometer_changed_bytes());
         for (size_t i = 0; i < n && i < 64; i++)
-            printf(" +%zu", offs[i]);
-        printf("\n");
+            printf("    +%-6zu  %5zu B changed\n",
+                   offs[i],
+                   js_arena_thermometer_changed_in_page(offs[i]));
     }
 
     /* Disable before the determinism checks — they call setters that

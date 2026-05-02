@@ -351,6 +351,7 @@ static struct sigaction therm_prev_sa;
 static long therm_page_size = 0;
 static size_t therm_base_pages = 0;
 static uint8_t *therm_dirty_bitmap = NULL;   /* one bit per page, 1 = dirtied since last reset */
+static uint8_t *therm_baseline = NULL;       /* copy of base buffer at enable time */
 static size_t therm_writes = 0;
 static size_t therm_pages_dirty = 0;
 
@@ -422,6 +423,13 @@ int js_arena_thermometer_enable(void)
     therm_dirty_bitmap = calloc(1, bitmap_bytes ? bitmap_bytes : 1);
     if (!therm_dirty_bitmap)
         return -1;
+    therm_baseline = malloc(base_size);
+    if (!therm_baseline) {
+        free(therm_dirty_bitmap);
+        therm_dirty_bitmap = NULL;
+        return -1;
+    }
+    memcpy(therm_baseline, js_arena_base_lo, base_size);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -456,6 +464,8 @@ void js_arena_thermometer_disable(void)
     sigaction(SIGSEGV, &therm_prev_sa, NULL);
     free(therm_dirty_bitmap);
     therm_dirty_bitmap = NULL;
+    free(therm_baseline);
+    therm_baseline = NULL;
     therm_writes = 0;
     therm_pages_dirty = 0;
     therm_enabled = 0;
@@ -466,10 +476,13 @@ void js_arena_thermometer_reset(void)
     if (!therm_enabled)
         return;
     /* Re-protect the entire base region in one syscall (cheap for our
-       sizes) and clear the bitmap. Pages dirtied during the next request
-       will fault and be made writable again. */
+       sizes) and clear the bitmap. Refresh the baseline so the changed-
+       byte counters reflect mutations during the *next* request, not
+       cumulative drift. */
     size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
     mprotect((void *)js_arena_base_lo, base_size, PROT_READ);
+    if (therm_baseline)
+        memcpy(therm_baseline, js_arena_base_lo, base_size);
     size_t bitmap_bytes = (therm_base_pages + 7) / 8;
     memset(therm_dirty_bitmap, 0, bitmap_bytes);
     therm_writes = 0;
@@ -495,4 +508,35 @@ size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap)
         }
     }
     return found;
+}
+
+size_t js_arena_thermometer_changed_in_page(size_t page_offset)
+{
+    if (!therm_enabled || !therm_baseline || !js_arena_base_lo)
+        return 0;
+    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    if (page_offset >= base_size)
+        return 0;
+    size_t end = page_offset + (size_t)therm_page_size;
+    if (end > base_size)
+        end = base_size;
+    const uint8_t *live = js_arena_base_lo + page_offset;
+    const uint8_t *base = therm_baseline    + page_offset;
+    size_t n = 0;
+    for (size_t i = 0, len = end - page_offset; i < len; i++)
+        if (live[i] != base[i])
+            n++;
+    return n;
+}
+
+size_t js_arena_thermometer_changed_bytes(void)
+{
+    if (!therm_enabled || !therm_dirty_bitmap)
+        return 0;
+    size_t total = 0;
+    for (size_t i = 0; i < therm_base_pages; i++) {
+        if (therm_dirty_bitmap[i >> 3] & (1u << (i & 7)))
+            total += js_arena_thermometer_changed_in_page(i * (size_t)therm_page_size);
+    }
+    return total;
 }

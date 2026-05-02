@@ -120,6 +120,16 @@ JS_EXTERN size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap);
 /* System page size at the time enable was called, or 0 if not enabled. */
 JS_EXTERN size_t js_arena_thermometer_page_size(void);
 
+/* Byte-level signal: enable mallocs a baseline copy of the entire base
+ * buffer; these helpers memcmp the live base against the baseline to
+ * count distinct mutated bytes. Useful to attribute residual writes
+ * inside a single dirty page to specific structures.
+ *   _changed_bytes()       — total across all dirty pages
+ *   _changed_in_page(off)  — within the page starting at byte `off`
+ */
+JS_EXTERN size_t js_arena_thermometer_changed_bytes(void);
+JS_EXTERN size_t js_arena_thermometer_changed_in_page(size_t page_offset);
+
 /* Diagnostic: prints JSRuntime field offsets to `out` so the thermometer's
  * dirty-page offsets can be cross-referenced with which mutable field is
  * being written. Layout is process-stable. */
