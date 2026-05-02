@@ -475,3 +475,21 @@ void js_arena_thermometer_reset(void)
 
 size_t js_arena_thermometer_pages(void)  { return therm_pages_dirty; }
 size_t js_arena_thermometer_writes(void) { return therm_writes; }
+size_t js_arena_thermometer_page_size(void) {
+    return therm_enabled ? (size_t)therm_page_size : 0;
+}
+
+size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap)
+{
+    if (!therm_enabled || !therm_dirty_bitmap)
+        return 0;
+    size_t found = 0;
+    for (size_t i = 0; i < therm_base_pages; i++) {
+        if (therm_dirty_bitmap[i >> 3] & (1u << (i & 7))) {
+            if (found < cap)
+                out[found] = i * (size_t)therm_page_size;
+            found++;
+        }
+    }
+    return found;
+}

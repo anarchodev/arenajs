@@ -174,9 +174,26 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   spans a few pages and gets mutated for `current_exception`,
   `current_stack_frame`, `shape_hash`, etc.).
 
-- Currently needed: **diagnostic on the thermometer** — report *which*
-  pages are dirty, not just how many. Then map page indices to JSRuntime
-  field offsets so we can see whether the residual writes are in the rt
-  struct (run-state move target) vs. shape_hash (overlay target) vs.
-  somewhere unexpected. Without that, surgical guards have diminishing
-  returns because we can't tell what's still firing.
+- Diagnostic done. `js_arena_thermometer_dirty_offsets` plus
+  `JS_DumpRuntimeOffsets` give per-page byte offsets and the layout map.
+
+  Residual 8 pages (request#1) split cleanly:
+  - **+0** — JSRuntime struct itself (current_exception, current_stack_frame,
+    list heads, malloc_state, atom_hash buffer start). Target of step 2.
+  - **+4096** — middle of `atom_array` backing buffer. Written when a new
+    atom is interned during a request. Target of step 5 (atom overlay).
+  - **+20480, +24576, +28672** — class_array, shape_hash buffer, JSContext
+    + class_proto array. shape_hash[h] is written when a new shape
+    transition is registered. Target of step 4 (shape overlay).
+  - **+49152, +53248, +57344** (request#1 only) — base-arena snapshot
+    allocations the closure path mutates. Need to find what slips past
+    the chokepoints; closure creation involves bytecode reference count
+    bumps (`b->header.ref_count++`) at sites we haven't guarded yet.
+
+- Currently on **step 2** — move per-request mutable state on JSRuntime
+  (`current_exception`, `current_stack_frame`, `gc_obj_list` head,
+  `gc_zero_ref_count_list` head, `tmp_obj_list` head, `gc_phase`,
+  `parent_promise`, `in_*` flags, `interrupt_handler`, `current_exception`,
+  job_list head) into a `JSRequestState` struct allocated at the start of
+  the request arena. Indirect through `rt->req`. Expect page +0 to drop
+  out of the dirty set entirely.

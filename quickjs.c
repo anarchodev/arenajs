@@ -2067,6 +2067,40 @@ void *JS_GetMallocOpaque(JSRuntime *rt)
     return rt->malloc_state.opaque;
 }
 
+void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
+{
+    FILE *out = (FILE *)out_FILE;
+    fprintf(out, "  rt = %p  sizeof(JSRuntime) = %zu\n",
+            (void *)rt, sizeof(JSRuntime));
+#define F(name) fprintf(out, "  rt+%-4zu  %s\n", offsetof(JSRuntime, name), #name)
+    F(malloc_state);
+    F(atom_hash);
+    F(atom_array);
+    F(class_array);
+    F(gc_obj_list);
+    F(gc_zero_ref_count_list);
+    F(current_exception);
+    F(current_stack_frame);
+    F(job_list);
+    F(shape_hash);
+#undef F
+    fprintf(out, "  --- backing buffers ---\n");
+    fprintf(out, "  atom_hash    = %p (%d entries x 4B)\n",
+            (void *)rt->atom_hash, rt->atom_hash_size);
+    fprintf(out, "  atom_array   = %p (%d entries x 8B)\n",
+            (void *)rt->atom_array, rt->atom_size);
+    fprintf(out, "  class_array  = %p (%d x %zuB)\n",
+            (void *)rt->class_array, rt->class_count, sizeof(JSClass));
+    fprintf(out, "  shape_hash   = %p (%d entries x 8B)\n",
+            (void *)rt->shape_hash, rt->shape_hash_size);
+    fprintf(out, "  current_excn = %p (16B JSValue)\n",
+            (void *)&rt->current_exception);
+    fprintf(out, "  cur_frame    = %p (8B ptr)\n",
+            (void *)&rt->current_stack_frame);
+    fprintf(out, "  gc_obj_list  = %p (16B list_head)\n",
+            (void *)&rt->gc_obj_list);
+}
+
 int JS_AddRuntimeFinalizer(JSRuntime *rt, JSRuntimeFinalizer *finalizer,
                            void *arg)
 {

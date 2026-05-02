@@ -105,6 +105,18 @@ JS_EXTERN void   js_arena_thermometer_disable(void);
 JS_EXTERN void   js_arena_thermometer_reset(void);
 JS_EXTERN size_t js_arena_thermometer_pages(void);
 JS_EXTERN size_t js_arena_thermometer_writes(void);
+/* Fills `out` (capacity `cap`) with the byte offsets within the base
+ * arena buffer of each dirtied page (multiples of the system page size).
+ * Returns the total number of dirty pages, which may exceed cap (in
+ * which case only the first cap entries were written). */
+JS_EXTERN size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap);
+/* System page size at the time enable was called, or 0 if not enabled. */
+JS_EXTERN size_t js_arena_thermometer_page_size(void);
+
+/* Diagnostic: prints JSRuntime field offsets to `out` so the thermometer's
+ * dirty-page offsets can be cross-referenced with which mutable field is
+ * being written. Layout is process-stable. */
+JS_EXTERN void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE);
 
 #ifdef __cplusplus
 }

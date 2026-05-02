@@ -57,6 +57,11 @@ int main(void)
     if (js_arena_thermometer_enable() < 0) {
         fprintf(stderr, "thermometer enable failed\n"); return 1;
     }
+    {
+        printf("--- JSRuntime layout ---\n");
+        JS_DumpRuntimeOffsets(rt, stdout);
+        printf("------------------------\n");
+    }
     js_arena_thermometer_reset();
 
     if (eval_print(ctx,
@@ -73,6 +78,15 @@ int main(void)
            req_after_req1,  req_after_req1  - req_after_snapshot);
     printf("  thermometer: %zu base pages dirtied, %zu writes\n",
            pages_req1, writes_req1);
+    {
+        size_t offs[64];
+        size_t n = js_arena_thermometer_dirty_offsets(offs, 64);
+        size_t ps = js_arena_thermometer_page_size();
+        printf("  dirty pages (page_size=%zu):", ps);
+        for (size_t i = 0; i < n && i < 64; i++)
+            printf(" +%zu", offs[i]);
+        printf("\n");
+    }
 
     js_arena_thermometer_reset();
 
@@ -89,6 +103,14 @@ int main(void)
            js_dual_arena_request_used(da));
     printf("  thermometer: %zu base pages dirtied, %zu writes\n",
            pages_req2, writes_req2);
+    {
+        size_t offs[64];
+        size_t n = js_arena_thermometer_dirty_offsets(offs, 64);
+        printf("  dirty pages:");
+        for (size_t i = 0; i < n && i < 64; i++)
+            printf(" +%zu", offs[i]);
+        printf("\n");
+    }
 
     /* Disable before the determinism checks — they call setters that
        legitimately mutate ctx fields living in base, and we don't want
