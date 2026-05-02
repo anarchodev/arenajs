@@ -45,6 +45,10 @@ struct JSDualArena {
     JSArenaMode mode;
 };
 
+/* Process-global base-arena range; see qjs-arena.h. */
+const uint8_t *js_arena_base_lo = NULL;
+const uint8_t *js_arena_base_hi = NULL;
+
 /* ----- low-level arena ops ----- */
 
 static inline size_t arena_cursor(const JSArena *a)
@@ -188,6 +192,12 @@ void js_dual_arena_free(JSDualArena *da)
 {
     if (!da)
         return;
+    /* Clear the global range if it pointed at this arena, so a stale
+       check after teardown doesn't read freed memory. */
+    if (js_arena_base_lo == da->base.buf) {
+        js_arena_base_lo = NULL;
+        js_arena_base_hi = NULL;
+    }
     arena_destroy(&da->base);
     arena_destroy(&da->request);
     free(da);
@@ -196,6 +206,8 @@ void js_dual_arena_free(JSDualArena *da)
 void js_dual_arena_freeze(JSDualArena *da)
 {
     da->mode = JS_ARENA_MODE_REQUEST;
+    js_arena_base_lo = da->base.buf;
+    js_arena_base_hi = da->base.buf + da->base.capacity;
 }
 
 void js_dual_arena_reset_request(JSDualArena *da)

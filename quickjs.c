@@ -45,6 +45,7 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+#include "qjs-arena.h"
 #include "libregexp.h"
 #include "dtoa.h"
 
@@ -1543,7 +1544,10 @@ static JSValue js_dup(JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        p->ref_count++;
+        /* arena: base-arena objects are immortal — skip the inc so we
+           don't dirty their cache lines. */
+        if (!js_arena_ptr_is_base(p))
+            p->ref_count++;
     }
     return unsafe_unconst(v);
 }
@@ -5002,7 +5006,9 @@ static JSValue js_linearize_string_rope(JSContext *ctx, JSValueConst rope)
     if (string_buffer_concat_value(b, rope))
         goto fail;
     ret = string_buffer_end(b);
-    if (r->header.ref_count > 1) {
+    /* arena: skip the cache update if r is in the base arena — we are not
+       allowed to mutate base. */
+    if (r->header.ref_count > 1 && !js_arena_ptr_is_base(r)) {
         /* update the rope so that it won't need to be linearized again */
         JS_FreeValue(ctx, r->left);
         JS_FreeValue(ctx, r->right);
@@ -5067,7 +5073,9 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
     if (p2->len == 0) {
         goto ret_op1;
     }
-    if (p1->header.ref_count == 1 && p1->is_wide_char == p2->is_wide_char
+    /* arena: never mutate a base-arena string in place. */
+    if (p1->header.ref_count == 1 && !js_arena_ptr_is_base(p1)
+    &&  p1->is_wide_char == p2->is_wide_char
     &&  js_malloc_usable_size(ctx, p1) >= sizeof(*p1) + ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char) {
         /* Concatenate in place in available space at the end of p1 */
         if (p1->is_wide_char) {
@@ -6766,6 +6774,10 @@ void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
+        /* arena: base-arena objects are immortal — skip the dec and
+           never enter the free path. */
+        if (js_arena_ptr_is_base(p))
+            return;
         if (--p->ref_count <= 0) {
             js_free_value_rt(rt, v);
         }
@@ -9698,8 +9710,9 @@ static JSProperty *add_property(JSContext *ctx,
             p->shape = js_dup_shape(new_sh);
             js_free_shape(ctx->rt, sh);
             return &p->prop[new_sh->prop_count - 1];
-        } else if (sh->header.ref_count != 1) {
-            /* if the shape is shared, clone it */
+        } else if (sh->header.ref_count != 1 || js_arena_ptr_is_base(sh)) {
+            /* if the shape is shared (or in the base arena, where we
+               must never mutate it), clone it */
             new_sh = js_clone_shape(ctx, sh);
             if (!new_sh)
                 return NULL;
@@ -10678,7 +10691,9 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
 
     sh = p->shape;
     if (sh->is_hashed) {
-        if (sh->header.ref_count != 1) {
+        /* arena: also clone if the shape is in the base arena, even
+           when ref_count is 1 — base must not be mutated. */
+        if (sh->header.ref_count != 1 || js_arena_ptr_is_base(sh)) {
             if (pprs)
                 idx = *pprs - sh->prop;
             /* clone the shape (the resulting one is no longer hashed) */

@@ -114,4 +114,13 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
   whatever `JS_SetTimeOrigin` wrote afterwards. Two consecutive runs of the
   smoke test produce identical `base_used` numbers, which is the necessary
   (not yet sufficient) condition for byte-deterministic init.
-- Currently on **step 1** (refcount inc/dec guard for base-arena objects).
+- 1 (chokepoint guard) partial. `js_dup` and `JS_FreeValueRT` now no-op when
+  the value's payload pointer is in the base arena. The four control-flow
+  `ref_count == 1 / != 1 / > 1` sites (rope cache, string in-place concat,
+  two shape clone-if-shared paths) also OR-in `js_arena_ptr_is_base` so base
+  objects always take the safe (clone) path. Mechanism: process-global
+  `(js_arena_base_lo, js_arena_base_hi)` set by `js_dual_arena_freeze`. One
+  arena-runtime per process; documented in `qjs-arena.h`.
+- Currently on **step 1b** — guarding the internal direct-touch inc/dec
+  sites (shape, var_ref, atom) and setting up the CoW restore thermometer
+  so we can measure progress.
