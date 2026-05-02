@@ -18,6 +18,7 @@
 #include "qjs-arena.h"
 
 #include <assert.h>
+#include <execinfo.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -355,6 +356,12 @@ static uint8_t *therm_baseline = NULL;       /* copy of base buffer at enable ti
 static size_t therm_writes = 0;
 static size_t therm_pages_dirty = 0;
 
+/* Diagnostic: when set, the SIGSEGV handler prints a backtrace for any
+   fault whose address falls in the range [therm_trace_lo, therm_trace_hi).
+   Set via js_arena_thermometer_trace_range. Off by default. */
+static uintptr_t therm_trace_lo = 0;
+static uintptr_t therm_trace_hi = 0;
+
 static void therm_chain(int sig, siginfo_t *info, void *ctx)
 {
     if (therm_prev_sa.sa_flags & SA_SIGINFO) {
@@ -394,6 +401,17 @@ static void therm_sigsegv(int sig, siginfo_t *info, void *ctx)
     if (!(therm_dirty_bitmap[byte_idx] & bit)) {
         therm_dirty_bitmap[byte_idx] |= bit;
         therm_pages_dirty++;
+    }
+
+    if (therm_trace_lo && addr >= therm_trace_lo && addr < therm_trace_hi) {
+        void *frames[16];
+        int nframes = backtrace(frames, 16);
+        char header[128];
+        int hlen = snprintf(header, sizeof(header),
+                            "[therm] fault at base+%zu (addr=%p)\n",
+                            addr - lo, (void *)addr);
+        write(2, header, (size_t)hlen);
+        backtrace_symbols_fd(frames, nframes, 2);
     }
 
     void *page_addr = (void *)(lo + page_idx * (size_t)therm_page_size);
@@ -491,6 +509,19 @@ void js_arena_thermometer_reset(void)
 
 size_t js_arena_thermometer_pages(void)  { return therm_pages_dirty; }
 size_t js_arena_thermometer_writes(void) { return therm_writes; }
+
+void js_arena_thermometer_trace_range(size_t lo_off, size_t hi_off)
+{
+    if (lo_off == 0 && hi_off == 0) {
+        therm_trace_lo = 0;
+        therm_trace_hi = 0;
+        return;
+    }
+    if (!js_arena_base_lo)
+        return;
+    therm_trace_lo = (uintptr_t)js_arena_base_lo + lo_off;
+    therm_trace_hi = (uintptr_t)js_arena_base_lo + hi_off;
+}
 size_t js_arena_thermometer_page_size(void) {
     return therm_enabled ? (size_t)therm_page_size : 0;
 }
@@ -539,4 +570,38 @@ size_t js_arena_thermometer_changed_bytes(void)
             total += js_arena_thermometer_changed_in_page(i * (size_t)therm_page_size);
     }
     return total;
+}
+
+const void *js_arena_thermometer_baseline_at(size_t offset)
+{
+    if (!therm_enabled || !therm_baseline)
+        return NULL;
+    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    if (offset >= base_size)
+        return NULL;
+    return therm_baseline + offset;
+}
+
+size_t js_arena_thermometer_changed_byte_offsets(
+    size_t page_offset, size_t *out, size_t cap)
+{
+    if (!therm_enabled || !therm_baseline || !js_arena_base_lo)
+        return 0;
+    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    if (page_offset >= base_size)
+        return 0;
+    size_t end = page_offset + (size_t)therm_page_size;
+    if (end > base_size)
+        end = base_size;
+    const uint8_t *live = js_arena_base_lo;
+    const uint8_t *base = therm_baseline;
+    size_t found = 0;
+    for (size_t i = page_offset; i < end; i++) {
+        if (live[i] != base[i]) {
+            if (found < cap)
+                out[found] = i;
+            found++;
+        }
+    }
+    return found;
 }

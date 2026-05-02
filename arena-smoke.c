@@ -85,10 +85,19 @@ int main(void)
         size_t ps = js_arena_thermometer_page_size();
         printf("  page_size=%zu, %zu changed bytes total\n",
                ps, js_arena_thermometer_changed_bytes());
-        for (size_t i = 0; i < n && i < 64; i++)
-            printf("    +%-6zu  %5zu B changed\n",
-                   offs[i],
-                   js_arena_thermometer_changed_in_page(offs[i]));
+        for (size_t i = 0; i < n && i < 64; i++) {
+            size_t bytes_chg = js_arena_thermometer_changed_in_page(offs[i]);
+            printf("    +%-6zu  %5zu B changed", offs[i], bytes_chg);
+            size_t boffs[64];
+            size_t bn = js_arena_thermometer_changed_byte_offsets(offs[i], boffs, 64);
+            if (bn > 0) {
+                printf("  at:");
+                for (size_t j = 0; j < bn && j < 64; j++)
+                    printf(" %zu", boffs[j]);
+                if (bn > 64) printf(" ... +%zu more", bn - 64);
+            }
+            printf("\n");
+        }
     }
 
     js_arena_thermometer_reset();
@@ -111,10 +120,19 @@ int main(void)
         size_t n = js_arena_thermometer_dirty_offsets(offs, 64);
         printf("  %zu changed bytes total\n",
                js_arena_thermometer_changed_bytes());
-        for (size_t i = 0; i < n && i < 64; i++)
-            printf("    +%-6zu  %5zu B changed\n",
-                   offs[i],
-                   js_arena_thermometer_changed_in_page(offs[i]));
+        for (size_t i = 0; i < n && i < 64; i++) {
+            size_t bytes_chg = js_arena_thermometer_changed_in_page(offs[i]);
+            printf("    +%-6zu  %5zu B changed", offs[i], bytes_chg);
+            size_t boffs[64];
+            size_t bn = js_arena_thermometer_changed_byte_offsets(offs[i], boffs, 64);
+            if (bn > 0) {
+                printf("  at:");
+                for (size_t j = 0; j < bn && j < 64; j++)
+                    printf(" %zu", boffs[j]);
+                if (bn > 64) printf(" ... +%zu more", bn - 64);
+            }
+            printf("\n");
+        }
     }
 
     /* Disable before the determinism checks — they call setters that

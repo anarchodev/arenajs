@@ -3322,12 +3322,17 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     p->atom_type = atom_type;
     p->first_weak_ref = NULL;
 
-    rt->atom_count++;
+    /* arena: skip atom_count++ on rt (in base) and the resize check.
+       atom_hash chains grow unboundedly; for request-scoped runtimes
+       this is bounded by request count. */
+    if (!js_arena_base_lo)
+        rt->atom_count++;
 
     if (atom_type != JS_ATOM_TYPE_SYMBOL) {
         p->hash_next = rt->atom_hash[h1];
         rt->atom_hash[h1] = i;
-        if (unlikely(rt->atom_count >= rt->atom_count_resize))
+        if (!js_arena_base_lo
+            && unlikely(rt->atom_count >= rt->atom_count_resize))
             JS_ResizeAtomHash(rt, rt->atom_hash_size * 2);
     }
 
@@ -5384,7 +5389,11 @@ static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
     sh->shape_hash_next = rt->shape_hash[h];
     rt->shape_hash[h] = sh;
-    rt->shape_hash_count++;
+    /* arena: skip the count bump on rt (in base); shape_hash never
+       resizes in arena mode and chains grow unboundedly. Bounded by
+       distinct shapes per runtime, which is small in practice. */
+    if (!js_arena_base_lo)
+        rt->shape_hash_count++;
 }
 
 static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
@@ -5397,7 +5406,9 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     while (*psh != sh)
         psh = &(*psh)->shape_hash_next;
     *psh = sh->shape_hash_next;
-    rt->shape_hash_count--;
+    /* arena: matching counter skip in js_shape_hash_link */
+    if (!js_arena_base_lo)
+        rt->shape_hash_count--;
 }
 
 /* create a new empty shape with prototype 'proto'. It is not hashed */
@@ -8343,6 +8354,12 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 
 static inline __exception int js_poll_interrupts(JSContext *ctx)
 {
+    /* arena: ctx lives in base. Decrementing this counter per bytecode op
+       would dirty a base page on every request. Arena-backed runtimes
+       skip the periodic interrupt poll entirely; if a future use needs
+       it back, move the counter into JSRequestState. */
+    if (js_arena_base_lo)
+        return 0;
     if (unlikely(--ctx->interrupt_counter <= 0)) {
         return __js_poll_interrupts(ctx);
     } else {
@@ -9856,6 +9873,14 @@ static JSProperty *add_property(JSContext *ctx,
             js_free_shape(ctx->rt, p->shape);
             p->shape = new_sh;
         }
+    } else if (js_arena_ptr_is_base(sh)) {
+        /* arena: an unhashed base shape would otherwise be mutated in
+           place by add_shape_property below — clone first. */
+        new_sh = js_clone_shape(ctx, sh);
+        if (!new_sh)
+            return NULL;
+        js_free_shape(ctx->rt, p->shape);
+        p->shape = new_sh;
     }
     assert(p->shape->header.ref_count == 1);
     if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
@@ -10824,6 +10849,20 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
     uint32_t idx = 0;    /* prevent warning */
 
     sh = p->shape;
+    /* arena: unhashed base shape needs cloning too — the original
+       is_hashed-only branch below would skip it. */
+    if (!sh->is_hashed && js_arena_ptr_is_base(sh)) {
+        if (pprs)
+            idx = *pprs - sh->prop;
+        sh = js_clone_shape(ctx, sh);
+        if (!sh)
+            return -1;
+        js_free_shape(ctx->rt, p->shape);
+        p->shape = sh;
+        if (pprs)
+            *pprs = &sh->prop[idx];
+        return 0;
+    }
     if (sh->is_hashed) {
         /* arena: also clone if the shape is in the base arena, even
            when ref_count is 1 — base must not be mutated. */

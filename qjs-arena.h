@@ -129,6 +129,21 @@ JS_EXTERN size_t js_arena_thermometer_page_size(void);
  */
 JS_EXTERN size_t js_arena_thermometer_changed_bytes(void);
 JS_EXTERN size_t js_arena_thermometer_changed_in_page(size_t page_offset);
+/* Fills `out` with the byte offsets within the base buffer (NOT within the
+ * page) of distinct changed bytes inside a single dirty page. Up to `cap`.
+ * Returns the total number of changed bytes (which may exceed cap). */
+JS_EXTERN size_t js_arena_thermometer_changed_byte_offsets(
+    size_t page_offset, size_t *out, size_t cap);
+
+/* Reads `len` bytes starting at `offset` in the baseline snapshot
+ * (state at the most recent reset). Returns NULL if not enabled or
+ * out of range. */
+JS_EXTERN const void *js_arena_thermometer_baseline_at(size_t offset);
+
+/* Diagnostic: when the SIGSEGV handler faults on an address inside
+ * [base+lo_off, base+hi_off), prints a backtrace. Pass (0, 0) to disable.
+ * Useful to identify which call paths still mutate base. */
+JS_EXTERN void js_arena_thermometer_trace_range(size_t lo_off, size_t hi_off);
 
 /* Diagnostic: prints JSRuntime field offsets to `out` so the thermometer's
  * dirty-page offsets can be cross-referenced with which mutable field is

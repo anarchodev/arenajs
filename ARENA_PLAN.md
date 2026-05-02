@@ -190,30 +190,52 @@ switch the public restore path to bump-cursor reset and retire the CoW path.
     the chokepoints; closure creation involves bytecode reference count
     bumps (`b->header.ref_count++`) at sites we haven't guarded yet.
 
-- 2 structural complete. `JSRequestState` (current_exception,
-  current_stack_frame, in_out_of_memory, in_build_stack_trace,
-  parent_promise) lives embedded on `JSRuntime` as `req_state` and is
-  pointed at by `rt->req`. `JS_FreezeRuntime` now (after the dual-arena
-  flips to request mode) calls `JS_RelocateReqState` which `js_calloc`'s
-  a fresh `JSRequestState` — the allocation lands in the request arena —
-  copies the embedded state into it, and re-points `rt->req`. ~58 call
-  sites in quickjs.c rewritten via `replace_all`. GC list heads, gc_phase,
-  job_list stay on rt (GC is suppressed; job_list relocation requires
-  walking and rewriting list links, deferred).
+- 2 + chokepoint cleanup, including:
+  - `JSRequestState` move (current_exception, current_stack_frame,
+    in_out_of_memory, in_build_stack_trace, parent_promise).
+  - `ctx->interrupt_counter` decrement skipped in arena mode
+    (was a per-bytecode-op base write).
+  - `rt->atom_count++/--`, `rt->shape_hash_count++/--` skipped in arena
+    mode (counters with no consumer once GC is suppressed).
+  - **Unhashed-base-shape clone fix** in both `add_property` and
+    `js_shape_prepare_update`. The existing clone-if-shared-or-base
+    branch sat inside `if (sh->is_hashed)`, so unhashed base shapes fell
+    straight through to `add_shape_property` and got mutated. Both
+    callers now have a parallel else-if branch that clones unhashed
+    base shapes.
+  - Thermometer gained a byte-level signal
+    (`js_arena_thermometer_changed_bytes`,
+    `_changed_in_page`, `_changed_byte_offsets`,
+    `_baseline_at`) plus a SIGSEGV-handler `trace_range` that
+    backtraces faults inside a chosen offset window — used to identify
+    the unhashed-shape mutation site.
 
-  **Thermometer page count unchanged: still 8/5 pages.** The page-
-  granularity metric isn't sensitive enough to reflect this win, because
-  page +0 is also dirtied by `atom_count++` (every new atom),
-  `shape_hash_count++` (every new shape transition), possibly
-  `atom_size`/`shape_hash_size` resize bumps, and other rt fields that
-  share the page with the now-relocated ones. Once any one of those fires,
-  the page is counted as dirty regardless of how many distinct mutations
-  contributed.
+  **Thermometer (steady-state request#2) so far:**
+  | source        | offset    | bytes |
+  |---------------|-----------|-------|
+  | rt page       | +0        | 7     |
+  | atom_array    | +4096     | 18    |
+  | shape_hash    | +20480    | 6     |
+  | global_var_obj prop | +28672 | 14 |
+  | **total**     |           | **45** |
 
-- **Next: byte-level signal in the thermometer.** Snapshot the base
-  buffer at enable time, expose `js_arena_thermometer_changed_bytes()`
-  that memcmp's each dirty page against the baseline to count distinct
-  modified bytes. Only then can we confirm step 2's mutation count
-  actually dropped, and target subsequent steps (atom_count writes,
-  shape_hash writes) by their mutation footprint rather than by which
-  pages they happen to share.
+  Pages: 4 (down from 7). Bytes: 45 (down from ~120 baseline). The four
+  remaining pages each have one structural cause:
+  - **+0 (7 B)** — `rt->atom_free_index` (intern path) plus 3 new-atom
+    `atom_hash[h]` slots. Targets atom overlay (step 5).
+  - **+4096 (18 B)** — `atom_array[i] = new_atom` writes. Atom overlay.
+  - **+20480 (6 B)** — `shape_hash[h] = new_shape` writes. Shape
+    overlay (step 4).
+  - **+28672 (14 B)** — `JS_DefineGlobalVar` writes a new property's
+    `pr->u.value` into `ctx->global_var_obj->prop[i]`, where both `p`
+    and `p->prop` are in base. Cloning `p->prop` would help only the
+    property array; `p->shape = new_sh` already writes to base too.
+    Real workloads call snapshot-defined functions whose locals don't
+    touch the global object, so this is a smoke-test artefact rather
+    than a steady-state cost — but we'd still want it gone for
+    determinism.
+
+- Currently on **step 4 (shape overlay)** — relocate request-discovered
+  shape transitions and their `shape_hash[h]` chain entries into the
+  request arena. Eliminates the +20480 page entirely and makes shape
+  table mutations safe under reset.
