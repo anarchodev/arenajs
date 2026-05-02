@@ -425,6 +425,50 @@ investigated yet" — running through it systematically, even before
 the thermometer complains, would catch the next class of bugs
 proactively rather than reactively.
 
+### Audit pass — closed in commits d5c451c..c65ff4d
+
+Walked through the "where to look next" candidates and applied the
+established remedy in each case (one commit per fix):
+
+- **Class 7**: `JS_DefineGlobalVar`'s var-on-`global_obj` branch
+  routed via `js_object_for_write` (top-level `var` writes).
+- **Class 7**: `JS_DefineGlobalFunction`'s redeclaration check
+  routed via `js_object_active` so prior-shadow defines are visible.
+- **Class 1**: 6 var_ref + 1 bytecode + 1 string-slice
+  `ref_count++` and 1 async-function `--ref_count` migrated to
+  `arena_rc_inc / _dec`.
+- **Class 4**: `ctx->std_array_prototype` shadowed via per-request
+  `std_array_prototype_dirty` flag on JSRequestState; reads use a
+  helper that AND's both. `ctx->binary_object_count` /
+  `binary_object_size` (pure stats) skipped in arena mode.
+- **Class 5**: `rt->job_list` relocated to `JSRequestState`
+  (`init_list_head` re-run by `JS_RelocateReqState` after the
+  memcpy because list heads are self-referential).
+  `ctx->loaded_modules` add skipped in arena mode; module
+  re-resolution per request is the trade.
+- **Class 7**: `OP_put_array_el`'s two fast paths bypass for base
+  arrays; falls through to `JS_SetPropertyValue` →
+  `JS_SetPropertyInternal2` (already hooked).
+
+**Bench after sweep:**
+| | Release | ASan |
+|--|--|--|
+| A: globalThis.blah set      | 3.7 µs | 31 µs |
+| B: override base GREETING   | 3.5 µs | 30 µs |
+| C: delete base GREETING     | 3.5 µs | 29 µs |
+| D: 100x push + reduce       | 20 µs  | 199 µs |
+| reset alone (floor)         | **14 ns** | 66 ns |
+
+Reset alone went from 8 → 14 ns: extra `init_list_head` for the
+job_list head on each `JS_RelocateReqState`. Worth it.
+
+Still open from the catalog: lazy-module instantiation
+(class 8), other ENABLE_DUMPS sites if any (class 11),
+JS_FreeContext path (class 10 — not exercised by the smoke test),
+remaining `ref_count == 1` sites in less common code paths
+(class 2). Each is small and bounded; queue them up as the
+thermometer surfaces them.
+
 ## Status
 
 - 0a complete.
