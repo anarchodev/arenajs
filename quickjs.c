@@ -4852,7 +4852,7 @@ static JSValue string_buffer_end(StringBuffer *s)
     if (!s->is_wide_char)
         str8(str)[s->len] = 0;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-    if (rt->is_arena)
+    if (s->ctx->rt->is_arena)
         init_list_head(&str->link);
     else
         list_add_tail(&str->link, &s->ctx->rt->string_list);
