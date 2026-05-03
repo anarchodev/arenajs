@@ -320,6 +320,11 @@ typedef struct JSRequestState {
        is re-initialised in JS_RelocateReqState (so the self-referential
        next/prev pointers are correct for the new location). */
     struct list_head job_list;
+    /* Per-request shadow for ctx->error_back_trace. Reads in arena
+       mode prefer this (when not JS_UNDEFINED); writes land here.
+       Multi-ctx support is a known limitation — for >1 ctx this
+       would need to be per-ctx like the shadow_map. */
+    JSValue error_back_trace_req;
 } JSRequestState;
 
 struct JSRuntime {
@@ -2185,6 +2190,7 @@ int JS_RelocateReqState(JSRuntime *rt)
        pointing at the old struct's location, so re-init for the new
        address. */
     init_list_head(&new_req->job_list);
+    new_req->error_back_trace_req = JS_UNDEFINED;
     rt->req = new_req;
     return 0;
 }
@@ -3363,6 +3369,28 @@ static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
 static inline bool js_std_array_prototype_active(JSContext *ctx)
 {
     return ctx->std_array_prototype && !ctx->rt->req->std_array_prototype_dirty;
+}
+
+/* arena: read ctx->error_back_trace through the per-request shadow.
+   In arena mode, build_backtrace writes to the shadow (not base ctx);
+   request boundaries reset it via JSRequestState reinit. */
+static inline JSValueConst js_error_back_trace_active(JSContext *ctx)
+{
+    if (js_arena_base_lo
+        && !JS_IsUndefined(ctx->rt->req->error_back_trace_req))
+        return ctx->rt->req->error_back_trace_req;
+    return ctx->error_back_trace;
+}
+
+/* arena: setter; in arena mode lands on the per-request shadow,
+   otherwise on the base ctx field. Caller has already done refcount
+   bookkeeping on `val`. */
+static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
+{
+    if (js_arena_base_lo)
+        ctx->rt->req->error_back_trace_req = val;
+    else
+        ctx->error_back_trace = val;
 }
 
 /* arena: in non-arena mode write the base flag; in arena mode set the
@@ -8508,8 +8536,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         dbuf_free(&dbuf);
     }
 
-    if (JS_IsUndefined(ctx->error_back_trace))
-        ctx->error_back_trace = js_dup(stack);
+    if (JS_IsUndefined(js_error_back_trace_active(ctx)))
+        js_error_back_trace_set(ctx, js_dup(stack));
     if (has_filter_func || can_add_backtrace(error_val)) {
         JS_DefinePropertyValue(ctx, error_val, JS_ATOM_stack, stack,
                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
@@ -20875,7 +20903,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
  exception:
     if (needs_backtrace(rt->req->current_exception)
-    || JS_IsUndefined(ctx->error_back_trace)) {
+    || JS_IsUndefined(js_error_back_trace_active(ctx))) {
         sf->cur_pc = pc;
         build_backtrace(ctx, rt->req->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
@@ -20894,8 +20922,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                     *sp++ = rt->req->current_exception;
                     rt->req->current_exception = JS_UNINITIALIZED;
-                    JS_FreeValueRT(rt, ctx->error_back_trace);
-                    ctx->error_back_trace = JS_UNDEFINED;
+                    JS_FreeValueRT(rt, js_error_back_trace_active(ctx));
+                    js_error_back_trace_set(ctx, JS_UNDEFINED);
                     pc = b->byte_code_buf + pos;
                     goto restart;
                 }
@@ -37426,13 +37454,12 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
     if (!rt->req->current_stack_frame) {
-        /* arena: ctx is in base; writing JS_UNDEFINED into an already-
-           undefined field would still fault the page. Skip when there's
-           nothing to clear. The store-on-error path remains a base write
-           (handled separately when error reporting itself relocates). */
-        if (!JS_IsUndefined(ctx->error_back_trace)) {
-            JS_FreeValueRT(rt, ctx->error_back_trace);
-            ctx->error_back_trace = JS_UNDEFINED;
+        /* arena: route through the per-request shadow so we don't touch
+           the base ctx field. */
+        JSValue cur = js_error_back_trace_active(ctx);
+        if (!JS_IsUndefined(cur)) {
+            JS_FreeValueRT(rt, cur);
+            js_error_back_trace_set(ctx, JS_UNDEFINED);
         }
     }
     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
@@ -62646,8 +62673,8 @@ uintptr_t js_std_cmd(int cmd, ...) {
     case 2: // ErrorBackTrace
         ctx = va_arg(ap, JSContext *);
         pv = va_arg(ap, JSValue *);
-        *pv = ctx->error_back_trace;
-        ctx->error_back_trace = JS_UNDEFINED;
+        *pv = js_error_back_trace_active(ctx);
+        js_error_back_trace_set(ctx, JS_UNDEFINED);
         break;
     case 3: // GetStringKind
         ctx = va_arg(ap, JSContext *);
