@@ -6098,9 +6098,17 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     if (!sh_alloc)
         return -1;
     sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-    list_del(&old_sh->header.link);
-    memcpy(sh, old_sh, sizeof(JSShape));
-    list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+    /* arena: don't touch the gc_obj_list — base shapes are immortal
+       and stay in their original slot; new shapes get a self-link.
+       This matches the gating in resize_properties above. */
+    if (js_arena_base_lo) {
+        memcpy(sh, old_sh, sizeof(JSShape));
+        init_list_head(&sh->header.link);
+    } else {
+        list_del(&old_sh->header.link);
+        memcpy(sh, old_sh, sizeof(JSShape));
+        list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+    }
 
     memset(prop_hash_end(sh) - new_hash_size, 0,
            sizeof(prop_hash_end(sh)[0]) * new_hash_size);
@@ -8912,7 +8920,11 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     if (sh->proto)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
     sh->proto = proto;
-    if (proto)
+    /* arena: avoid a same-value write into a base prototype object.
+       Every base prototype is already marked is_prototype at snapshot
+       build time, so the conditional skip costs nothing in normal
+       (non-arena) mode either. */
+    if (proto && !proto->is_prototype)
         proto->is_prototype = true;
     if (p->is_prototype) {
         /* track modification of Array.prototype */
@@ -9287,6 +9299,28 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
    appended objects in the same pass — those get picked up in the next
    pass. Safe because gc_obj_list is doubly-linked and we only ever
    append (we don't remove during iteration). */
+/* arena: walk every base JSObject and mark its shape's proto target
+   as is_prototype. Eliminates the same-value `proto->is_prototype = true`
+   write that JS_SetPrototypeInternal would otherwise perform the first
+   time some user code uses a base prototype as `__proto__`. Called by
+   JS_FreezeRuntime BEFORE the arena flips. */
+int JS_MarkAllPrototypes(JSRuntime *rt)
+{
+    int marked = 0;
+    struct list_head *el;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)h;
+        if (p->shape && p->shape->proto && !p->shape->proto->is_prototype) {
+            p->shape->proto->is_prototype = true;
+            marked++;
+        }
+    }
+    return marked;
+}
+
 int JS_ForceAllAutoinit(JSRuntime *rt)
 {
     int passes = 0;

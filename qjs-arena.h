@@ -90,6 +90,11 @@ JS_EXTERN int JS_RelocateReqState(JSRuntime *rt);
    class of post-freeze base mutations. */
 JS_EXTERN int JS_ForceAllAutoinit(JSRuntime *rt);
 
+/* arena: pre-mark every base prototype object's is_prototype flag so the
+   first user code to use it as `__proto__` doesn't trigger a same-value
+   write into base. Called by JS_FreezeRuntime; returns count marked. */
+JS_EXTERN int JS_MarkAllPrototypes(JSRuntime *rt);
+
 /* Page-fault-based base-arena write detector — the "CoW thermometer" in
  * ARENA_PLAN.md. After enabling, the base arena buffer is mprotect'd
  * read-only and a SIGSEGV handler counts every write that touches it.

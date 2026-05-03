@@ -334,9 +334,13 @@ void JS_FreezeRuntime(JSRuntime *rt)
        1. Pre-force every autoinit property while we're still in BASE mode
           so the resulting writes land in base normally and no lazy init
           remains. Eliminates the prototype-method-after-reset hole.
-       2. Flip the dual arena to request mode.
-       3. Relocate JSRequestState into the request arena. */
+       2. Pre-mark every base prototype's is_prototype flag so user-code
+          uses of those objects as `__proto__` don't trigger a same-value
+          write into snapshot memory.
+       3. Flip the dual arena to request mode.
+       4. Relocate JSRequestState into the request arena. */
     JS_ForceAllAutoinit(rt);
+    JS_MarkAllPrototypes(rt);
     js_dual_arena_freeze(JS_GetDualArena(rt));
     JS_RelocateReqState(rt);
 }
