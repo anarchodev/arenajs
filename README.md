@@ -124,21 +124,31 @@ identify which call paths still mutate base when adding a new feature.
 
 These follow from the model and aren't going to change:
 
-- **One arena-backed runtime per thread, and the runtime stays on
-  its creating thread.** A thread-local pointer range
-  (`js_arena_base_lo` / `js_arena_base_hi`, declared `__thread`) is
-  set by `JS_FreezeRuntime` and used by the refcount chokepoints to
-  skip base targets. A second `JS_NewRuntimeArena` from the *same*
-  thread would overwrite the slot and corrupt the first runtime;
-  and a thread that didn't create the runtime will see the slot as
-  unset and treat all base objects as request-arena (eventual
-  refcount corruption). Workers servicing different requests should
-  each own their own runtime.
-- **The thermometer is still process-singleton.** It installs a
-  `SIGSEGV` handler — process-wide by definition — and tracks one
-  base address range. Enabling the thermometer in more than one
-  thread at a time is unsupported; it's a debug tool, so the
-  expectation is single-threaded debug runs.
+- **A runtime stays on its creating thread.** Per-thread state is
+  stored in `__thread` slots (the registered arena-range list, the
+  per-runtime `is_arena` flag is fine cross-thread but the range
+  list isn't). A thread that didn't create the runtime will see an
+  empty range list and treat its base objects as request-arena,
+  eventually corrupting refcounts. QuickJS is already single-
+  threaded per-runtime, so this matches intent — but the runtime
+  cannot migrate between threads.
+- **Multiple arena runtimes can share one thread, and arena and
+  vanilla (non-arena) runtimes can coexist.** Each
+  `JS_NewRuntimeArena` registers its base range in the per-thread
+  list (cap: 16 ranges); `js_arena_ptr_is_base` walks the list, so
+  vanilla heap pointers (in no range) get the normal codepath while
+  arena pointers (in some range) get the arena codepath. Per-runtime
+  gating uses the new `rt->is_arena` flag set at `JS_FreezeRuntime`.
+  See `arena-coexist.c` for a worked example.
+- **The thermometer also supports multiple ranges concurrently.**
+  The `SIGSEGV` handler is process-singleton (sigaction is process-
+  wide), but it dispatches by `si_addr` to a list of per-range
+  `(bitmap, baseline, counters)` entries (cap: 8). Two threads
+  enabling the thermometer on the *same* range would race on its
+  counters; that's an embedder error since arena ownership is
+  per-thread. The no-arg API (`js_arena_thermometer_pages()` etc.)
+  operates on the most recently enabled range; for multi-range
+  testing call the `_range(lo, hi)` variants.
 - **Single context per runtime.** A few JSRequestState fields
   (`error_back_trace_req`, `random_state_req`) are per-runtime, not
   per-context. Multi-context support would require those to become
@@ -173,6 +183,9 @@ Targets produced:
 - `build/arena-bench` — per-request reset speed benchmark
 - `build/arena-test262` — the test262 walker (requires the test262
   submodule, see below)
+- `build/arena-coexist` — vanilla + arena runtime sharing one thread,
+  100 interleaved request iterations with the thermometer asserting
+  zero base writes per arena request
 
 ### Running the regression sweep
 

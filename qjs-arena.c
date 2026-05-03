@@ -50,9 +50,33 @@ struct JSDualArena {
     JSArenaMode mode;
 };
 
-/* Process-global base-arena range; see qjs-arena.h. */
-__thread const uint8_t *js_arena_base_lo = NULL;
-__thread const uint8_t *js_arena_base_hi = NULL;
+/* Per-thread list of registered arena base ranges; see qjs-arena.h. */
+__thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
+__thread int                   js_arena_range_count = 0;
+
+int js_arena_register_base(const uint8_t *lo, const uint8_t *hi)
+{
+    if (js_arena_range_count >= JS_ARENA_RANGES_MAX)
+        return -1;
+    js_arena_ranges[js_arena_range_count].lo = lo;
+    js_arena_ranges[js_arena_range_count].hi = hi;
+    js_arena_range_count++;
+    return 0;
+}
+
+void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi)
+{
+    for (int i = 0; i < js_arena_range_count; i++) {
+        if (js_arena_ranges[i].lo == lo && js_arena_ranges[i].hi == hi) {
+            /* Compact: move the last entry into this slot. */
+            js_arena_range_count--;
+            js_arena_ranges[i] = js_arena_ranges[js_arena_range_count];
+            js_arena_ranges[js_arena_range_count].lo = NULL;
+            js_arena_ranges[js_arena_range_count].hi = NULL;
+            return;
+        }
+    }
+}
 
 /* ----- low-level arena ops ----- */
 
@@ -204,17 +228,15 @@ void js_dual_arena_free(JSDualArena *da)
 {
     if (!da)
         return;
+    const uint8_t *lo = da->base.buf;
+    const uint8_t *hi = da->base.buf + da->base.capacity;
     /* If the thermometer is still active on this arena, disable it before
        tearing down — otherwise the SIGSEGV handler stays installed pointing
        into munmap'd memory. */
-    if (js_arena_base_lo == da->base.buf)
-        js_arena_thermometer_disable();
-    /* Clear the global range if it pointed at this arena, so a stale
+    js_arena_thermometer_disable_range(lo, hi);
+    /* Drop this arena's range from the per-thread list so a stale
        check after teardown doesn't read freed memory. */
-    if (js_arena_base_lo == da->base.buf) {
-        js_arena_base_lo = NULL;
-        js_arena_base_hi = NULL;
-    }
+    js_arena_unregister_base(lo, hi);
     arena_destroy(&da->base);
     arena_destroy(&da->request);
     free(da);
@@ -223,8 +245,7 @@ void js_dual_arena_free(JSDualArena *da)
 void js_dual_arena_freeze(JSDualArena *da)
 {
     da->mode = JS_ARENA_MODE_REQUEST;
-    js_arena_base_lo = da->base.buf;
-    js_arena_base_hi = da->base.buf + da->base.capacity;
+    js_arena_register_base(da->base.buf, da->base.buf + da->base.capacity);
 }
 
 void js_dual_arena_reset_request(JSDualArena *da)
@@ -320,6 +341,9 @@ JSRuntime *JS_NewRuntimeArena(size_t base_size, size_t request_size)
         js_dual_arena_free(da);
         return NULL;
     }
+    /* Mark the runtime as arena-backed only at freeze time — pre-freeze
+       it must behave as vanilla (allocate into base, use base shape_hash,
+       no overlays), since request-arena machinery doesn't exist yet. */
     return rt;
 }
 
@@ -342,6 +366,11 @@ void JS_FreezeRuntime(JSRuntime *rt)
     JS_ForceAllAutoinit(rt);
     JS_MarkAllPrototypes(rt);
     js_dual_arena_freeze(JS_GetDualArena(rt));
+    /* Flip rt->is_arena now: from this point on every chokepoint takes
+       the arena code path. Done AFTER js_dual_arena_freeze because the
+       dual arena registers its base range in the same step, so
+       js_arena_ptr_is_base() works in concert with rt->is_arena. */
+    js_runtime_mark_arena(rt);
     JS_RelocateReqState(rt);
 }
 
@@ -359,24 +388,57 @@ void JS_ResetRequestArena(JSRuntime *rt)
 
 /* ----- thermometer -----
  *
- * Counts writes to the base arena via mprotect+SIGSEGV. The handler chains
- * to the previous handler for faults outside base. Single-threaded.
+ * Counts writes to a base-arena range via mprotect+SIGSEGV. Supports
+ * multiple ranges concurrently: each enabled arena gets its own
+ * (bitmap, baseline, counters) entry; the SIGSEGV handler walks the
+ * list to find which entry contains si_addr, and chains to the
+ * previous handler if no entry matches.
+ *
+ * The signal handler is process-singleton (sigaction is process-wide).
+ * Two threads frobbing the same arena's counters race; that's an
+ * embedder error since arena ownership is per-thread.
  */
 
-static volatile sig_atomic_t therm_enabled = 0;
+struct therm_state {
+    const uint8_t *lo;
+    const uint8_t *hi;
+    size_t        base_pages;
+    uint8_t      *dirty_bitmap;   /* one bit per page */
+    uint8_t      *baseline;       /* copy of base buffer at enable time */
+    size_t        writes;
+    size_t        pages_dirty;
+};
+
+#define THERM_MAX 8
+static struct therm_state therm_states[THERM_MAX];
+static int therm_state_count = 0;
+static volatile sig_atomic_t therm_handler_installed = 0;
 static struct sigaction therm_prev_sa;
 static long therm_page_size = 0;
-static size_t therm_base_pages = 0;
-static uint8_t *therm_dirty_bitmap = NULL;   /* one bit per page, 1 = dirtied since last reset */
-static uint8_t *therm_baseline = NULL;       /* copy of base buffer at enable time */
-static size_t therm_writes = 0;
-static size_t therm_pages_dirty = 0;
 
-/* Diagnostic: when set, the SIGSEGV handler prints a backtrace for any
-   fault whose address falls in the range [therm_trace_lo, therm_trace_hi).
-   Set via js_arena_thermometer_trace_range. Off by default. */
+/* Diagnostic: print a backtrace for faults whose address falls in
+   [therm_trace_lo, therm_trace_hi). Off by default. */
 static uintptr_t therm_trace_lo = 0;
 static uintptr_t therm_trace_hi = 0;
+
+static struct therm_state *therm_find_for(uintptr_t addr)
+{
+    for (int i = 0; i < therm_state_count; i++) {
+        struct therm_state *s = &therm_states[i];
+        if (addr >= (uintptr_t)s->lo && addr < (uintptr_t)s->hi)
+            return s;
+    }
+    return NULL;
+}
+
+static struct therm_state *therm_find_by_lo(const uint8_t *lo)
+{
+    for (int i = 0; i < therm_state_count; i++) {
+        if (therm_states[i].lo == lo)
+            return &therm_states[i];
+    }
+    return NULL;
+}
 
 static void therm_chain(int sig, siginfo_t *info, void *ctx)
 {
@@ -384,7 +446,6 @@ static void therm_chain(int sig, siginfo_t *info, void *ctx)
         if (therm_prev_sa.sa_sigaction)
             therm_prev_sa.sa_sigaction(sig, info, ctx);
     } else if (therm_prev_sa.sa_handler == SIG_DFL) {
-        /* restore default and re-raise so we get a proper crash */
         struct sigaction dfl = {0};
         dfl.sa_handler = SIG_DFL;
         sigemptyset(&dfl.sa_mask);
@@ -398,25 +459,20 @@ static void therm_chain(int sig, siginfo_t *info, void *ctx)
 
 static void therm_sigsegv(int sig, siginfo_t *info, void *ctx)
 {
-    if (!therm_enabled) {
-        therm_chain(sig, info, ctx);
-        return;
-    }
     uintptr_t addr = (uintptr_t)info->si_addr;
-    uintptr_t lo = (uintptr_t)js_arena_base_lo;
-    uintptr_t hi = (uintptr_t)js_arena_base_hi;
-    if (addr < lo || addr >= hi) {
+    struct therm_state *s = therm_find_for(addr);
+    if (!s) {
         therm_chain(sig, info, ctx);
         return;
     }
 
-    therm_writes++;
-    size_t page_idx = (addr - lo) / (size_t)therm_page_size;
+    s->writes++;
+    size_t page_idx = (addr - (uintptr_t)s->lo) / (size_t)therm_page_size;
     size_t byte_idx = page_idx >> 3;
     uint8_t bit = (uint8_t)(1u << (page_idx & 7));
-    if (!(therm_dirty_bitmap[byte_idx] & bit)) {
-        therm_dirty_bitmap[byte_idx] |= bit;
-        therm_pages_dirty++;
+    if (!(s->dirty_bitmap[byte_idx] & bit)) {
+        s->dirty_bitmap[byte_idx] |= bit;
+        s->pages_dirty++;
     }
 
     if (therm_trace_lo && addr >= therm_trace_lo && addr < therm_trace_hi) {
@@ -425,106 +481,157 @@ static void therm_sigsegv(int sig, siginfo_t *info, void *ctx)
         char header[128];
         int hlen = snprintf(header, sizeof(header),
                             "[therm] fault at base+%zu (addr=%p)\n",
-                            addr - lo, (void *)addr);
+                            addr - (uintptr_t)s->lo, (void *)addr);
         write(2, header, (size_t)hlen);
         backtrace_symbols_fd(frames, nframes, 2);
     }
 
-    void *page_addr = (void *)(lo + page_idx * (size_t)therm_page_size);
-    /* mprotect is not on POSIX's async-signal-safe list, but is in practice
-       safe on Linux/glibc. If a future platform breaks this, switch to
-       userfaultfd or a snapshot+memcmp scheme. */
+    void *page_addr = (void *)((uintptr_t)s->lo + page_idx * (size_t)therm_page_size);
     mprotect(page_addr, (size_t)therm_page_size, PROT_READ | PROT_WRITE);
 }
 
-int js_arena_thermometer_enable(void)
+static int therm_install_handler(void)
 {
-    if (therm_enabled)
+    if (therm_handler_installed)
         return 0;
-    if (!js_arena_base_lo || !js_arena_base_hi)
-        return -1; /* freeze hasn't published the range yet */
-
-    therm_page_size = sysconf(_SC_PAGESIZE);
-    if (therm_page_size <= 0)
-        return -1;
-
-    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
-    if ((uintptr_t)js_arena_base_lo & (uintptr_t)(therm_page_size - 1))
-        return -1; /* base must be page-aligned (it is when mmap'd) */
-
-    therm_base_pages = base_size / (size_t)therm_page_size;
-    size_t bitmap_bytes = (therm_base_pages + 7) / 8;
-    therm_dirty_bitmap = calloc(1, bitmap_bytes ? bitmap_bytes : 1);
-    if (!therm_dirty_bitmap)
-        return -1;
-    therm_baseline = malloc(base_size);
-    if (!therm_baseline) {
-        free(therm_dirty_bitmap);
-        therm_dirty_bitmap = NULL;
-        return -1;
-    }
-    memcpy(therm_baseline, js_arena_base_lo, base_size);
-
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_flags = SA_SIGINFO;
     sa.sa_sigaction = therm_sigsegv;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSEGV, &sa, &therm_prev_sa) < 0) {
-        free(therm_dirty_bitmap);
-        therm_dirty_bitmap = NULL;
+    if (sigaction(SIGSEGV, &sa, &therm_prev_sa) < 0)
         return -1;
-    }
-
-    if (mprotect((void *)js_arena_base_lo, base_size, PROT_READ) < 0) {
-        sigaction(SIGSEGV, &therm_prev_sa, NULL);
-        free(therm_dirty_bitmap);
-        therm_dirty_bitmap = NULL;
-        return -1;
-    }
-
-    therm_writes = 0;
-    therm_pages_dirty = 0;
-    therm_enabled = 1;
+    therm_handler_installed = 1;
     return 0;
+}
+
+static void therm_uninstall_handler_if_idle(void)
+{
+    if (!therm_handler_installed || therm_state_count > 0)
+        return;
+    sigaction(SIGSEGV, &therm_prev_sa, NULL);
+    therm_handler_installed = 0;
+}
+
+int js_arena_thermometer_enable_range(const uint8_t *lo, const uint8_t *hi)
+{
+    if (!lo || !hi || lo >= hi)
+        return -1;
+    if (therm_find_by_lo(lo))
+        return 0; /* already enabled for this range */
+    if (therm_state_count >= THERM_MAX)
+        return -1;
+
+    if (therm_page_size == 0) {
+        therm_page_size = sysconf(_SC_PAGESIZE);
+        if (therm_page_size <= 0)
+            return -1;
+    }
+    if ((uintptr_t)lo & (uintptr_t)(therm_page_size - 1))
+        return -1; /* mmap'd ranges are page-aligned */
+
+    size_t base_size = (size_t)(hi - lo);
+    size_t base_pages = base_size / (size_t)therm_page_size;
+    size_t bitmap_bytes = (base_pages + 7) / 8;
+    uint8_t *bitmap = calloc(1, bitmap_bytes ? bitmap_bytes : 1);
+    if (!bitmap)
+        return -1;
+    uint8_t *baseline = malloc(base_size);
+    if (!baseline) { free(bitmap); return -1; }
+    memcpy(baseline, lo, base_size);
+
+    if (therm_install_handler() < 0) {
+        free(baseline); free(bitmap); return -1;
+    }
+    if (mprotect((void *)lo, base_size, PROT_READ) < 0) {
+        free(baseline); free(bitmap);
+        therm_uninstall_handler_if_idle();
+        return -1;
+    }
+
+    struct therm_state *s = &therm_states[therm_state_count++];
+    s->lo = lo; s->hi = hi;
+    s->base_pages = base_pages;
+    s->dirty_bitmap = bitmap;
+    s->baseline = baseline;
+    s->writes = 0;
+    s->pages_dirty = 0;
+    return 0;
+}
+
+void js_arena_thermometer_disable_range(const uint8_t *lo, const uint8_t *hi)
+{
+    (void)hi;
+    struct therm_state *s = therm_find_by_lo(lo);
+    if (!s)
+        return;
+    size_t base_size = (size_t)(s->hi - s->lo);
+    mprotect((void *)s->lo, base_size, PROT_READ | PROT_WRITE);
+    free(s->dirty_bitmap);
+    free(s->baseline);
+    /* compact: move the last entry into this slot */
+    int idx = (int)(s - therm_states);
+    therm_state_count--;
+    if (idx != therm_state_count)
+        therm_states[idx] = therm_states[therm_state_count];
+    memset(&therm_states[therm_state_count], 0, sizeof(therm_states[0]));
+    therm_uninstall_handler_if_idle();
+}
+
+/* No-arg API: operate on the most-recently-enabled state. Convenient
+   for the typical single-runtime test harness; for multi-runtime
+   debugging, call the _range variants explicitly. */
+static struct therm_state *therm_current(void)
+{
+    return therm_state_count > 0 ? &therm_states[therm_state_count - 1] : NULL;
+}
+
+int js_arena_thermometer_enable(void)
+{
+    if (js_arena_range_count == 0)
+        return -1; /* freeze hasn't published any range yet */
+    /* Default to the most recently registered arena. */
+    struct js_arena_range *r =
+        &js_arena_ranges[js_arena_range_count - 1];
+    return js_arena_thermometer_enable_range(r->lo, r->hi);
 }
 
 void js_arena_thermometer_disable(void)
 {
-    if (!therm_enabled)
-        return;
-    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
-    mprotect((void *)js_arena_base_lo, base_size, PROT_READ | PROT_WRITE);
-    sigaction(SIGSEGV, &therm_prev_sa, NULL);
-    free(therm_dirty_bitmap);
-    therm_dirty_bitmap = NULL;
-    free(therm_baseline);
-    therm_baseline = NULL;
-    therm_writes = 0;
-    therm_pages_dirty = 0;
-    therm_enabled = 0;
+    /* Disable everything the thermometer is tracking. Used by tests
+       that toggle the thermometer once at end of run. */
+    while (therm_state_count > 0) {
+        struct therm_state *s = &therm_states[therm_state_count - 1];
+        js_arena_thermometer_disable_range(s->lo, s->hi);
+    }
 }
 
 void js_arena_thermometer_reset(void)
 {
-    if (!therm_enabled)
+    struct therm_state *s = therm_current();
+    if (!s)
         return;
-    /* Re-protect the entire base region in one syscall (cheap for our
-       sizes) and clear the bitmap. Refresh the baseline so the changed-
-       byte counters reflect mutations during the *next* request, not
-       cumulative drift. */
-    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
-    mprotect((void *)js_arena_base_lo, base_size, PROT_READ);
-    if (therm_baseline)
-        memcpy(therm_baseline, js_arena_base_lo, base_size);
-    size_t bitmap_bytes = (therm_base_pages + 7) / 8;
-    memset(therm_dirty_bitmap, 0, bitmap_bytes);
-    therm_writes = 0;
-    therm_pages_dirty = 0;
+    size_t base_size = (size_t)(s->hi - s->lo);
+    mprotect((void *)s->lo, base_size, PROT_READ);
+    if (s->baseline)
+        memcpy(s->baseline, s->lo, base_size);
+    size_t bitmap_bytes = (s->base_pages + 7) / 8;
+    memset(s->dirty_bitmap, 0, bitmap_bytes);
+    s->writes = 0;
+    s->pages_dirty = 0;
 }
 
-size_t js_arena_thermometer_pages(void)  { return therm_pages_dirty; }
-size_t js_arena_thermometer_writes(void) { return therm_writes; }
+size_t js_arena_thermometer_pages(void)
+{
+    struct therm_state *s = therm_current();
+    return s ? s->pages_dirty : 0;
+}
+
+size_t js_arena_thermometer_writes(void)
+{
+    struct therm_state *s = therm_current();
+    return s ? s->writes : 0;
+}
 
 void js_arena_thermometer_trace_range(size_t lo_off, size_t hi_off)
 {
@@ -533,22 +640,26 @@ void js_arena_thermometer_trace_range(size_t lo_off, size_t hi_off)
         therm_trace_hi = 0;
         return;
     }
-    if (!js_arena_base_lo)
+    struct therm_state *s = therm_current();
+    if (!s)
         return;
-    therm_trace_lo = (uintptr_t)js_arena_base_lo + lo_off;
-    therm_trace_hi = (uintptr_t)js_arena_base_lo + hi_off;
+    therm_trace_lo = (uintptr_t)s->lo + lo_off;
+    therm_trace_hi = (uintptr_t)s->lo + hi_off;
 }
-size_t js_arena_thermometer_page_size(void) {
-    return therm_enabled ? (size_t)therm_page_size : 0;
+
+size_t js_arena_thermometer_page_size(void)
+{
+    return therm_state_count > 0 ? (size_t)therm_page_size : 0;
 }
 
 size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap)
 {
-    if (!therm_enabled || !therm_dirty_bitmap)
+    struct therm_state *s = therm_current();
+    if (!s)
         return 0;
     size_t found = 0;
-    for (size_t i = 0; i < therm_base_pages; i++) {
-        if (therm_dirty_bitmap[i >> 3] & (1u << (i & 7))) {
+    for (size_t i = 0; i < s->base_pages; i++) {
+        if (s->dirty_bitmap[i >> 3] & (1u << (i & 7))) {
             if (found < cap)
                 out[found] = i * (size_t)therm_page_size;
             found++;
@@ -559,16 +670,17 @@ size_t js_arena_thermometer_dirty_offsets(size_t *out, size_t cap)
 
 size_t js_arena_thermometer_changed_in_page(size_t page_offset)
 {
-    if (!therm_enabled || !therm_baseline || !js_arena_base_lo)
+    struct therm_state *s = therm_current();
+    if (!s || !s->baseline)
         return 0;
-    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    size_t base_size = (size_t)(s->hi - s->lo);
     if (page_offset >= base_size)
         return 0;
     size_t end = page_offset + (size_t)therm_page_size;
     if (end > base_size)
         end = base_size;
-    const uint8_t *live = js_arena_base_lo + page_offset;
-    const uint8_t *base = therm_baseline    + page_offset;
+    const uint8_t *live = s->lo + page_offset;
+    const uint8_t *base = s->baseline + page_offset;
     size_t n = 0;
     for (size_t i = 0, len = end - page_offset; i < len; i++)
         if (live[i] != base[i])
@@ -578,11 +690,12 @@ size_t js_arena_thermometer_changed_in_page(size_t page_offset)
 
 size_t js_arena_thermometer_changed_bytes(void)
 {
-    if (!therm_enabled || !therm_dirty_bitmap)
+    struct therm_state *s = therm_current();
+    if (!s)
         return 0;
     size_t total = 0;
-    for (size_t i = 0; i < therm_base_pages; i++) {
-        if (therm_dirty_bitmap[i >> 3] & (1u << (i & 7)))
+    for (size_t i = 0; i < s->base_pages; i++) {
+        if (s->dirty_bitmap[i >> 3] & (1u << (i & 7)))
             total += js_arena_thermometer_changed_in_page(i * (size_t)therm_page_size);
     }
     return total;
@@ -590,27 +703,29 @@ size_t js_arena_thermometer_changed_bytes(void)
 
 const void *js_arena_thermometer_baseline_at(size_t offset)
 {
-    if (!therm_enabled || !therm_baseline)
+    struct therm_state *s = therm_current();
+    if (!s || !s->baseline)
         return NULL;
-    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    size_t base_size = (size_t)(s->hi - s->lo);
     if (offset >= base_size)
         return NULL;
-    return therm_baseline + offset;
+    return s->baseline + offset;
 }
 
 size_t js_arena_thermometer_changed_byte_offsets(
     size_t page_offset, size_t *out, size_t cap)
 {
-    if (!therm_enabled || !therm_baseline || !js_arena_base_lo)
+    struct therm_state *s = therm_current();
+    if (!s || !s->baseline)
         return 0;
-    size_t base_size = (size_t)(js_arena_base_hi - js_arena_base_lo);
+    size_t base_size = (size_t)(s->hi - s->lo);
     if (page_offset >= base_size)
         return 0;
     size_t end = page_offset + (size_t)therm_page_size;
     if (end > base_size)
         end = base_size;
-    const uint8_t *live = js_arena_base_lo;
-    const uint8_t *base = therm_baseline;
+    const uint8_t *live = s->lo;
+    const uint8_t *base = s->baseline;
     size_t found = 0;
     for (size_t i = page_offset; i < end; i++) {
         if (live[i] != base[i]) {

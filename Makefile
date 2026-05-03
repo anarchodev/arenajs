@@ -140,15 +140,17 @@ test262-check: $(QJS)
 microbench: $(QJS)
 	$(QJS) tests/microbench.js
 
-# Arena regression sweep. Builds the four arena harnesses (smoke,
-# stress, bench, test262) and runs them in order; arena-test262 walks
-# the test262 corpus under the thermometer asserting zero base-byte
-# mutations, so this serves as the inviolate-base regression check.
+# Arena regression sweep. Builds the arena harnesses and runs them in
+# order; arena-test262 walks the test262 corpus under the thermometer
+# asserting zero base-byte mutations, so this serves as the
+# inviolate-base regression check. arena-coexist verifies a vanilla
+# and an arena runtime can share one thread.
 test-arena: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target arena-smoke arena-stress arena-bench arena-test262
+	cmake --build $(BUILD_DIR) --target arena-smoke arena-stress arena-bench arena-test262 arena-coexist
 	$(BUILD_DIR)/arena-smoke
 	$(BUILD_DIR)/arena-stress
 	$(BUILD_DIR)/arena-bench
+	$(BUILD_DIR)/arena-coexist
 	$(BUILD_DIR)/arena-test262 test262/test/built-ins
 	$(BUILD_DIR)/arena-test262 test262/test/language
 	$(BUILD_DIR)/arena-test262 test262/test/annexB

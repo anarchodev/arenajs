@@ -335,6 +335,13 @@ struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
     const char *rt_info;
+    /* arena: true iff this runtime was created via JS_NewRuntimeArena.
+       Gates all the per-runtime arena-mode behaviour (chokepoints
+       checked it via the thread-local rt->is_arena before; with
+       coexistence of vanilla + arena runtimes in one thread the gate
+       has to be per-runtime). Set by JS_NewRuntimeArena, never
+       cleared. */
+    bool is_arena;
 
     int atom_hash_size; /* power of two */
     int atom_count;
@@ -1674,7 +1681,7 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
        deliberately-small ref_counts on base-arena objects. We don't need
        GC anyway — the request arena is reset wholesale between requests
        and base is immortal. Suppress here. */
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         return;
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = true;
@@ -1714,7 +1721,7 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
     s = &rt->malloc_state;
     /* arena: skip the malloc_state tracking; arena enforces its own
        capacity at the allocator level, and the tracking only feeds GC. */
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         return rt->mf.js_calloc(s->opaque, count, size);
 
     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
@@ -1740,7 +1747,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
         return NULL;
 
     s = &rt->malloc_state;
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         return rt->mf.js_malloc(s->opaque, size);
 
     /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
@@ -1767,7 +1774,7 @@ void js_free_rt(JSRuntime *rt, void *ptr)
        js_dual_arena_free / arena reset. Per-allocation tracking exists
        only to drive GC, and we disabled GC for arena mode. Skip the
        bookkeeping; mf.js_free is itself a no-op. */
-    if (js_arena_base_lo) {
+    if (rt->is_arena) {
         rt->mf.js_free(rt->malloc_state.opaque, ptr);
         return;
     }
@@ -1798,7 +1805,7 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
         return NULL;
     }
     s = &rt->malloc_state;
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         return rt->mf.js_realloc(s->opaque, ptr, size);
 
     old_size = rt->mf.js_malloc_usable_size(ptr);
@@ -2066,6 +2073,15 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
     uintptr_t sp;
     sp = js_get_stack_pointer() - alloca_size;
     return unlikely(sp < rt->stack_limit);
+}
+
+/* arena: marks a runtime as arena-backed. Called by JS_NewRuntimeArena
+   so the per-runtime gating (rt->is_arena) supersedes the older
+   thread-global rt->is_arena check. Defined here because
+   qjs-arena.c can't reach the JSRuntime struct. */
+void js_runtime_mark_arena(JSRuntime *rt)
+{
+    rt->is_arena = true;
 }
 
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
@@ -2432,7 +2448,7 @@ static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     /* arena: skip linking to base string_list (a debug-only diagnostic
        list); self-loop instead so subsequent list_del is a no-op. */
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         init_list_head(&str->link);
     else
         list_add_tail(&str->link, &rt->string_list);
@@ -3337,7 +3353,7 @@ static JSObject *js_object_shadow_lookup(JSRuntime *rt, JSObject *p)
    without map walks (the common case). */
 static inline JSObject *js_object_active(JSRuntime *rt, JSObject *p)
 {
-    if (likely(!js_arena_base_lo))
+    if (likely(!rt->is_arena))
         return p;
     if (likely(!js_arena_ptr_is_base(p)))
         return p;
@@ -3349,7 +3365,7 @@ static inline JSObject *js_object_active(JSRuntime *rt, JSObject *p)
    on first call. Pre-freeze / non-base pass through unchanged. */
 static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
 {
-    if (!js_arena_base_lo || !js_arena_ptr_is_base(p))
+    if (!ctx->rt->is_arena || !js_arena_ptr_is_base(p))
         return p;
     JSObject *shadow = js_object_shadow_lookup(ctx->rt, p);
     if (shadow)
@@ -3381,7 +3397,7 @@ static inline bool js_std_array_prototype_active(JSContext *ctx)
    request boundaries reset it via JSRequestState reinit. */
 static inline JSValueConst js_error_back_trace_active(JSContext *ctx)
 {
-    if (js_arena_base_lo
+    if (ctx->rt->is_arena
         && !JS_IsUndefined(ctx->rt->req->error_back_trace_req))
         return ctx->rt->req->error_back_trace_req;
     return ctx->error_back_trace;
@@ -3392,7 +3408,7 @@ static inline JSValueConst js_error_back_trace_active(JSContext *ctx)
    bookkeeping on `val`. */
 static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
 {
-    if (js_arena_base_lo)
+    if (ctx->rt->is_arena)
         ctx->rt->req->error_back_trace_req = val;
     else
         ctx->error_back_trace = val;
@@ -3402,7 +3418,7 @@ static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
    per-request dirty mark instead so base ctx is not mutated. */
 static inline void js_std_array_prototype_mark_dirty(JSContext *ctx)
 {
-    if (js_arena_base_lo)
+    if (ctx->rt->is_arena)
         ctx->rt->req->std_array_prototype_dirty = true;
     else
         ctx->std_array_prototype = false;
@@ -3588,7 +3604,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
             p->header.ref_count = 1;  /* not refcounted */
             p->atom_type = JS_ATOM_TYPE_SYMBOL;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-            if (js_arena_base_lo)
+            if (rt->is_arena)
                 init_list_head(&p->link);
             else
                 list_add_tail(&p->link, &rt->string_list);
@@ -3625,7 +3641,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
             p->len = str->len;
             p->kind = JS_STRING_KIND_NORMAL;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-            if (js_arena_base_lo)
+            if (rt->is_arena)
                 init_list_head(&p->link);
             else
                 list_add_tail(&p->link, &rt->string_list);
@@ -3643,7 +3659,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         p->len = 0;
         p->kind = JS_STRING_KIND_NORMAL;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-        if (js_arena_base_lo)
+        if (rt->is_arena)
             init_list_head(&p->link);
         else
             list_add_tail(&p->link, &rt->string_list);
@@ -3652,7 +3668,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
 
     /* arena: allocate from the per-request overlay so atom_array (in
        base) and atom_free_index (in base) are not written. */
-    if (js_arena_base_lo) {
+    if (rt->is_arena) {
         if (js_atom_overlay_ensure_slot(rt) < 0)
             goto fail;
         uint32_t rel = (uint32_t)rt->req->atom_overlay_free_index;
@@ -3673,11 +3689,11 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     p->atom_type = atom_type;
     p->first_weak_ref = NULL;
 
-    if (!js_arena_base_lo)
+    if (!rt->is_arena)
         rt->atom_count++;
 
     if (atom_type != JS_ATOM_TYPE_SYMBOL) {
-        if (js_arena_base_lo) {
+        if (rt->is_arena) {
             /* arena: link into the per-request hash overlay rather than
                base atom_hash. */
             if (js_atom_hash_overlay_ensure(rt) < 0)
@@ -3768,7 +3784,7 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
     /* arena: this would unlink from rt->atom_hash, rewrite js_atom_struct(rt, i),
        update rt->atom_free_index and rt->atom_count — all base writes. We
        leak the atom slot instead; arena reset reclaims everything wholesale. */
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         return;
     uint32_t i = p->hash_next;  /* atom_index */
     if (p->atom_type != JS_ATOM_TYPE_SYMBOL) {
@@ -4833,7 +4849,7 @@ static JSValue string_buffer_end(StringBuffer *s)
     if (!s->is_wide_char)
         str8(str)[s->len] = 0;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
-    if (js_arena_base_lo)
+    if (rt->is_arena)
         init_list_head(&str->link);
     else
         list_add_tail(&str->link, &s->ctx->rt->string_list);
@@ -5790,7 +5806,7 @@ static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
     /* arena: request-arena shapes go into the per-request overlay so the
        base shape_hash table is never written. Base shapes (snapshot init)
        still link into the base table normally. */
-    if (js_arena_base_lo && !js_arena_ptr_is_base(sh)) {
+    if (rt->is_arena && !js_arena_ptr_is_base(sh)) {
         if (js_shape_overlay_ensure(rt) < 0)
             return;  /* on OOM, skip linking; lookups won't find this shape */
         h = js_shape_overlay_bucket(sh->hash, rt->req->shape_overlay_size);
@@ -5803,7 +5819,7 @@ static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
     sh->shape_hash_next = rt->shape_hash[h];
     rt->shape_hash[h] = sh;
     /* skip rt->shape_hash_count in arena mode (base write, no consumer) */
-    if (!js_arena_base_lo)
+    if (!rt->is_arena)
         rt->shape_hash_count++;
 }
 
@@ -5813,10 +5829,10 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     JSShape **psh;
 
     /* arena: base shapes are immortal — never unlinked once frozen. */
-    if (js_arena_base_lo && js_arena_ptr_is_base(sh))
+    if (rt->is_arena && js_arena_ptr_is_base(sh))
         return;
     /* arena: request-arena shape lives in the overlay. */
-    if (js_arena_base_lo && rt->req->shape_overlay) {
+    if (rt->is_arena && rt->req->shape_overlay) {
         h = js_shape_overlay_bucket(sh->hash, rt->req->shape_overlay_size);
         psh = &rt->req->shape_overlay[h];
         while (*psh && *psh != sh)
@@ -5832,7 +5848,7 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     while (*psh != sh)
         psh = &(*psh)->shape_hash_next;
     *psh = sh->shape_hash_next;
-    if (!js_arena_base_lo)
+    if (!rt->is_arena)
         rt->shape_hash_count--;
 }
 
@@ -6027,14 +6043,14 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         if (!sh_alloc)
             return -1;
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-        if (!js_arena_base_lo)
+        if (!ctx->rt->is_arena)
             list_del(&old_sh->header.link);
         /* copy all the fields and the properties */
         memcpy(sh, old_sh,
                sizeof(JSShape) + sizeof(sh->prop[0]) * old_sh->prop_count);
         /* arena: gc_obj_list lives in base; skip linking here, mirrors
            add_gc_object's self-loop behaviour. */
-        if (js_arena_base_lo)
+        if (ctx->rt->is_arena)
             init_list_head(&sh->header.link);
         else
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
@@ -6052,20 +6068,20 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         js_free(ctx, get_alloc_from_shape(old_sh));
     } else {
         /* only resize the properties */
-        if (!js_arena_base_lo)
+        if (!ctx->rt->is_arena)
             list_del(&sh->header.link);
         sh_alloc = js_realloc(ctx, get_alloc_from_shape(sh),
                               get_shape_size(new_hash_size, new_size));
         if (unlikely(!sh_alloc)) {
             /* insert again in the GC list */
-            if (js_arena_base_lo)
+            if (ctx->rt->is_arena)
                 init_list_head(&sh->header.link);
             else
                 list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
             return -1;
         }
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-        if (js_arena_base_lo)
+        if (ctx->rt->is_arena)
             init_list_head(&sh->header.link);
         else
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
@@ -6106,7 +6122,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     /* arena: don't touch the gc_obj_list — base shapes are immortal
        and stay in their original slot; new shapes get a self-link.
        This matches the gating in resize_properties above. */
-    if (js_arena_base_lo) {
+    if (ctx->rt->is_arena) {
         memcpy(sh, old_sh, sizeof(JSShape));
         init_list_head(&sh->header.link);
     } else {
@@ -7351,7 +7367,7 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
     case JS_TAG_FUNCTION_BYTECODE:
         {
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
-            if (js_arena_base_lo) {
+            if (rt->is_arena) {
                 /* arena: bypass the gc_zero_ref_count_list dance whose
                    head lives in base. Free directly; finalizers run as
                    normal. Recursion through children is bounded by JS
@@ -7409,7 +7425,7 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
 {
     h->mark = 0;
     h->gc_obj_type = type;
-    if (js_arena_base_lo) {
+    if (rt->is_arena) {
         /* arena: gc_obj_list head lives in base; linking into it would
            dirty a base page on every allocation. We don't traverse the
            list (GC is suppressed; teardown walks gated by ENABLE_DUMPS),
@@ -8835,7 +8851,7 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
        would dirty a base page on every request. Arena-backed runtimes
        skip the periodic interrupt poll entirely; if a future use needs
        it back, move the counter into JSRequestState. */
-    if (js_arena_base_lo)
+    if (ctx->rt->is_arena)
         return 0;
     if (unlikely(--ctx->interrupt_counter <= 0)) {
         return __js_poll_interrupts(ctx);
@@ -8879,7 +8895,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
        up in those walks as its base identity, so identity comparisons
        must be against base. */
     JSObject *p_base = p;
-    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+    if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p)
             return -1;
@@ -8946,7 +8962,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
        Object.prototype identity check below, and those two ARE pre-marked
        — so leaving rarer base prototypes unmarked is harmless. */
     if (proto && !proto->is_prototype) {
-        if (js_arena_base_lo && js_arena_ptr_is_base(proto)) {
+        if (ctx->rt->is_arena && js_arena_ptr_is_base(proto)) {
             /* leave unmarked; see comment above */
         } else {
             proto->is_prototype = true;
@@ -9395,7 +9411,7 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
     /* arena: redirect a base-JSObject target to its shadow if one
        exists. Pass-through for unshadowed base or request-arena
        objects. Reads only — does not allocate a shadow. */
-    if (js_arena_base_lo && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+    if (ctx->rt->is_arena && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         JSObject *p_orig = JS_VALUE_GET_OBJ(obj);
         JSObject *p_active = js_object_active(ctx->rt, p_orig);
         if (p_active != p_orig) {
@@ -10005,7 +10021,7 @@ static int JS_GetOwnPropertyInternal2(JSContext *ctx, JSPropertyDescriptor *desc
        hasOwnProperty / Object.keys / getOwnPropertyDescriptor on a
        base object that was modified this request reads the modified
        view. */
-    if (js_arena_base_lo)
+    if (ctx->rt->is_arena)
         p = js_object_active(ctx->rt, p);
 
 retry:
@@ -10169,7 +10185,7 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
         return js_proxy_preventExtensions(ctx, obj);
     /* arena: write to a base object's extensible bit must land in the
        per-request shadow, not in snapshot memory. */
-    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+    if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p)
             return -1;
@@ -10860,7 +10876,7 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
     /* arena: redirect a base-JSObject target to its writable shadow,
        allocating one on first write. Both `obj` and `this_obj` may
        reference the same base; swap them in lockstep. */
-    if (js_arena_base_lo
+    if (ctx->rt->is_arena
         && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         JSObject *p_orig = JS_VALUE_GET_OBJ(obj);
         if (js_arena_ptr_is_base(p_orig)) {
@@ -11345,7 +11361,7 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
        request shadow. JS_SetPropertyInternal2 shadows obj up-front but
        the receiver-side slow path arrives here with the original base
        this_obj. Catch it once at the entry. */
-    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+    if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p)
             return -1;
@@ -11566,7 +11582,7 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
     }
     p = JS_VALUE_GET_OBJ(this_obj);
     /* arena: redirect base target to shadow on write. */
-    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+    if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p)
             return -1;
@@ -12246,7 +12262,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
             /* arena: writing to an existing property on base global_obj
                must land in the per-request shadow. The fast path here
                had been writing through to base. */
-            if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+            if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
                 JSObject *p_shadow = js_object_for_write(ctx, p);
                 if (!p_shadow) {
                     JS_FreeValue(ctx, val);
@@ -12317,7 +12333,7 @@ int JS_DeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int flags)
         return -1;
     p = JS_VALUE_GET_OBJ(obj1);
     /* arena: redirect base target to shadow on delete (a write op). */
-    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+    if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p) {
             JS_FreeValue(ctx, obj1);
@@ -19734,7 +19750,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* arena: the fast-path read inlines find_own_property
                        and bypasses JS_GetPropertyInternal. Redirect to
                        shadow if one exists. */
-                    if (js_arena_base_lo)
+                    if (rt->is_arena)
                         p = js_object_active(ctx->rt, p);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
@@ -19785,7 +19801,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
                     /* arena: same redirect as OP_get_field. */
-                    if (js_arena_base_lo)
+                    if (rt->is_arena)
                         p = js_object_active(ctx->rt, p);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
@@ -19838,7 +19854,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* arena: if writing through an existing property
                        slot, redirect to shadow first so set_value lands
                        in shadow->prop, not base->prop. */
-                    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+                    if (rt->is_arena && js_arena_ptr_is_base(p)) {
                         p = js_object_for_write(ctx, p);
                         if (!p)
                             goto exception;
@@ -20130,7 +20146,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            or extending the array). Skip both and let the
                            slow path route through JS_SetPropertyValue →
                            JS_SetPropertyInternal2 (already hooked). */
-                        if (unlikely(js_arena_base_lo
+                        if (unlikely(rt->is_arena
                                      && js_arena_ptr_is_base(p)))
                             goto put_array_el_slow_path;
                         if (likely(p->class_id == JS_CLASS_ARRAY &&
@@ -29920,7 +29936,7 @@ static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
        lookups won't find this module via the list (re-resolution will
        re-load it; acceptable for now — proper fix is a per-request
        module registry). */
-    if (js_arena_base_lo)
+    if (ctx->rt->is_arena)
         init_list_head(&m->link);
     else
         list_add_tail(&m->link, &ctx->loaded_modules);
@@ -39872,7 +39888,7 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
 
     /* arena: stats only, written into base ctx; consumer is
        JS_ComputeMemoryUsage which is a diagnostic. Skip. */
-    if (!js_arena_base_lo) {
+    if (!ctx->rt->is_arena) {
         ctx->binary_object_count += 1;
         ctx->binary_object_size += buf_len;
     }
@@ -47897,7 +47913,7 @@ static void js_random_init(JSContext *ctx)
    arena mode this is just &ctx->random_state. */
 static inline uint64_t *js_random_state_active(JSContext *ctx)
 {
-    if (js_arena_base_lo)
+    if (ctx->rt->is_arena)
         return &ctx->rt->req->random_state_req;
     return &ctx->random_state;
 }
@@ -61393,8 +61409,9 @@ static bool is_valid_weakref_target(JSValueConst val)
    in the request arena; lookups still work normally. */
 static inline bool weakref_target_is_base(JSValueConst target)
 {
-    if (!js_arena_base_lo)
-        return false;
+    /* No rt in scope here; rely on the per-pointer arena range check.
+       Vanilla heap pointers are never in any arena range, so this
+       returns false for non-arena runtimes automatically. */
     switch (JS_VALUE_GET_TAG(target)) {
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:

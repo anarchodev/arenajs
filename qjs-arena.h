@@ -45,26 +45,40 @@ JS_EXTERN bool js_dual_arena_in_request(const JSDualArena *da, const void *ptr);
 JS_EXTERN size_t js_dual_arena_base_used(const JSDualArena *da);
 JS_EXTERN size_t js_dual_arena_request_used(const JSDualArena *da);
 
-/* Thread-local base-arena address range, populated by js_dual_arena_freeze().
- * Used by the refcount inc/dec chokepoints to skip work for base-arena objects
- * (those allocations are immortal: they are alive for the runtime's lifetime,
- * inc/dec are no-ops, and the free path is never entered).
+/* Thread-local list of registered base-arena address ranges. One entry
+ * per arena-backed runtime that has been frozen on this thread. Used by
+ * the refcount chokepoints (and a few other per-pointer checks) to
+ * recognise base-arena allocations.
  *
- * Limitation: only one arena-backed runtime per thread. Calling
- * js_dual_arena_freeze on a second dual arena from the same thread overwrites
- * the range and the earlier runtime's chokepoint guards become wrong. The
- * runtime must also stay on its creating thread — if a second thread calls
- * into it, that thread's TLS is unset and js_arena_ptr_is_base() returns
- * false for everything, eventually corrupting refcounts.
+ * Multiple arena runtimes can coexist in the same thread, and arena
+ * runtimes can coexist with vanilla (non-arena) runtimes. Vanilla
+ * heap pointers fall in no registered range, so js_arena_ptr_is_base()
+ * returns false for them automatically.
+ *
+ * The runtime must stay on its creating thread — a second thread calling
+ * into it sees an unset TLS list and js_arena_ptr_is_base() reports
+ * false for objects that ARE in base, which corrupts refcount semantics.
  */
-extern __thread const uint8_t *js_arena_base_lo;
-extern __thread const uint8_t *js_arena_base_hi;
+#define JS_ARENA_RANGES_MAX 16
+struct js_arena_range { const uint8_t *lo, *hi; };
+extern __thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
+extern __thread int                   js_arena_range_count;
 
 static inline bool js_arena_ptr_is_base(const void *p)
 {
     const uint8_t *b = (const uint8_t *)p;
-    return b >= js_arena_base_lo && b < js_arena_base_hi;
+    for (int i = 0; i < js_arena_range_count; i++) {
+        if (b >= js_arena_ranges[i].lo && b < js_arena_ranges[i].hi)
+            return true;
+    }
+    return false;
 }
+
+/* Internal: register/deregister an arena's base range. Called by
+ * js_dual_arena_freeze and js_dual_arena_free. Returns 0 on success,
+ * -1 if the per-thread range table is full (raise JS_ARENA_RANGES_MAX). */
+JS_EXTERN int  js_arena_register_base(const uint8_t *lo, const uint8_t *hi);
+JS_EXTERN void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi);
 
 /* JSMallocFunctions table; pass &js_dual_arena_malloc_funcs to JS_NewRuntime2
    together with a JSDualArena* as the opaque parameter. */
@@ -76,6 +90,10 @@ JS_EXTERN JSRuntime *JS_NewRuntimeArena(size_t base_size,
 JS_EXTERN void JS_FreezeRuntime(JSRuntime *rt);
 JS_EXTERN void JS_ResetRequestArena(JSRuntime *rt);
 JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
+
+/* Internal: marks a runtime as arena-backed. Set by JS_NewRuntimeArena;
+   defined in quickjs.c so it can reach the JSRuntime struct. */
+JS_EXTERN void js_runtime_mark_arena(JSRuntime *rt);
 
 /* Internal coordination — relocates the per-request mutable runtime state
    (current_exception, current_stack_frame, in_*, parent_promise) from its
@@ -125,6 +143,15 @@ JS_EXTERN int JS_MarkAllPrototypes(JSRuntime *rt);
 JS_EXTERN int    js_arena_thermometer_enable(void);
 JS_EXTERN void   js_arena_thermometer_disable(void);
 JS_EXTERN void   js_arena_thermometer_reset(void);
+
+/* Multi-runtime variants. The thermometer can track up to 8 ranges
+ * concurrently; the SIGSEGV handler dispatches to the entry whose
+ * (lo, hi) contains the faulting address. The no-arg API above
+ * operates on the most recently enabled range. */
+JS_EXTERN int    js_arena_thermometer_enable_range(const uint8_t *lo,
+                                                   const uint8_t *hi);
+JS_EXTERN void   js_arena_thermometer_disable_range(const uint8_t *lo,
+                                                    const uint8_t *hi);
 JS_EXTERN size_t js_arena_thermometer_pages(void);
 JS_EXTERN size_t js_arena_thermometer_writes(void);
 /* Fills `out` (capacity `cap`) with the byte offsets within the base
