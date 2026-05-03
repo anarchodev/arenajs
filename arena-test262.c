@@ -165,6 +165,10 @@ static void run_one(Walker *w, const char *path, const char *relpath)
         free(src);
         return;
     }
+    if (getenv("ARENA_VERBOSE")) {
+        fprintf(stderr, "  [%d] %s\n", w->evaluated + 1, relpath);
+        fflush(stderr);
+    }
     js_arena_thermometer_reset();
     JSValue v = JS_Eval(w->ctx, src, len, relpath, JS_EVAL_TYPE_GLOBAL);
     size_t pages = js_arena_thermometer_pages();

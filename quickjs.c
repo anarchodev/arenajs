@@ -8854,6 +8854,18 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
             goto not_obj;
     }
+    /* Spec: when obj is not an Object, Object.setPrototypeOf returns
+       obj unchanged. Bail before touching it as if it were a JSObject;
+       previously the arena shadow guard below dereferenced obj as an
+       object pointer even for primitives. */
+    if (throw_flag && JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+        if (JS_VALUE_GET_TAG(proto_val) != JS_TAG_OBJECT
+            && JS_VALUE_GET_TAG(proto_val) != JS_TAG_NULL) {
+            JS_ThrowTypeErrorNotAnObject(ctx);
+            return -1;
+        }
+        return true;
+    }
     p = JS_VALUE_GET_OBJ(obj);
     /* arena: prototype mutation is a write to the JSObject's shape;
        redirect base target to shadow. */
@@ -8872,9 +8884,6 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     } else {
         proto = JS_VALUE_GET_OBJ(proto_val);
     }
-
-    if (throw_flag && JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return true;
 
     if (unlikely(p->class_id == JS_CLASS_PROXY))
         return js_proxy_setPrototypeOf(ctx, obj, proto_val, throw_flag);
@@ -11986,7 +11995,8 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
     JSObject *p;
     JSShapeProperty *prs;
 
-    p = JS_VALUE_GET_OBJ(ctx->global_obj);
+    /* arena: check the active (possibly shadowed) global_obj. */
+    p = js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ctx->global_obj));
     prs = find_own_property1(p, prop);
     /* XXX: should handle JS_PROP_AUTOINIT */
     if (flags & DEFINE_GLOBAL_LEX_VAR) {
@@ -12106,6 +12116,9 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
 
     /* fast path */
     p = JS_VALUE_GET_OBJ(ctx->global_obj);
+    /* arena: if a prior set in this request shadowed global_obj, read
+       from the shadow so we see the updated value. */
+    p = js_object_active(ctx->rt, p);
     prs = find_own_property(&pr, p, prop);
     if (prs) {
         if (likely((prs->flags & JS_PROP_TMASK) == 0))
@@ -12195,6 +12208,22 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
     if (prs) {
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+            /* arena: writing to an existing property on base global_obj
+               must land in the per-request shadow. The fast path here
+               had been writing through to base. */
+            if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+                JSObject *p_shadow = js_object_for_write(ctx, p);
+                if (!p_shadow) {
+                    JS_FreeValue(ctx, val);
+                    return -1;
+                }
+                prs = find_own_property(&pr, p_shadow, prop);
+                if (!prs) {
+                    /* should not happen — clone preserves shape */
+                    JS_FreeValue(ctx, val);
+                    return -1;
+                }
+            }
             /* fast path */
             set_value(ctx, &pr->u.value, val);
             return 0;
