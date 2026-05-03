@@ -773,3 +773,52 @@ thermometer surfaces them.
   workloads now stable across 1000+ resets. Snapshot grew by ~150 KB
   (all the prototype methods now eagerly allocated), reset cost
   unchanged at 8 ns/iter.
+
+- **test262 walker (`arena-test262.c`)** built as the breadth check
+  for the inviolate-base invariant. Walks the test262 spec corpus,
+  runs each test under the thermometer in arena mode, asserts zero
+  base bytes dirtied per file. Started at "no signal beyond a 38-test
+  kitchen-sink stress harness", landed at:
+
+  | tree                | tests | base-clean | base-dirtied |
+  |---------------------|-------|-----------:|-------------:|
+  | test262/built-ins   | 21570 | **21570**  | 0            |
+  | test262/language    | 18770 | **18770**  | 0            |
+  | test262/annexB      |  1003 |  **1003**  | 0            |
+  | test262/staging     |  1160 |  **1160**  | crash @1161  |
+
+  **40 343 / 40 343 evaluated tests across the official spec corpus
+  leave zero base bytes touched.** Staging crash is a separate cumulative-
+  state corruption bug (free_gc_object aborts on an unknown gc_obj_type
+  mid-run; suggests a stale request-arena pointer reachable from base
+  somewhere). Tracked separately — does not affect the base-write
+  invariant.
+
+  Classes of base mutation this exercise surfaced and fixed (incremental):
+  - `JS_SetGlobalVar` fast path overwrote base `global_obj` prop slot
+    (e.g. reassigning `Array`); the surviving request-arena pointer
+    crashed the next request. Routed through `js_object_for_write`.
+  - `Object.setPrototypeOf(<primitive>, ...)` decoded the primitive as
+    a JSObject and ran the arena guard before the spec early-return.
+  - `WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` over base
+    targets wrote `target->first_weak_ref` for collection-cleanup
+    bookkeeping. Base targets are immortal in arena mode → skip insert
+    and the symmetric delete/finalizer paths.
+  - `JS_SetPrototypeInternal` flipped `proto->is_prototype = true` on
+    rare base prototypes that `JS_MarkAllPrototypes` didn't reach at
+    freeze. Skipped (the only consumer is the
+    Array.prototype/Object.prototype identity check, both pre-marked).
+  - Same function: shadow swap broke identity comparisons (Object.prototype
+    immutability + cycle detection). Keep `p_base` for identity, use `p`
+    only for writes.
+  - `Math.random` updated `ctx->random_state` (same-value write but page-
+    faulted). Relocated to `JSRequestState.random_state_req`.
+  - `JS_PreventExtensions` wrote `p->extensible = false` directly on
+    base targets. Routed through the shadow.
+  - `JS_MarkAllPrototypes` added at freeze to pre-mark every base
+    prototype's `is_prototype` flag (path-copy, not bulk relocation —
+    snapshot stays maximal).
+  - `compact_properties` mutated `gc_obj_list` neighbours when the old
+    shape was a base shape. Gated to skip list ops in arena mode.
+  - `error_back_trace` relocated from `ctx->` to JSRequestState — fixed
+    the try/catch/Array.from base writes.
