@@ -51,8 +51,8 @@ struct JSDualArena {
 };
 
 /* Process-global base-arena range; see qjs-arena.h. */
-const uint8_t *js_arena_base_lo = NULL;
-const uint8_t *js_arena_base_hi = NULL;
+__thread const uint8_t *js_arena_base_lo = NULL;
+__thread const uint8_t *js_arena_base_hi = NULL;
 
 /* ----- low-level arena ops ----- */
 

@@ -124,11 +124,21 @@ identify which call paths still mutate base when adding a new feature.
 
 These follow from the model and aren't going to change:
 
-- **One arena-backed runtime per process.** A process-global pointer
-  range (`js_arena_base_lo` / `js_arena_base_hi`) is set by
-  `JS_FreezeRuntime` and used by the refcount chokepoints to skip
-  base targets. A second `JS_NewRuntimeArena` in the same process
-  would overwrite this and corrupt the first.
+- **One arena-backed runtime per thread, and the runtime stays on
+  its creating thread.** A thread-local pointer range
+  (`js_arena_base_lo` / `js_arena_base_hi`, declared `__thread`) is
+  set by `JS_FreezeRuntime` and used by the refcount chokepoints to
+  skip base targets. A second `JS_NewRuntimeArena` from the *same*
+  thread would overwrite the slot and corrupt the first runtime;
+  and a thread that didn't create the runtime will see the slot as
+  unset and treat all base objects as request-arena (eventual
+  refcount corruption). Workers servicing different requests should
+  each own their own runtime.
+- **The thermometer is still process-singleton.** It installs a
+  `SIGSEGV` handler — process-wide by definition — and tracks one
+  base address range. Enabling the thermometer in more than one
+  thread at a time is unsupported; it's a debug tool, so the
+  expectation is single-threaded debug runs.
 - **Single context per runtime.** A few JSRequestState fields
   (`error_back_trace_req`, `random_state_req`) are per-runtime, not
   per-context. Multi-context support would require those to become

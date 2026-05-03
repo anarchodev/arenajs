@@ -45,18 +45,20 @@ JS_EXTERN bool js_dual_arena_in_request(const JSDualArena *da, const void *ptr);
 JS_EXTERN size_t js_dual_arena_base_used(const JSDualArena *da);
 JS_EXTERN size_t js_dual_arena_request_used(const JSDualArena *da);
 
-/* Process-global base-arena address range, populated by js_dual_arena_freeze().
+/* Thread-local base-arena address range, populated by js_dual_arena_freeze().
  * Used by the refcount inc/dec chokepoints to skip work for base-arena objects
  * (those allocations are immortal: they are alive for the runtime's lifetime,
  * inc/dec are no-ops, and the free path is never entered).
  *
- * Limitation: only one arena-backed runtime per process. Calling
- * js_dual_arena_freeze on a second dual arena overwrites the range and the
- * earlier runtime's chokepoint guards become wrong. Realistic deployments
- * for this allocator are single-runtime; revisit if that ever changes.
+ * Limitation: only one arena-backed runtime per thread. Calling
+ * js_dual_arena_freeze on a second dual arena from the same thread overwrites
+ * the range and the earlier runtime's chokepoint guards become wrong. The
+ * runtime must also stay on its creating thread — if a second thread calls
+ * into it, that thread's TLS is unset and js_arena_ptr_is_base() returns
+ * false for everything, eventually corrupting refcounts.
  */
-extern const uint8_t *js_arena_base_lo;
-extern const uint8_t *js_arena_base_hi;
+extern __thread const uint8_t *js_arena_base_lo;
+extern __thread const uint8_t *js_arena_base_hi;
 
 static inline bool js_arena_ptr_is_base(const void *p)
 {
