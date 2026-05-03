@@ -186,6 +186,10 @@ Targets produced:
 - `build/arena-coexist` — vanilla + arena runtime sharing one thread,
   100 interleaved request iterations with the thermometer asserting
   zero base writes per arena request
+- `build/arena-interrupt` — verifies `JS_SetInterruptHandler` fires
+  in arena mode (per-request counter on `JSRequestState` instead of
+  the base ctx) and that aborting an infinite-loop request leaves
+  zero base bytes touched
 
 ### Running the regression sweep
 

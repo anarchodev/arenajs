@@ -146,11 +146,12 @@ microbench: $(QJS)
 # inviolate-base regression check. arena-coexist verifies a vanilla
 # and an arena runtime can share one thread.
 test-arena: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target arena-smoke arena-stress arena-bench arena-test262 arena-coexist
+	cmake --build $(BUILD_DIR) --target arena-smoke arena-stress arena-bench arena-test262 arena-coexist arena-interrupt
 	$(BUILD_DIR)/arena-smoke
 	$(BUILD_DIR)/arena-stress
 	$(BUILD_DIR)/arena-bench
 	$(BUILD_DIR)/arena-coexist
+	$(BUILD_DIR)/arena-interrupt
 	$(BUILD_DIR)/arena-test262 test262/test/built-ins
 	$(BUILD_DIR)/arena-test262 test262/test/language
 	$(BUILD_DIR)/arena-test262 test262/test/annexB

@@ -329,6 +329,12 @@ typedef struct JSRequestState {
        JS_SetRandomSeed writes here in arena mode. The seed-zero contract
        (Math.random returns 0 until seeded) is preserved per-request. */
     uint64_t random_state_req;
+    /* Per-request interrupt counter. The bytecode interpreter
+       decrements this every basic block via js_poll_interrupts; in
+       arena mode that decrement would dirty the base ctx page on
+       every request. Live here instead, reset to
+       JS_INTERRUPT_COUNTER_INIT at every JS_ResetRequestArena. */
+    int interrupt_counter_req;
 } JSRequestState;
 
 struct JSRuntime {
@@ -2215,6 +2221,7 @@ int JS_RelocateReqState(JSRuntime *rt)
     init_list_head(&new_req->job_list);
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->random_state_req = 0;
+    new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
     rt->req = new_req;
     return 0;
 }
@@ -8838,7 +8845,13 @@ static void JS_ThrowInterrupted(JSContext *ctx)
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
-    ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
+    /* Reset whichever counter the poll just hit zero on (arena uses
+       the per-request shadow on JSRequestState, vanilla uses the base
+       ctx field). */
+    if (rt->is_arena)
+        rt->req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
+    else
+        ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
             JS_ThrowInterrupted(ctx);
@@ -8850,13 +8863,14 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 
 static inline __exception int js_poll_interrupts(JSContext *ctx)
 {
-    /* arena: ctx lives in base. Decrementing this counter per bytecode op
-       would dirty a base page on every request. Arena-backed runtimes
-       skip the periodic interrupt poll entirely; if a future use needs
-       it back, move the counter into JSRequestState. */
-    if (ctx->rt->is_arena)
-        return 0;
-    if (unlikely(--ctx->interrupt_counter <= 0)) {
+    /* arena: route the per-bytecode-op decrement through the
+       per-request counter on JSRequestState so it doesn't dirty the
+       base ctx page. Vanilla path uses ctx->interrupt_counter as
+       before. */
+    int *counter = ctx->rt->is_arena
+        ? &ctx->rt->req->interrupt_counter_req
+        : &ctx->interrupt_counter;
+    if (unlikely(--*counter <= 0)) {
         return __js_poll_interrupts(ctx);
     } else {
         return 0;
