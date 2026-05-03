@@ -780,19 +780,17 @@ thermometer surfaces them.
   base bytes dirtied per file. Started at "no signal beyond a 38-test
   kitchen-sink stress harness", landed at:
 
-  | tree                | tests | base-clean | base-dirtied |
-  |---------------------|-------|-----------:|-------------:|
-  | test262/built-ins   | 21570 | **21570**  | 0            |
-  | test262/language    | 18770 | **18770**  | 0            |
-  | test262/annexB      |  1003 |  **1003**  | 0            |
-  | test262/staging     |  1160 |  **1160**  | crash @1161  |
+  | tree                | tests | base-clean |
+  |---------------------|------:|-----------:|
+  | test262/built-ins   | 21570 | **21570**  |
+  | test262/language    | 18770 | **18770**  |
+  | test262/annexB      |  1003 |  **1003**  |
+  | test262/staging     |  1393 |  **1393**  |
+  | test262/intl402     |  3284 |  **3284**  |
+  | **total**           | 46020 | **46020**  |
 
-  **40 343 / 40 343 evaluated tests across the official spec corpus
-  leave zero base bytes touched.** Staging crash is a separate cumulative-
-  state corruption bug (free_gc_object aborts on an unknown gc_obj_type
-  mid-run; suggests a stale request-arena pointer reachable from base
-  somewhere). Tracked separately — does not affect the base-write
-  invariant.
+  **46 020 / 46 020 evaluated tests across the entire test262 corpus
+  leave zero base bytes touched.**
 
   Classes of base mutation this exercise surfaced and fixed (incremental):
   - `JS_SetGlobalVar` fast path overwrote base `global_obj` prop slot
@@ -822,3 +820,14 @@ thermometer surfaces them.
     shape was a base shape. Gated to skip list ops in arena mode.
   - `error_back_trace` relocated from `ctx->` to JSRequestState — fixed
     the try/catch/Array.from base writes.
+  - `Reflect.set(target, key, val, receiver)` with a base receiver
+    routed `JS_CreateProperty(p=base, ...)` and `add_property` wrote
+    `p->shape = new_sh` directly into base. Shadow `p` at
+    `JS_CreateProperty` entry so the slow path's slow path also
+    respects the inviolate base.
+  - `JS_GetOwnPropertyInternal2` (the central own-property reader, used
+    by `hasOwnProperty`, `Object.keys`, `getOwnPropertyDescriptor`,
+    etc.) read `p->shape` without consulting the per-request shadow.
+    A base object that had been shadowed-and-mutated this request
+    appeared unchanged to those readers. Route `p` through
+    `js_object_active` at entry.
