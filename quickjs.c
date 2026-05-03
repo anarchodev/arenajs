@@ -10084,8 +10084,10 @@ int JS_IsExtensible(JSContext *ctx, JSValueConst obj)
     p = JS_VALUE_GET_OBJ(obj);
     if (unlikely(p->class_id == JS_CLASS_PROXY))
         return js_proxy_isExtensible(ctx, obj);
-    else
-        return p->extensible;
+    /* arena: a per-request preventExtensions on a base object lives in
+       the shadow; route reads through it. */
+    p = js_object_active(ctx->rt, p);
+    return p->extensible;
 }
 
 /* return -1 if exception (Proxy object only) or true/false */
@@ -10098,6 +10100,13 @@ int JS_PreventExtensions(JSContext *ctx, JSValueConst obj)
     p = JS_VALUE_GET_OBJ(obj);
     if (unlikely(p->class_id == JS_CLASS_PROXY))
         return js_proxy_preventExtensions(ctx, obj);
+    /* arena: write to a base object's extensible bit must land in the
+       per-request shadow, not in snapshot memory. */
+    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+        p = js_object_for_write(ctx, p);
+        if (!p)
+            return -1;
+    }
     p->extensible = false;
     return true;
 }
