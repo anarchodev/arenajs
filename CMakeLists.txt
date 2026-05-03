@@ -449,6 +449,19 @@ add_executable(api-test
 target_compile_definitions(api-test PRIVATE ${qjs_defines})
 target_link_libraries(api-test PRIVATE qjs)
 
+# Arena harnesses: smoke (basic two-request lifecycle), stress
+# (kitchen-sink of 38 JS workloads), bench (per-request reset speed),
+# test262 (walks the test262 corpus under the thermometer asserting
+# zero base-byte mutations per request). All link against the same
+# libqjs as api-test; they read test262 files at runtime relative to
+# the build's source dir for arena-test262.
+
+foreach(arena_target IN ITEMS arena-smoke arena-stress arena-bench arena-test262)
+    add_executable(${arena_target} ${arena_target}.c)
+    target_compile_definitions(${arena_target} PRIVATE ${qjs_defines})
+    target_link_libraries(${arena_target} PRIVATE qjs)
+endforeach()
+
 add_executable(lre-test
     lre-test.c
     libregexp.c
