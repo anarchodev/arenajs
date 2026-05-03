@@ -325,6 +325,10 @@ typedef struct JSRequestState {
        Multi-ctx support is a known limitation — for >1 ctx this
        would need to be per-ctx like the shadow_map. */
     JSValue error_back_trace_req;
+    /* Per-request Math.random() state. Initialised to 0 at every reset;
+       JS_SetRandomSeed writes here in arena mode. The seed-zero contract
+       (Math.random returns 0 until seeded) is preserved per-request. */
+    uint64_t random_state_req;
 } JSRequestState;
 
 struct JSRuntime {
@@ -2191,6 +2195,7 @@ int JS_RelocateReqState(JSRuntime *rt)
        address. */
     init_list_head(&new_req->job_list);
     new_req->error_back_trace_req = JS_UNDEFINED;
+    new_req->random_state_req = 0;
     rt->req = new_req;
     return 0;
 }
@@ -8867,8 +8872,13 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         return true;
     }
     p = JS_VALUE_GET_OBJ(obj);
-    /* arena: prototype mutation is a write to the JSObject's shape;
-       redirect base target to shadow. */
+    /* arena: keep `p_base` for identity checks (Object.prototype
+       immutability, cycle detection), and use the writable shadow `p`
+       only for the actual prop/shape write. The proto chain we walk
+       below is the base chain — any in-arena shadowed prototype shows
+       up in those walks as its base identity, so identity comparisons
+       must be against base. */
+    JSObject *p_base = p;
     if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p)
@@ -8890,7 +8900,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     sh = p->shape;
     if (sh->proto == proto)
         return true;
-    if (p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) {
+    if (p_base == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) {
         if (throw_flag) {
             JS_ThrowTypeError(ctx, "'Immutable prototype object \'Object.prototype\' cannot have their prototype set'");
             return -1;
@@ -8909,7 +8919,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         /* check if there is a cycle */
         p1 = proto;
         do {
-            if (p1 == p) {
+            if (p1 == p_base) {
                 if (throw_flag) {
                     JS_ThrowTypeError(ctx, "circular prototype chain");
                     return -1;
@@ -8929,12 +8939,19 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
     if (sh->proto)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
     sh->proto = proto;
-    /* arena: avoid a same-value write into a base prototype object.
-       Every base prototype is already marked is_prototype at snapshot
-       build time, so the conditional skip costs nothing in normal
-       (non-arena) mode either. */
-    if (proto && !proto->is_prototype)
-        proto->is_prototype = true;
+    /* arena: skip the bit flip on base prototypes. Most base prototypes
+       are pre-marked at freeze by JS_MarkAllPrototypes; the rest (objects
+       that no one had used as a proto by freeze time) we just leave with
+       is_prototype = false. The only consumer is the Array.prototype /
+       Object.prototype identity check below, and those two ARE pre-marked
+       — so leaving rarer base prototypes unmarked is harmless. */
+    if (proto && !proto->is_prototype) {
+        if (js_arena_base_lo && js_arena_ptr_is_base(proto)) {
+            /* leave unmarked; see comment above */
+        } else {
+            proto->is_prototype = true;
+        }
+    }
     if (p->is_prototype) {
         /* track modification of Array.prototype */
         if (unlikely(p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]))) {
@@ -47857,10 +47874,20 @@ static void js_random_init(JSContext *ctx)
     ctx->random_state = 0;
 }
 
+/* arena: route random_state through the per-request shadow so
+   Math.random() does not write into base ctx. Pre-arena and outside
+   arena mode this is just &ctx->random_state. */
+static inline uint64_t *js_random_state_active(JSContext *ctx)
+{
+    if (js_arena_base_lo)
+        return &ctx->rt->req->random_state_req;
+    return &ctx->random_state;
+}
+
 void JS_SetRandomSeed(JSContext *ctx, uint64_t seed)
 {
     /* xorshift64 requires a non-zero state */
-    ctx->random_state = seed != 0 ? seed : 1;
+    *js_random_state_active(ctx) = seed != 0 ? seed : 1;
 }
 
 static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
@@ -47869,7 +47896,7 @@ static JSValue js_math_random(JSContext *ctx, JSValueConst this_val,
     JSFloat64Union u;
     uint64_t v;
 
-    v = xorshift64star(&ctx->random_state);
+    v = xorshift64star(js_random_state_active(ctx));
     /* 1.0 <= u.d < 2 */
     u.u64 = ((uint64_t)0x3ff << 52) | (v >> 12);
     return js_float64(u.d - 1.0);
@@ -52216,6 +52243,8 @@ static void map_hash_resize(JSContext *ctx, JSMapState *s)
     s->record_count_threshold = new_hash_size * 2;
 }
 
+static inline bool weakref_target_is_base(JSValueConst target);
+
 static JSWeakRefRecord **get_first_weak_ref(JSValueConst key)
 {
         switch (JS_VALUE_GET_TAG(key)) {
@@ -52250,14 +52279,19 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
     mr->map = s;
     mr->empty = false;
     if (s->is_weak) {
-        JSWeakRefRecord *wr = js_malloc(ctx, sizeof(*wr));
-        if (!wr) {
-            js_free(ctx, mr);
-            return NULL;
+        /* arena: skip the per-target weak-ref bookkeeping when the key
+           is a base target — base targets are immortal here, so there's
+           no collection event to clean up after. */
+        if (!weakref_target_is_base(key)) {
+            JSWeakRefRecord *wr = js_malloc(ctx, sizeof(*wr));
+            if (!wr) {
+                js_free(ctx, mr);
+                return NULL;
+            }
+            wr->kind = JS_WEAK_REF_KIND_MAP;
+            wr->u.map_record = mr;
+            insert_weakref_record(key, wr);
         }
-        wr->kind = JS_WEAK_REF_KIND_MAP;
-        wr->u.map_record = mr;
-        insert_weakref_record(key, wr);
         mr->key = unsafe_unconst(key);
     } else {
         mr->key = js_dup(key);
@@ -52280,6 +52314,12 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
 {
     JSWeakRefRecord **pwr, *wr;
 
+    /* arena: insert_weakref_record skipped insertion for base targets,
+       so there's nothing to remove. js_free of wr is a no-op in arena
+       mode, but we still need to free in non-arena mode — for arena
+       base targets, no wr was allocated either (see map_add_record). */
+    if (weakref_target_is_base(mr->key))
+        return;
     pwr = get_first_weak_ref(mr->key);
     for(;;) {
         wr = *pwr;
@@ -60920,6 +60960,12 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
     if (!wrd || wrd == &js_weakref_sentinel)
         return;
 
+    /* arena: insert was skipped for base targets — chain is empty. */
+    if (weakref_target_is_base(wrd->target)) {
+        js_free_rt(rt, wrd);
+        return;
+    }
+
     /* Delete weak ref */
     JSWeakRefRecord **pwr, *wr;
 
@@ -61007,6 +61053,11 @@ static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
 {
     JSWeakRefRecord **pwr, *wr;
 
+    /* arena: insert was skipped for base targets (see insert_weakref_record
+       and js_finrec_register); the chain is empty so there's nothing to
+       remove. */
+    if (weakref_target_is_base(fre->target))
+        return;
     pwr = get_first_weak_ref(fre->target);
     for(;;) {
         wr = *pwr;
@@ -61317,9 +61368,31 @@ static bool is_valid_weakref_target(JSValueConst val)
     return true;
 }
 
+/* arena: in arena mode, base targets are immortal — the first_weak_ref
+   chain on them is purely for collection-cleanup, which never fires.
+   Skip insertion (and the symmetric deletion path) so no base byte is
+   touched. The actual map/set storage uses the hash table, which lives
+   in the request arena; lookups still work normally. */
+static inline bool weakref_target_is_base(JSValueConst target)
+{
+    if (!js_arena_base_lo)
+        return false;
+    switch (JS_VALUE_GET_TAG(target)) {
+    case JS_TAG_OBJECT:
+    case JS_TAG_SYMBOL:
+        return js_arena_ptr_is_base(JS_VALUE_GET_PTR(target));
+    default:
+        return false;
+    }
+}
+
 static void insert_weakref_record(JSValueConst target,
                                   struct JSWeakRefRecord *wr)
 {
+    if (weakref_target_is_base(target)) {
+        wr->next_weak_ref = NULL;
+        return;
+    }
     JSWeakRefRecord **pwr = get_first_weak_ref(target);
     /* Add the weak reference */
     wr->next_weak_ref = *pwr;
