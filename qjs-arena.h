@@ -135,10 +135,16 @@ JS_EXTERN int JS_MarkAllPrototypes(JSRuntime *rt);
  * Returns 0 on success, -1 if base hasn't been frozen yet or if installing
  * the SIGSEGV handler / mprotect failed.
  *
- * Single-threaded only. The handler uses mprotect, which is not strictly
- * async-signal-safe per POSIX but works on Linux/glibc in practice — same
- * pattern as incremental GCs. The previous SIGSEGV handler is chained for
- * faults outside the base arena.
+ * Multiple ranges supported (cap: 8) — the handler dispatches by si_addr
+ * to the entry that contains the faulting address. Each range gets its
+ * own bitmap / baseline / counters. Two threads frobbing the same
+ * arena's counters race; arena ownership is per-thread so this is an
+ * embedder error.
+ *
+ * The handler uses mprotect, which is not strictly async-signal-safe per
+ * POSIX but works on Linux/glibc in practice — same pattern as incremental
+ * GCs. The previous SIGSEGV handler is chained for faults outside any
+ * registered base range.
  */
 JS_EXTERN int    js_arena_thermometer_enable(void);
 JS_EXTERN void   js_arena_thermometer_disable(void);

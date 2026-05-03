@@ -2075,10 +2075,13 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
     return unlikely(sp < rt->stack_limit);
 }
 
-/* arena: marks a runtime as arena-backed. Called by JS_NewRuntimeArena
+/* arena: marks a runtime as arena-backed. Called by JS_FreezeRuntime
    so the per-runtime gating (rt->is_arena) supersedes the older
-   thread-global rt->is_arena check. Defined here because
-   qjs-arena.c can't reach the JSRuntime struct. */
+   thread-global js_arena_base_lo check, which the chokepoints used
+   to mean "is this thread in arena mode at all" — a binary that no
+   longer holds once vanilla and arena runtimes can coexist on one
+   thread. Defined here because qjs-arena.c can't reach the
+   JSRuntime struct directly. */
 void js_runtime_mark_arena(JSRuntime *rt)
 {
     rt->is_arena = true;
