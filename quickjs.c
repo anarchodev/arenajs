@@ -10001,6 +10001,13 @@ static int JS_GetOwnPropertyInternal2(JSContext *ctx, JSPropertyDescriptor *desc
     JSProperty *pr;
     int flags_only = (desc == NULL && pflags != NULL);
 
+    /* arena: route base receivers through any per-request shadow so
+       hasOwnProperty / Object.keys / getOwnPropertyDescriptor on a
+       base object that was modified this request reads the modified
+       view. */
+    if (js_arena_base_lo)
+        p = js_object_active(ctx->rt, p);
+
 retry:
     prs = find_own_property(&pr, p, prop);
     if (prs) {
@@ -11332,6 +11339,17 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
 {
     JSProperty *pr;
     int ret, prop_flags;
+
+    /* arena: a property add on a base receiver (e.g.
+       Reflect.set(x, k, v, Object.prototype)) must land in the per-
+       request shadow. JS_SetPropertyInternal2 shadows obj up-front but
+       the receiver-side slow path arrives here with the original base
+       this_obj. Catch it once at the entry. */
+    if (js_arena_base_lo && js_arena_ptr_is_base(p)) {
+        p = js_object_for_write(ctx, p);
+        if (!p)
+            return -1;
+    }
 
     /* add a new property or modify an existing exotic one */
     if (p->is_exotic) {
