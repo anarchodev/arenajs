@@ -140,10 +140,25 @@ test262-check: $(QJS)
 microbench: $(QJS)
 	$(QJS) tests/microbench.js
 
+# Arena regression sweep. Builds the four arena harnesses (smoke,
+# stress, bench, test262) and runs them in order; arena-test262 walks
+# the test262 corpus under the thermometer asserting zero base-byte
+# mutations, so this serves as the inviolate-base regression check.
+test-arena: $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --target arena-smoke arena-stress arena-bench arena-test262
+	$(BUILD_DIR)/arena-smoke
+	$(BUILD_DIR)/arena-stress
+	$(BUILD_DIR)/arena-bench
+	$(BUILD_DIR)/arena-test262 test262/test/built-ins
+	$(BUILD_DIR)/arena-test262 test262/test/language
+	$(BUILD_DIR)/arena-test262 test262/test/annexB
+	$(BUILD_DIR)/arena-test262 test262/test/staging
+	$(BUILD_DIR)/arena-test262 test262/test/intl402
+
 unicode_gen: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target unicode_gen
 
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test-arena test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
