@@ -268,6 +268,7 @@ set(qjs_sources
     libregexp.c
     libunicode.c
     qjs-arena.c
+    qjs-arena-trace.c
     quickjs.c
 )
 
@@ -355,6 +356,34 @@ if(EMSCRIPTEN)
     )
     target_compile_definitions(qjs_wasm PRIVATE ${qjs_defines})
     target_link_libraries(qjs_wasm PRIVATE m)
+
+    # arenajs reactor: minimal browser-facing module that exports
+    # arena_init/arena_run/arena_destroy. Consumed by rove's replay UI.
+    # Tape host imports and trace-event emitter land in follow-ons.
+    add_executable(qjs_arena_wasm
+        ${qjs_sources}
+        qjs-arena-reactor.c
+        qjs-arena-replay-bindings.c
+    )
+    target_link_options(qjs_arena_wasm PRIVATE
+        -sSTACK_SIZE=2097152
+        -sNO_INVOKE_RUN
+        -sNO_EXIT_RUNTIME
+        -sMODULARIZE
+        -sEXPORT_ES6
+        -sEXPORT_NAME=getArenaJs
+        -sTEXTDECODER=1
+        -sNO_DEFAULT_TO_CXX
+        # HEAPU8/HEAPU16/HEAPU32 exposed so the host can decode binary
+        # trace payloads written by the WASM into linear memory.
+        -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU16,HEAPU32
+        "-sEXPORTED_FUNCTIONS=_arena_init,_arena_run,_arena_run_module,_arena_set_trace_mode,_arena_destroy,_malloc,_free"
+    )
+    # Turn on the trace emitter for this target. Default 0 means the
+    # native qjs library (used by the rove worker) has zero trace
+    # overhead — every patch site in quickjs.c folds to a no-op.
+    target_compile_definitions(qjs_arena_wasm PRIVATE ${qjs_defines} ARENA_TRACE_ENABLED=1)
+    target_link_libraries(qjs_arena_wasm PRIVATE m)
 endif()
 
 
