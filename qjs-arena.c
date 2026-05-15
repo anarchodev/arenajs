@@ -52,10 +52,21 @@ typedef enum {
     JS_ARENA_MODE_REQUEST = 1,
 } JSArenaMode;
 
+/* First request-mode allocation refused for lack of arena space.
+   `hit` latches on the FIRST refusal (most informative — later ones
+   are cascade). Cleared every js_dual_arena_reset_request. */
+typedef struct {
+    int    hit;
+    size_t requested;
+    size_t used;
+    size_t limit;
+} JSArenaOOM;
+
 struct JSDualArena {
     JSArena base;
     JSArena request;
     JSArenaMode mode;
+    JSArenaOOM  oom;
 };
 
 /* Per-thread list of registered arena base ranges; see qjs-arena.h. */
@@ -276,6 +287,43 @@ void js_dual_arena_freeze(JSDualArena *da)
 void js_dual_arena_reset_request(JSDualArena *da)
 {
     arena_reset(&da->request);
+    da->oom.hit = 0;
+    da->oom.requested = 0;
+    da->oom.used = 0;
+    da->oom.limit = 0;
+}
+
+/* Latch the first request-mode allocation refusal. Base-mode refusals
+   are a build-the-snapshot problem, not a per-request capacity signal,
+   so they're deliberately not recorded here. */
+static void note_oom(JSDualArena *da, size_t requested)
+{
+    if (da->mode != JS_ARENA_MODE_REQUEST || da->oom.hit)
+        return;
+    da->oom.hit = 1;
+    da->oom.requested = requested;
+    da->oom.used = arena_cursor(&da->request) - ARENA_PREFIX_LEN;
+    da->oom.limit = da->request.capacity - ARENA_PREFIX_LEN;
+}
+
+bool js_dual_arena_oom_hit(const JSDualArena *da)
+{
+    return da->oom.hit != 0;
+}
+
+size_t js_dual_arena_oom_requested(const JSDualArena *da)
+{
+    return da->oom.requested;
+}
+
+size_t js_dual_arena_oom_used(const JSDualArena *da)
+{
+    return da->oom.used;
+}
+
+size_t js_dual_arena_oom_limit(const JSDualArena *da)
+{
+    return da->oom.limit;
 }
 
 bool js_dual_arena_is_frozen(const JSDualArena *da)
@@ -320,12 +368,17 @@ static void *jda_calloc(void *opaque, size_t count, size_t size)
     void *p = arena_alloc(active_arena(opaque), total);
     if (p)
         memset(p, 0, total);
+    else
+        note_oom(opaque, total);
     return p;
 }
 
 static void *jda_malloc(void *opaque, size_t size)
 {
-    return arena_alloc(active_arena(opaque), size);
+    void *p = arena_alloc(active_arena(opaque), size);
+    if (!p)
+        note_oom(opaque, size);
+    return p;
 }
 
 static void jda_free(void *opaque, void *ptr)
@@ -336,7 +389,10 @@ static void jda_free(void *opaque, void *ptr)
 
 static void *jda_realloc(void *opaque, void *ptr, size_t size)
 {
-    return arena_realloc(active_arena(opaque), ptr, size);
+    void *p = arena_realloc(active_arena(opaque), ptr, size);
+    if (!p && size != 0)
+        note_oom(opaque, size);
+    return p;
 }
 
 static size_t jda_usable_size(const void *ptr)

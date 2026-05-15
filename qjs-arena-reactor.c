@@ -28,6 +28,24 @@
 #define ARENA_EXPORT __attribute__((visibility("default")))
 #endif
 
+/* arena_run / arena_run_module return codes. The caller (the product
+   embedding us) must be able to tell "the JS code threw" — a user
+   error, surface it, don't retry — from "we ran out of request arena"
+   — a capacity signal: the result is void, resize / retry / 503, and
+   tell the operator. They are NOT the same outcome and conflating
+   them as a bare -1 made the failure reason unrecoverable for the
+   caller (made worse by QJS mangling the OOM into a null exception).
+
+     ARENA_RC_OK     0   success, or clean host-requested stop
+     ARENA_RC_ERROR -1   JS exception (user error)
+     ARENA_RC_OOM   -2   request arena exhausted — result is void;
+                         query arena_oom_* for actionable numbers */
+#define ARENA_RC_OK     0
+#define ARENA_RC_ERROR (-1)
+#define ARENA_RC_OOM   (-2)
+
+static int arena_oom_override(int rc, const char *where);
+
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
 
@@ -224,10 +242,15 @@ int arena_run(const char *src)
     JSValue v = JS_Eval(g_ctx, src, strlen(src), "<arena>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
         JSValue exc = JS_GetException(g_ctx);
+        if (js_dual_arena_oom_hit(JS_GetDualArena(g_rt))) {
+            JS_FreeValue(g_ctx, exc);
+            JS_FreeValue(g_ctx, v);
+            return arena_oom_override(ARENA_RC_ERROR, "arena_run");
+        }
         diagnose_exception(g_ctx, exc, "arena_run");
         JS_FreeValue(g_ctx, exc);
         JS_FreeValue(g_ctx, v);
-        return -1;
+        return ARENA_RC_ERROR;
     }
 
     const char *s = JS_ToCString(g_ctx, v);
@@ -236,7 +259,35 @@ int arena_run(const char *src)
         JS_FreeCString(g_ctx, s);
     }
     JS_FreeValue(g_ctx, v);
-    return 0;
+    return arena_oom_override(ARENA_RC_OK, "arena_run");
+}
+
+/* Evaluate `entry_src` as the body of a module named `entry_name`.
+   Imports inside it (and transitively) trigger the replay-mode module
+   loader, which pulls source from Module.module_sources per
+   Module.tapes.module. After eval, microtasks drain so any top-level
+   awaits / dynamic import promises settle before returning. */
+/* Conservative OOM policy: if any request-mode allocation was refused
+   this run, the result is void regardless of how execution limped to
+   its end — some object silently didn't get created. Report
+   ARENA_RC_OOM with an actionable line rather than let a
+   silently-wrong result through. NOT applied to a clean
+   host-requested stop: that's the host explicitly saying "I have what
+   I need, tear down", not a tainted result. */
+static int arena_oom_override(int rc, const char *where)
+{
+    if (!g_rt)
+        return rc;
+    JSDualArena *da = JS_GetDualArena(g_rt);
+    if (!js_dual_arena_oom_hit(da))
+        return rc;
+    fprintf(stderr,
+            "%s: request arena exhausted — needed %zu B, %zu / %zu B used\n",
+            where,
+            js_dual_arena_oom_requested(da),
+            js_dual_arena_oom_used(da),
+            js_dual_arena_oom_limit(da));
+    return ARENA_RC_OOM;
 }
 
 /* Evaluate `entry_src` as the body of a module named `entry_name`.
@@ -248,9 +299,9 @@ ARENA_EXPORT
 int arena_run_module(const char *entry_name, const char *entry_src)
 {
     if (!g_rt || !g_ctx || !entry_name || !entry_src)
-        return -1;
+        return ARENA_RC_ERROR;
 
-    JS_ResetRequestArena(g_rt);
+    JS_ResetRequestArena(g_rt);   /* also clears the per-request OOM record */
     arena_trace_reset();   /* clear name-table so host can dedupe by run */
 
     JSValue v = JS_Eval(g_ctx, entry_src, strlen(entry_src), entry_name,
@@ -268,18 +319,44 @@ int arena_run_module(const char *entry_name, const char *entry_src)
            (b) the sentinel's InternalError construction itself OOM-d
                on arena pressure, exception value ended up JS_NULL,
                but s_bail_armed in the trace module records that stop
-               was requested. Treat as clean stop. */
+               was requested. Treat as clean stop — do NOT reclassify
+               as OOM, the host asked to stop on purpose. */
         if (is_trace_stop(g_ctx, exc) || arena_trace_stop_armed()) {
             JS_FreeValue(g_ctx, exc);
-            return 0;
+            return ARENA_RC_OK;
+        }
+        /* Arena-exhaustion is the likely cause when the exception is
+           the mangled JS_NULL; report it as OOM with numbers rather
+           than the generic (and now redundant) diagnose path. */
+        if (js_dual_arena_oom_hit(JS_GetDualArena(g_rt))) {
+            JS_FreeValue(g_ctx, exc);
+            return arena_oom_override(ARENA_RC_ERROR, "arena_run_module");
         }
         diagnose_exception(g_ctx, exc, "arena_run_module");
         JS_FreeValue(g_ctx, exc);
-        return -1;
+        return ARENA_RC_ERROR;
     }
     JS_FreeValue(g_ctx, v);
 
-    return drain_pending_jobs();
+    /* Even a "successful" run is void if it touched the ceiling. */
+    return arena_oom_override(drain_pending_jobs(), "arena_run_module");
+}
+
+ARENA_EXPORT int arena_oom_hit(void)
+{
+    return g_rt ? (js_dual_arena_oom_hit(JS_GetDualArena(g_rt)) ? 1 : 0) : 0;
+}
+ARENA_EXPORT double arena_oom_requested(void)
+{
+    return g_rt ? (double)js_dual_arena_oom_requested(JS_GetDualArena(g_rt)) : 0;
+}
+ARENA_EXPORT double arena_oom_used(void)
+{
+    return g_rt ? (double)js_dual_arena_oom_used(JS_GetDualArena(g_rt)) : 0;
+}
+ARENA_EXPORT double arena_oom_limit(void)
+{
+    return g_rt ? (double)js_dual_arena_oom_limit(JS_GetDualArena(g_rt)) : 0;
 }
 
 ARENA_EXPORT
