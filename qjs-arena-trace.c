@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -148,49 +149,190 @@ static int ensure_name(JSContext *ctx, uint32_t atom)
 
 /* ── stack-state emit (kind=2 inspection) ──────────────────────────── */
 /*
- * When host_trace returns 2, we synchronously walk the live stack
- * before unwinding. Each frame becomes an object with:
- *   { func: "name", file: "path", line: N,
- *     vars: { name1: <jsonValue>, name2: <jsonValue>, ... } }
+ * When host_trace returns 2 (or arena_trace_snapshot_here is called),
+ * we synchronously walk the live stack and ship a JSON document:
+ *   [ { "func":"name", "file":"path", "line":N,
+ *       "vars": { "name1": <json>, ... } }, ... ]
  *
- * The frames-array is built as a JSValue tree so we can lean on
- * QJS's JS_JSONStringify for the heavy lifting (handles strings,
- * numbers, nested objects, arrays). Values that JSON can't represent
- * (functions, symbols, undefined, cycles, BigInt) get coerced to
- * placeholder strings via safe_for_json so the host still SEES that
- * something was there rather than getting silently-dropped fields.
+ * This is serialized DIRECTLY into a libc-malloc'd byte buffer — no
+ * JSValue tree is built. The old implementation constructed a frames
+ * array of objects-of-objects and handed it to JS_JSONStringify;
+ * every one of those JSObject / JSShape / property-array / string
+ * allocations landed in the request bump arena and never came back
+ * until reset (bump frees are no-ops). Dense snapshot cadence × deep
+ * stacks exhausted the arena and OOM-d the run. Writing bytes by hand
+ * means the only arena allocations are the transient per-value
+ * stringifications of genuinely-complex values (objects/arrays/large
+ * floats), one at a time, each freed immediately — primitive locals
+ * (the deep-recursion / tight-loop hot path) allocate nothing.
+ *
+ * The output buffer uses libc malloc/realloc/free, which DO reclaim
+ * (emscripten dlmalloc), so it doesn't touch the bump arena at all.
+ *
+ * Value encoding preserves the old safe_for_json semantics: undefined,
+ * uninitialized, symbol, function, and unserializable (cyclic/BigInt)
+ * values become bracketed placeholder strings so the host sees that
+ * something was there rather than a silently-dropped field.
  */
 
-static JSValue safe_for_json(JSContext *ctx, JSValueConst val)
-{
-    if (JS_IsUndefined(val))
-        return JS_NewString(ctx, "[undefined]");
-    if (JS_IsFunction(ctx, val)) {
-        JSValue name = JS_GetPropertyStr(ctx, val, "name");
-        const char *n = NULL;
-        if (!JS_IsException(name) && !JS_IsUndefined(name))
-            n = JS_ToCString(ctx, name);
-        char buf[96];
-        snprintf(buf, sizeof(buf), "[function %s]", n ? n : "");
-        if (n) JS_FreeCString(ctx, n);
-        JS_FreeValue(ctx, name);
-        return JS_NewString(ctx, buf);
-    }
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_SYMBOL)
-        return JS_NewString(ctx, "[Symbol]");
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_UNINITIALIZED)
-        return JS_NewString(ctx, "[uninitialized]");
+typedef struct {
+    char  *buf;
+    size_t len;
+    size_t cap;
+    int    err;   /* set on malloc failure → emit is skipped entirely */
+} jbuf;
 
-    /* Probe-stringify to catch BigInt / cycles. If it throws we fall
-       back to a placeholder; otherwise the outer JSON pass will
-       re-encode the original value cleanly. */
-    JSValue probe = JS_JSONStringify(ctx, val, JS_UNDEFINED, JS_UNDEFINED);
-    if (JS_IsException(probe)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return JS_NewString(ctx, "[unserializable]");
+static void jb_grow(jbuf *j, size_t need)
+{
+    if (j->err || j->len + need <= j->cap) return;
+    size_t ncap = j->cap ? j->cap : 4096;
+    while (ncap < j->len + need) ncap *= 2;
+    char *nb = (char *)realloc(j->buf, ncap);
+    if (!nb) { j->err = 1; return; }
+    j->buf = nb;
+    j->cap = ncap;
+}
+
+static void jb_raw(jbuf *j, const char *s, size_t n)
+{
+    jb_grow(j, n);
+    if (j->err) return;
+    memcpy(j->buf + j->len, s, n);
+    j->len += n;
+}
+
+static void jb_cstr(jbuf *j, const char *s) { jb_raw(j, s, strlen(s)); }
+
+static void jb_ch(jbuf *j, char c)
+{
+    jb_grow(j, 1);
+    if (!j->err) j->buf[j->len++] = c;
+}
+
+/* Append s as a quoted, RFC-8259-escaped JSON string. Raw UTF-8 bytes
+   >= 0x20 pass through; only the seven short escapes + \uXXXX for
+   other control chars. */
+static void jb_json_str(jbuf *j, const char *s, size_t n)
+{
+    jb_ch(j, '"');
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  jb_raw(j, "\\\"", 2); break;
+            case '\\': jb_raw(j, "\\\\", 2); break;
+            case '\b': jb_raw(j, "\\b", 2);  break;
+            case '\f': jb_raw(j, "\\f", 2);  break;
+            case '\n': jb_raw(j, "\\n", 2);  break;
+            case '\r': jb_raw(j, "\\r", 2);  break;
+            case '\t': jb_raw(j, "\\t", 2);  break;
+            default:
+                if (c < 0x20) {
+                    char u[7];
+                    snprintf(u, sizeof u, "\\u%04x", c);
+                    jb_raw(j, u, 6);
+                } else {
+                    jb_ch(j, (char)c);
+                }
+        }
     }
-    JS_FreeValue(ctx, probe);
-    return JS_DupValue(ctx, val);
+    jb_ch(j, '"');
+}
+
+/* Resolve an atom to its string and append it as a JSON string.
+   JS_AtomToCString allocates a transient cstring in the arena (freed
+   immediately); the set of distinct names across a run is small and
+   bounded, so this is not the allocation that mattered. */
+static void jb_atom_str(JSContext *ctx, jbuf *j, JSAtom atom,
+                        const char *fallback)
+{
+    const char *s = JS_AtomToCString(ctx, atom);
+    if (s) {
+        jb_json_str(j, s, strlen(s));
+        JS_FreeCString(ctx, s);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));   /* clear conversion OOM */
+        jb_json_str(j, fallback, strlen(fallback));
+    }
+}
+
+/* Append one variable value as JSON. Primitives format directly with
+   zero JS allocation. Strings/functions cost one transient cstring.
+   Objects/arrays defer to JS_JSONStringify for that single value —
+   the only place a JSValue temporary is created, and it's freed
+   before the next value. Mirrors the old safe_for_json placeholders. */
+static void jb_value(JSContext *ctx, jbuf *j, JSValueConst v)
+{
+    int tag = JS_VALUE_GET_NORM_TAG(v);
+
+    if (JS_IsUndefined(v))           { jb_cstr(j, "\"[undefined]\"");      return; }
+    if (tag == JS_TAG_UNINITIALIZED) { jb_cstr(j, "\"[uninitialized]\"");  return; }
+    if (JS_IsNull(v))                { jb_cstr(j, "null");                 return; }
+    if (JS_IsBool(v)) { jb_cstr(j, JS_ToBool(ctx, v) ? "true" : "false");  return; }
+    if (tag == JS_TAG_SYMBOL)        { jb_cstr(j, "\"[Symbol]\"");         return; }
+
+    if (tag == JS_TAG_INT) {
+        char tmp[16];
+        int n = snprintf(tmp, sizeof tmp, "%d", JS_VALUE_GET_INT(v));
+        jb_raw(j, tmp, (size_t)n);
+        return;
+    }
+    if (tag == JS_TAG_FLOAT64) {
+        double d = JS_VALUE_GET_FLOAT64(v);
+        if (!isfinite(d)) { jb_cstr(j, "null"); return; }  /* JSON has no NaN/Inf */
+        if (d == (double)(int64_t)d && d >= -9.007199254740992e15
+                                    && d <=  9.007199254740992e15) {
+            char tmp[24];
+            int n = snprintf(tmp, sizeof tmp, "%lld", (long long)(int64_t)d);
+            jb_raw(j, tmp, (size_t)n);
+            return;
+        }
+        /* fractional / large: engine's number formatter (small temp) */
+        JSValue s = JS_ToString(ctx, v);
+        if (!JS_IsException(s)) {
+            size_t n; const char *cs = JS_ToCStringLen(ctx, &n, s);
+            if (cs) { jb_raw(j, cs, n); JS_FreeCString(ctx, cs); }
+            else { JS_FreeValue(ctx, JS_GetException(ctx)); jb_cstr(j, "null"); }
+        } else { JS_FreeValue(ctx, JS_GetException(ctx)); jb_cstr(j, "null"); }
+        JS_FreeValue(ctx, s);
+        return;
+    }
+
+    if (JS_IsString(v)) {
+        size_t n; const char *s = JS_ToCStringLen(ctx, &n, v);
+        if (s) { jb_json_str(j, s, n); JS_FreeCString(ctx, s); }
+        else { JS_FreeValue(ctx, JS_GetException(ctx));
+               jb_cstr(j, "\"[unserializable]\""); }
+        return;
+    }
+
+    if (JS_IsFunction(ctx, v)) {
+        JSValue nm = JS_GetPropertyStr(ctx, v, "name");
+        const char *n = NULL;
+        if (!JS_IsException(nm) && !JS_IsUndefined(nm))
+            n = JS_ToCString(ctx, nm);
+        char buf[96];
+        snprintf(buf, sizeof buf, "[function %s]", n ? n : "");
+        if (n) JS_FreeCString(ctx, n);
+        else JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, nm);
+        jb_json_str(j, buf, strlen(buf));
+        return;
+    }
+
+    /* object / array / anything else: stringify just this one value */
+    JSValue js = JS_JSONStringify(ctx, v, JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(js)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        jb_cstr(j, "\"[unserializable]\"");
+    } else if (JS_IsUndefined(js)) {
+        jb_cstr(j, "\"[unserializable]\"");
+    } else {
+        size_t n; const char *s = JS_ToCStringLen(ctx, &n, js);
+        if (s) { jb_raw(j, s, n); JS_FreeCString(ctx, s); }
+        else { JS_FreeValue(ctx, JS_GetException(ctx));
+               jb_cstr(j, "\"[unserializable]\""); }
+    }
+    JS_FreeValue(ctx, js);
 }
 
 static void emit_state(JSContext *ctx,
@@ -199,15 +341,12 @@ static void emit_state(JSContext *ctx,
 {
     if (s_bail_armed) return;
 
-    JSValue frames_arr = JS_NewArray(ctx);
-    if (JS_IsException(frames_arr)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return;
-    }
+    jbuf j = { 0 };
+    jb_ch(&j, '[');
 
     struct JSStackFrame *sf = js_arena_trace_top_frame(ctx);
     int is_top = 1;
-    uint32_t frame_idx = 0;
+    int first_frame = 1;
 
     while (sf) {
         struct JSFunctionBytecode *b = is_top ? top_b
@@ -224,81 +363,73 @@ static void emit_state(JSContext *ctx,
         int line = js_arena_trace_bc_resolve_line(ctx, b, pc);
         if (line < 0) line = 0;
 
-        JSValue frame = JS_NewObject(ctx);
+        if (!first_frame) jb_ch(&j, ',');
+        first_frame = 0;
 
-        /* func name */
-        JSAtom fn_atom = js_arena_trace_bc_func_name(b);
-        const char *fn = JS_AtomToCString(ctx, fn_atom);
-        JS_SetPropertyStr(ctx, frame, "func",
-                           JS_NewString(ctx, fn ? fn : "<anonymous>"));
-        if (fn) JS_FreeCString(ctx, fn);
+        jb_cstr(&j, "{\"func\":");
+        jb_atom_str(ctx, &j, js_arena_trace_bc_func_name(b), "<anonymous>");
+        jb_cstr(&j, ",\"file\":");
+        jb_atom_str(ctx, &j, js_arena_trace_bc_filename(b), "");
+        {
+            char ln[40];
+            int n = snprintf(ln, sizeof ln, ",\"line\":%d,\"vars\":{", line);
+            jb_raw(&j, ln, (size_t)n);
+        }
 
-        /* file */
-        JSAtom file_atom = js_arena_trace_bc_filename(b);
-        const char *fname = JS_AtomToCString(ctx, file_atom);
-        JS_SetPropertyStr(ctx, frame, "file",
-                           JS_NewString(ctx, fname ? fname : ""));
-        if (fname) JS_FreeCString(ctx, fname);
-
-        /* line */
-        JS_SetPropertyStr(ctx, frame, "line", JS_NewInt32(ctx, line));
-
-        /* vars: args + locals + closure-referenced names. The walker
-           handles each storage class (arg_buf, var_buf, captured-via-
-           var_refs, closure-via-var_refs) under the hood; we just
-           merge everything into a single object keyed by name. If the
-           same name appears as both a local and a closure ref —
-           rare in well-formed code — the local wins because it's
-           visited first. */
-        JSValue vars = JS_NewObject(ctx);
+        /* vars: args + locals first (they win on name collision),
+           then closure-referenced names. Track emitted local names so
+           a colliding closure var doesn't write a duplicate JSON key
+           (preserves the old "locals win" dedup). The 64-entry cap is
+           a pragmatic bound — a function with >64 locals colliding
+           with a closure name beyond the cap would emit a duplicate
+           key, which JSON.parse tolerates (last wins); vanishingly
+           rare and non-fatal. */
+        int first_var = 1;
+        JSAtom seen[64];
+        int seen_n = 0;
         int n = js_arena_trace_frame_var_count(sf, b);
         for (int i = 0; i < n; i++) {
-            JSAtom name_atom = js_arena_trace_frame_var_name(sf, b, i);
-            if (name_atom == JS_ATOM_NULL) continue;
-            JSValueConst raw = js_arena_trace_frame_var_value(sf, b, i);
-            JSValue safe = safe_for_json(ctx, raw);
-            JS_SetProperty(ctx, vars, name_atom, safe);
+            JSAtom na = js_arena_trace_frame_var_name(sf, b, i);
+            if (na == JS_ATOM_NULL) continue;
+            if (!first_var) jb_ch(&j, ',');
+            first_var = 0;
+            jb_atom_str(ctx, &j, na, "");
+            jb_ch(&j, ':');
+            jb_value(ctx, &j, js_arena_trace_frame_var_value(sf, b, i));
+            if (seen_n < (int)(sizeof seen / sizeof seen[0]))
+                seen[seen_n++] = na;
         }
         int cn = js_arena_trace_frame_closure_count(b);
         for (int i = 0; i < cn; i++) {
-            JSAtom name_atom = js_arena_trace_frame_closure_name(b, i);
-            if (name_atom == JS_ATOM_NULL) continue;
-            /* skip if already set as a local (locals win) */
-            if (JS_HasProperty(ctx, vars, name_atom) == 1) continue;
-            JSValueConst raw = js_arena_trace_frame_closure_value(sf, b, i);
-            JSValue safe = safe_for_json(ctx, raw);
-            JS_SetProperty(ctx, vars, name_atom, safe);
+            JSAtom na = js_arena_trace_frame_closure_name(b, i);
+            if (na == JS_ATOM_NULL) continue;
+            int dup = 0;
+            for (int k = 0; k < seen_n; k++)
+                if (seen[k] == na) { dup = 1; break; }
+            if (dup) continue;
+            if (!first_var) jb_ch(&j, ',');
+            first_var = 0;
+            jb_atom_str(ctx, &j, na, "");
+            jb_ch(&j, ':');
+            jb_value(ctx, &j, js_arena_trace_frame_closure_value(sf, b, i));
         }
-        JS_SetPropertyStr(ctx, frame, "vars", vars);
 
-        JS_SetPropertyUint32(ctx, frames_arr, frame_idx++, frame);
+        jb_cstr(&j, "}}");
         sf = js_arena_trace_prev_frame(sf);
     }
 
-    JSValue json = JS_JSONStringify(ctx, frames_arr, JS_UNDEFINED, JS_UNDEFINED);
-    if (!JS_IsException(json)) {
-        size_t slen = 0;
-        const char *s = JS_ToCStringLen(ctx, &slen, json);
-        if (s) {
-            _arena_host_state((int)(intptr_t)s, (int)slen);
-            JS_FreeCString(ctx, s);
-        }
-    } else {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-    }
-    JS_FreeValue(ctx, json);
-    JS_FreeValue(ctx, frames_arr);
+    jb_ch(&j, ']');
+
+    if (!j.err)
+        _arena_host_state((int)(intptr_t)j.buf, (int)j.len);
+    free(j.buf);
 
     /* emit_state must NEVER leave a pending exception on the context.
-       The loop above doesn't check exception status on every QJS API
-       call (and adding checks at every site would balloon the code) —
-       under arena pressure, JS_NewObject / JS_SetPropertyStr / etc.
-       can fail and leave ctx in an exception state. JSON.stringify's
-       cleanup above handles only its own exception. Flush whatever
-       else remains so snapshot_here is a true "fire and forget" path
-       from the host's perspective. JS_GetException returns JS_NULL
-       (and is a no-op for JS_FreeValue) when no exception is pending,
-       so this is safe to call unconditionally. */
+       The per-value paths above clear their own conversion failures,
+       but be defensive: snapshot_here is a fire-and-forget path from
+       the host's perspective. JS_GetException returns JS_NULL (a
+       no-op for JS_FreeValue) when nothing is pending, so this is
+       safe to call unconditionally. */
     JSValue stale = JS_GetException(ctx);
     JS_FreeValue(ctx, stale);
 }

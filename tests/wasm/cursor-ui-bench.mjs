@@ -19,15 +19,16 @@
 import getArenaJs from "../../build-wasm/qjs_arena_wasm.js";
 import { CursorEngine } from "./cursor.mjs";
 
-// 128 MB request arena — snapshot_here builds JSValues for each frame
-// (frame names, file strings, var maps with safe_for_json values) into
-// the request arena. The bump allocator doesn't reclaim them until
-// the next reset, so dense snapshot cadence × deep stacks adds up
-// fast. Worst case in this bench is deep-recursion N=200 with step=1:
-// ~300 snapshots × ~200 frames × tens of bytes per frame value.
-// Production UI deployments should size based on their workload.
+// 16 MB request arena. emit_state used to build a JSValue tree per
+// snapshot (frame objects, var maps) into the bump arena, which never
+// reclaims mid-run — dense cadence × deep stacks needed 128 MB+ and
+// still OOM'd the deep-recursion shape. emit_state now serializes the
+// stack walk directly to a libc-malloc'd byte buffer (which DOES
+// reclaim), so the only arena cost is transient per-value
+// stringification of complex values. Deep recursion N=800 now fits
+// comfortably in 8 MB; 16 MB is generous headroom for the bench.
 const Module = await getArenaJs();
-if (Module.cwrap("arena_init","number",["number","number"])(8192, 131072) !== 0)
+if (Module.cwrap("arena_init","number",["number","number"])(8192, 16384) !== 0)
     throw new Error("arena_init failed");
 const eng = new CursorEngine(Module);
 
