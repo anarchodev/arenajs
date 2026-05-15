@@ -40,9 +40,12 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-First tracked version (target `0.1.0`). Covers the browser-side
-replay cursor / scrubber surface and the arena OOM signal. Rename
-this heading to `[0.1.0] - YYYY-MM-DD` when the release is tagged.
+_Nothing yet._
+
+## [0.1.0] - 2026-05-15
+
+First tracked version. Covers the browser-side replay cursor /
+scrubber surface and the arena OOM signal.
 
 ### Added
 
