@@ -26,8 +26,9 @@ const DEFAULT_STACK_SNAPSHOT_STEP = 64;
 export class CursorEngine {
     constructor(Module) {
         this.M = Module;
-        this._run     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
-        this._setMode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
+        this._run      = Module.cwrap("arena_run_module",     "number", ["string","string"]);
+        this._setMode  = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
+        this._snapshot = Module.cwrap("arena_snapshot_here",  "number", []);
         this._scanCache = new WeakMap();
         this._matCache  = new WeakMap();
     }
@@ -113,6 +114,7 @@ export class CursorEngine {
         if (cached) return cached;
 
         const stackSnapshotStep = opts.stackSnapshotStep ?? DEFAULT_STACK_SNAPSHOT_STEP;
+        const varSnapshotStep   = opts.snapshotStep ?? 0;
 
         this._installReplay(replay);
         const r = this._decoder();
@@ -126,9 +128,21 @@ export class CursorEngine {
         const liveStack = [];            // running call frames (mutated)
         const stackSnapshots = [];
         const lineIndex = new Map();     // "file:line" → number[] (packed later)
+        const varSnapshots = [];
 
         let scanCounter = 0;
         let depth = 0;
+        let pendingSnapshotJson = null;
+
+        // host_state fires synchronously from arena_snapshot_here(),
+        // delivering the JSON payload emit_state built. Only installed
+        // if the caller asked for varSnapshots — otherwise per-event
+        // cost stays at zero.
+        if (varSnapshotStep > 0) {
+            this.M.host_state = (ptr, len) => {
+                pendingSnapshotJson = r.str(ptr, len);
+            };
+        }
 
         this.M.host_trace = (kind, ptr) => {
             if (kind === K_NAME) {
@@ -209,6 +223,20 @@ export class CursorEngine {
                 stackSnapshots.push(liveStack.map(f => ({ ...f })));
             }
 
+            // Variable snapshot every varSnapshotStep events. host_state
+            // delivers the JSON synchronously from inside arena_snapshot_here.
+            if (varSnapshotStep > 0 && (eventIdx % varSnapshotStep) === 0) {
+                pendingSnapshotJson = null;
+                this._snapshot();
+                if (pendingSnapshotJson !== null) {
+                    let frames;
+                    try { frames = JSON.parse(pendingSnapshotJson); }
+                    catch { frames = []; }
+                    varSnapshots.push({ eventOrdinal: eventIdx, frames });
+                    pendingSnapshotJson = null;
+                }
+            }
+
             // lineIndex covers any event with a meaningful (file, line)
             // — UI can filter by kind on read.
             if (event.kind !== "FUNC_EXIT") {
@@ -225,6 +253,7 @@ export class CursorEngine {
         this._run(replay.entry.name, replay.entry.src);
         this._setMode(TRACE_OFF);
         this.M.host_trace = null;
+        if (varSnapshotStep > 0) this.M.host_state = null;
 
         // Pack indices into Int32Arrays. Map keys keep the JS string
         // keys for ergonomics; values are typed.
@@ -239,6 +268,8 @@ export class CursorEngine {
             stackSnapshotStep,
             lineIndex: packedLineIndex,
             scanOrdinalToEventIdx: Int32Array.from(scanOrdinalToEventIdx),
+            varSnapshots: varSnapshotStep > 0 ? varSnapshots : undefined,
+            varSnapshotStep: varSnapshotStep > 0 ? varSnapshotStep : undefined,
             inspectCache: new Map(),
         };
         this._matCache.set(replay, result);

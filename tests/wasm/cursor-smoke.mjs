@@ -206,6 +206,65 @@ check("scanIndex: cache reuses array", idx === idx2);
           checked > 0 && checked === ok, `${ok}/${checked}`);
 }
 
+// ── Test 11: materialise with snapshotStep captures varSnapshots ─────
+{
+    // Fresh replay so the materialise cache doesn't return a prior
+    // varSnapshots-less result.
+    const replay2 = {
+        entry: { name: "loop.js", src: `
+            let s = 0;
+            for (let i = 0; i < 50; i++) {
+                s += i;
+            }
+            globalThis._ = s;
+        ` },
+        tapes: {}, module_sources: {},
+    };
+    const mat = await eng.materialise(replay2, { snapshotStep: 10 });
+    check("snap: varSnapshots array present", Array.isArray(mat.varSnapshots));
+    check("snap: varSnapshotStep echoed", mat.varSnapshotStep === 10);
+    check("snap: snapshot count plausible",
+          mat.varSnapshots.length >= 1 &&
+          mat.varSnapshots.length <= Math.ceil(mat.events.length / 10) + 1,
+          `${mat.varSnapshots.length} for ${mat.events.length} events`);
+    check("snap: each entry has eventOrdinal + frames",
+          mat.varSnapshots.every(s =>
+              typeof s.eventOrdinal === "number" &&
+              Array.isArray(s.frames)));
+    check("snap: eventOrdinals are multiples of step",
+          mat.varSnapshots.every(s => s.eventOrdinal % 10 === 0));
+
+    // At least one snapshot taken mid-loop should have a non-empty
+    // frames array with live JS locals.
+    const nonEmpty = mat.varSnapshots.filter(s => s.frames.length > 0);
+    check("snap: at least one non-empty frame snapshot",
+          nonEmpty.length > 0,
+          `${nonEmpty.length}/${mat.varSnapshots.length}`);
+    if (nonEmpty.length > 0) {
+        const f = nonEmpty[0].frames[0];
+        check("snap: frame has func/file/line/vars",
+              typeof f.func === "string" &&
+              typeof f.file === "string" &&
+              typeof f.line === "number" &&
+              typeof f.vars === "object");
+        const hasLoopVars = nonEmpty.some(s =>
+            s.frames.some(fr => fr.vars && ("i" in fr.vars || "s" in fr.vars))
+        );
+        check("snap: snapshot captures loop locals", hasLoopVars);
+    }
+}
+
+// ── Test 12: no snapshotStep → no varSnapshots ───────────────────────
+{
+    const replay3 = {
+        entry: { name: "noop.js", src: "let x = 1; globalThis._ = x;" },
+        tapes: {}, module_sources: {},
+    };
+    const mat = await eng.materialise(replay3);
+    check("no-snap: varSnapshots undefined", mat.varSnapshots === undefined);
+    check("no-snap: varSnapshotStep undefined", mat.varSnapshotStep === undefined);
+}
+
 // ── Test 10: stackSnapshots reflect call depth at sampled events ─────
 {
     const mat = await eng.materialise(replay);
