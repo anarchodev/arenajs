@@ -31,8 +31,14 @@ bundled with emsdk works fine — `node tests/wasm/<name>.mjs`):
 | `trace-smoke.mjs` | Trace emitter — scan + drill modes, stop sentinel                |
 | `state-smoke.mjs` | Stack walker — args, locals, captured locals, closure vars       |
 | `wire-smoke.mjs`  | RTAP bytes → parser → Module.tapes → handler — full round-trip   |
+| `cursor-smoke.mjs`| `CursorEngine` — scan-index cache, scan/line anchors, paging     |
 
 `rtap.mjs` is the parser/serializer module the wire test depends on.
 It mirrors `src/tape/root.zig`'s encoding rule-for-rule and is the
 intended lift target for rove's web/ tree when the new replay UI
 needs a shared parser.
+
+`cursor.mjs` is the host-side replay cursor module (design notes in
+`REPLAY_CURSOR_API.md` at the repo root). Same lift trajectory as
+`rtap.mjs` — temporary home here, eventual destination is rove's
+web/ tree.
