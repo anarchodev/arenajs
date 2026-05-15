@@ -114,35 +114,52 @@ export class CursorEngine {
         if (cached) return cached;
 
         const stackSnapshotStep = opts.stackSnapshotStep ?? DEFAULT_STACK_SNAPSHOT_STEP;
-        const varSnapshotStep   = opts.snapshotStep ?? 0;
 
+        // Pass 1: drill the replay capturing events + structural sidecars
+        // but no variable snapshots. Gives us an exact event count.
+        const base = await this._materialisePass1(replay, stackSnapshotStep);
+
+        // Decide variable-snapshot cadence:
+        //   - explicit snapshotStep wins if provided
+        //   - otherwise targetSnapshots picks the step from pass 1's
+        //     event count (UI scrubber width = targetSnapshots)
+        //   - else no varSnapshots
+        let varStep = 0;
+        if (opts.snapshotStep !== undefined && opts.snapshotStep > 0) {
+            varStep = opts.snapshotStep;
+        } else if (opts.targetSnapshots !== undefined && opts.targetSnapshots > 0
+                   && base.events.length > 0) {
+            varStep = Math.max(1, Math.ceil(base.events.length / opts.targetSnapshots));
+        }
+
+        if (varStep > 0) {
+            const varSnapshots = await this._captureVarSnapshots(replay, varStep);
+            base.varSnapshots = varSnapshots;
+            base.varSnapshotStep = varStep;
+        }
+
+        this._matCache.set(replay, base);
+        return base;
+    }
+
+    // Pass 1: drill once, no var snapshots. Builds the events array,
+    // stackSnapshots, matchingExit, lineIndex, scanOrdinalToEventIdx.
+    async _materialisePass1(replay, stackSnapshotStep) {
         this._installReplay(replay);
         const r = this._decoder();
 
         const atomMap = new Map();
         const fileStack = [];
         const events = [];
-        const matchingExitArr = [];      // length tracks events.length
+        const matchingExitArr = [];
         const scanOrdinalToEventIdx = [];
-        const enterIdxStack = [];        // stack of FUNC_ENTER event indices
-        const liveStack = [];            // running call frames (mutated)
+        const enterIdxStack = [];
+        const liveStack = [];
         const stackSnapshots = [];
-        const lineIndex = new Map();     // "file:line" → number[] (packed later)
-        const varSnapshots = [];
+        const lineIndex = new Map();
 
         let scanCounter = 0;
         let depth = 0;
-        let pendingSnapshotJson = null;
-
-        // host_state fires synchronously from arena_snapshot_here(),
-        // delivering the JSON payload emit_state built. Only installed
-        // if the caller asked for varSnapshots — otherwise per-event
-        // cost stays at zero.
-        if (varSnapshotStep > 0) {
-            this.M.host_state = (ptr, len) => {
-                pendingSnapshotJson = r.str(ptr, len);
-            };
-        }
 
         this.M.host_trace = (kind, ptr) => {
             if (kind === K_NAME) {
@@ -223,20 +240,6 @@ export class CursorEngine {
                 stackSnapshots.push(liveStack.map(f => ({ ...f })));
             }
 
-            // Variable snapshot every varSnapshotStep events. host_state
-            // delivers the JSON synchronously from inside arena_snapshot_here.
-            if (varSnapshotStep > 0 && (eventIdx % varSnapshotStep) === 0) {
-                pendingSnapshotJson = null;
-                this._snapshot();
-                if (pendingSnapshotJson !== null) {
-                    let frames;
-                    try { frames = JSON.parse(pendingSnapshotJson); }
-                    catch { frames = []; }
-                    varSnapshots.push({ eventOrdinal: eventIdx, frames });
-                    pendingSnapshotJson = null;
-                }
-            }
-
             // lineIndex covers any event with a meaningful (file, line)
             // — UI can filter by kind on read.
             if (event.kind !== "FUNC_EXIT") {
@@ -253,14 +256,11 @@ export class CursorEngine {
         this._run(replay.entry.name, replay.entry.src);
         this._setMode(TRACE_OFF);
         this.M.host_trace = null;
-        if (varSnapshotStep > 0) this.M.host_state = null;
 
-        // Pack indices into Int32Arrays. Map keys keep the JS string
-        // keys for ergonomics; values are typed.
         const packedLineIndex = new Map();
         for (const [k, v] of lineIndex) packedLineIndex.set(k, Int32Array.from(v));
 
-        const result = {
+        return {
             replay,
             events,
             matchingExit: Int32Array.from(matchingExitArr),
@@ -268,12 +268,48 @@ export class CursorEngine {
             stackSnapshotStep,
             lineIndex: packedLineIndex,
             scanOrdinalToEventIdx: Int32Array.from(scanOrdinalToEventIdx),
-            varSnapshots: varSnapshotStep > 0 ? varSnapshots : undefined,
-            varSnapshotStep: varSnapshotStep > 0 ? varSnapshotStep : undefined,
+            varSnapshots: undefined,
+            varSnapshotStep: undefined,
             inspectCache: new Map(),
         };
-        this._matCache.set(replay, result);
-        return result;
+    }
+
+    // Pass 2: drill again, snapshotting variables every `step` events.
+    // Discards the events themselves — pass 1 already captured them.
+    // Cheap host-side bookkeeping: just a counter and a snapshot trigger.
+    async _captureVarSnapshots(replay, step) {
+        this._installReplay(replay);
+        const r = this._decoder();
+        const varSnapshots = [];
+        let pendingSnapshotJson = null;
+        let eventIdx = -1;
+
+        this.M.host_state = (ptr, len) => {
+            pendingSnapshotJson = r.str(ptr, len);
+        };
+        this.M.host_trace = (kind) => {
+            if (kind === K_NAME) return 0;
+            eventIdx++;
+            if (eventIdx % step !== 0) return 0;
+            pendingSnapshotJson = null;
+            this._snapshot();
+            let frames = [];
+            if (pendingSnapshotJson !== null) {
+                try { frames = JSON.parse(pendingSnapshotJson); }
+                catch { frames = []; }
+                pendingSnapshotJson = null;
+            }
+            varSnapshots.push({ eventOrdinal: eventIdx, frames });
+            return 0;
+        };
+
+        this._setMode(TRACE_DRILL);
+        this._run(replay.entry.name, replay.entry.src);
+        this._setMode(TRACE_OFF);
+        this.M.host_trace = null;
+        this.M.host_state = null;
+
+        return varSnapshots;
     }
 
     openCursor(replay, anchor) {
