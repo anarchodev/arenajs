@@ -1,24 +1,27 @@
 // Browser-side replay cursor module.
 //
 // Wraps an already-initialised qjs_arena_wasm Module instance and
-// exposes the three-verb surface from REPLAY_CURSOR_API.md:
+// exposes the cursor surface from REPLAY_CURSOR_API.md:
 //
 //   scanIndex(replay)              — cached list of FUNC_ENTER/EXIT/THROW
-//                                    events for the whole replay
+//                                    events for the whole replay (cheap)
+//   materialise(replay, opts)      — one-pass drill: events array,
+//                                    stackSnapshots, matchingExit,
+//                                    lineIndex, scanOrdinalToEventIdx
 //   openCursor(replay, anchor)     — position into the drill stream
-//   drillNext(cursor, limit)       — pull up to `limit` drill events
+//   drillNext(cursor, limit)       — slice the next `limit` events from
+//                                    the materialised data
 //
 // One CursorEngine wraps one long-lived arena and dispatches many
 // replays into it; `JS_ResetRequestArena` runs at the top of each
 // `arena_run_module` call so per-request state doesn't bleed across
-// pages. The scan→drill flip happens from inside host_trace once the
-// anchor's bracketing scan ordinal is observed.
-//
-// Caller responsibility: build the Module, run `arena_init(...)` to
-// completion, then hand it in. Reused across scanIndex / drillNext.
+// replays. `drillNext` is a pure slice over `materialise()` output —
+// no per-page replay.
 
 const TRACE_OFF = 0, TRACE_SCAN = 1, TRACE_DRILL = 2;
 const K_NAME = 0, K_FUNC_ENTER = 1, K_FUNC_EXIT = 2, K_LINE = 3, K_THROW = 4;
+
+const DEFAULT_STACK_SNAPSHOT_STEP = 64;
 
 export class CursorEngine {
     constructor(Module) {
@@ -26,6 +29,7 @@ export class CursorEngine {
         this._run     = Module.cwrap("arena_run_module",     "number", ["string","string"]);
         this._setMode = Module.cwrap("arena_set_trace_mode", null,     ["number"]);
         this._scanCache = new WeakMap();
+        this._matCache  = new WeakMap();
     }
 
     _decoder() {
@@ -39,8 +43,6 @@ export class CursorEngine {
     }
 
     _installReplay(replay) {
-        // Reset every tape channel's read cursor so the run replays
-        // from the start. Mirrors module-smoke's setTapes.
         for (const k of Object.keys(replay.tapes)) {
             replay.tapes[k]._cursor = 0;
         }
@@ -94,7 +96,6 @@ export class CursorEngine {
                     message: r.str(ptr + 10, mlen),
                 });
             }
-            // LINE events shouldn't fire in scan mode; ignore if any leak.
             return 0;
         };
 
@@ -107,23 +108,27 @@ export class CursorEngine {
         return records;
     }
 
-    openCursor(replay, anchor) {
-        return { replay, anchor, drillEventsAfterAnchor: 0 };
-    }
+    async materialise(replay, opts = {}) {
+        const cached = this._matCache.get(replay);
+        if (cached) return cached;
 
-    async drillNext(cursor, limit) {
-        if (!Number.isInteger(limit) || limit <= 0)
-            throw new Error("drillNext: limit must be a positive integer");
+        const stackSnapshotStep = opts.stackSnapshotStep ?? DEFAULT_STACK_SNAPSHOT_STEP;
 
-        this._installReplay(cursor.replay);
+        this._installReplay(replay);
         const r = this._decoder();
+
         const atomMap = new Map();
         const fileStack = [];
-        const collected = [];
-        const anchor = cursor.anchor;
-        let scanCounter = 0, depth = 0;
-        let state = "SEEKING_ANCHOR";
-        let dropRemaining = cursor.drillEventsAfterAnchor;
+        const events = [];
+        const matchingExitArr = [];      // length tracks events.length
+        const scanOrdinalToEventIdx = [];
+        const enterIdxStack = [];        // stack of FUNC_ENTER event indices
+        const liveStack = [];            // running call frames (mutated)
+        const stackSnapshots = [];
+        const lineIndex = new Map();     // "file:line" → number[] (packed later)
+
+        let scanCounter = 0;
+        let depth = 0;
 
         this.M.host_trace = (kind, ptr) => {
             if (kind === K_NAME) {
@@ -131,7 +136,6 @@ export class CursorEngine {
                 return 0;
             }
 
-            // Decode + maintain depth/file-stack for all scan-kind events.
             let event;
             let isScan = true;
             if (kind === K_FUNC_ENTER) {
@@ -173,57 +177,124 @@ export class CursorEngine {
                 event.scanOrdinal = scanCounter;
                 scanCounter++;
             } else {
-                // LINE — stamp with most recent scan ordinal.
                 event.scanOrdinal = Math.max(0, scanCounter - 1);
             }
 
-            switch (state) {
-                case "SEEKING_ANCHOR":
-                    if (anchor.kind === "scan") {
-                        if (isScan && event.scanOrdinal === anchor.ordinal) {
-                            this._setMode(TRACE_DRILL);
-                            state = "COLLECTING";
-                        }
-                    } else { // "line"
-                        const after = anchor.afterScan ?? 0;
-                        if (isScan && event.scanOrdinal >= after) {
-                            this._setMode(TRACE_DRILL);
-                            state = "SEEKING_LINE";
-                        }
-                    }
-                    return 0;
+            const eventIdx = events.length;
+            events.push(event);
+            matchingExitArr.push(-1);
 
-                case "SEEKING_LINE":
-                    if (event.kind === "LINE" &&
-                        event.file === anchor.file &&
-                        event.line === anchor.line) {
-                        state = "COLLECTING";
-                    }
-                    return 0;
-
-                case "COLLECTING":
-                    if (dropRemaining > 0) { dropRemaining--; return 0; }
-                    collected.push(event);
-                    if (collected.length >= limit) return 1;
-                    return 0;
+            // Stack maintenance + matchingExit pairing.
+            if (event.kind === "FUNC_ENTER") {
+                liveStack.push({
+                    name: event.name, file: event.file,
+                    line: event.line, depth: event.depth,
+                });
+                enterIdxStack.push(eventIdx);
+            } else if (event.kind === "FUNC_EXIT") {
+                liveStack.pop();
+                const enterIdx = enterIdxStack.pop();
+                if (enterIdx !== undefined) {
+                    matchingExitArr[enterIdx] = eventIdx;
+                    matchingExitArr[eventIdx] = enterIdx;
+                }
+            } else if (event.kind === "LINE" && liveStack.length > 0) {
+                liveStack[liveStack.length - 1].line = event.line;
             }
+
+            if (isScan) scanOrdinalToEventIdx.push(eventIdx);
+
+            // Sparse stack snapshot every stackSnapshotStep events.
+            if (stackSnapshotStep > 0 && (eventIdx % stackSnapshotStep) === 0) {
+                stackSnapshots.push(liveStack.map(f => ({ ...f })));
+            }
+
+            // lineIndex covers any event with a meaningful (file, line)
+            // — UI can filter by kind on read.
+            if (event.kind !== "FUNC_EXIT") {
+                const key = `${event.file}:${event.line}`;
+                let arr = lineIndex.get(key);
+                if (!arr) { arr = []; lineIndex.set(key, arr); }
+                arr.push(eventIdx);
+            }
+
             return 0;
         };
 
-        this._setMode(TRACE_SCAN);
-        this._run(cursor.replay.entry.name, cursor.replay.entry.src);
+        this._setMode(TRACE_DRILL);
+        this._run(replay.entry.name, replay.entry.src);
         this._setMode(TRACE_OFF);
         this.M.host_trace = null;
 
-        // If we never filled the buffer, the run finished naturally —
-        // no more pages.
-        const ended = (collected.length < limit);
-        const next = ended ? null : {
+        // Pack indices into Int32Arrays. Map keys keep the JS string
+        // keys for ergonomics; values are typed.
+        const packedLineIndex = new Map();
+        for (const [k, v] of lineIndex) packedLineIndex.set(k, Int32Array.from(v));
+
+        const result = {
+            replay,
+            events,
+            matchingExit: Int32Array.from(matchingExitArr),
+            stackSnapshots,
+            stackSnapshotStep,
+            lineIndex: packedLineIndex,
+            scanOrdinalToEventIdx: Int32Array.from(scanOrdinalToEventIdx),
+            inspectCache: new Map(),
+        };
+        this._matCache.set(replay, result);
+        return result;
+    }
+
+    openCursor(replay, anchor) {
+        return { replay, anchor, drillEventsAfterAnchor: 0 };
+    }
+
+    async drillNext(cursor, limit) {
+        if (!Number.isInteger(limit) || limit <= 0)
+            throw new Error("drillNext: limit must be a positive integer");
+
+        const mat = await this.materialise(cursor.replay);
+        const anchorIdx = this._anchorToEventIdx(mat, cursor.anchor);
+        if (anchorIdx < 0) {
+            // Anchor not found in this replay — return empty page,
+            // signal end (no more pages to fetch for an unmatched anchor).
+            return { events: [], next: null };
+        }
+
+        const start = anchorIdx + 1 + cursor.drillEventsAfterAnchor;
+        const end = Math.min(start + limit, mat.events.length);
+        const events = mat.events.slice(start, end);
+
+        const next = (end < mat.events.length) ? {
             replay: cursor.replay,
             anchor: cursor.anchor,
             drillEventsAfterAnchor:
-                cursor.drillEventsAfterAnchor + collected.length,
-        };
-        return { events: collected, next };
+                cursor.drillEventsAfterAnchor + events.length,
+        } : null;
+
+        return { events, next };
+    }
+
+    _anchorToEventIdx(mat, anchor) {
+        if (anchor.kind === "scan") {
+            const ord = anchor.ordinal;
+            if (ord < 0 || ord >= mat.scanOrdinalToEventIdx.length) return -1;
+            return mat.scanOrdinalToEventIdx[ord];
+        }
+        // line anchor
+        const after = anchor.afterScan ?? 0;
+        const afterEventIdx = (after < mat.scanOrdinalToEventIdx.length)
+            ? mat.scanOrdinalToEventIdx[after]
+            : -1;
+        const key = `${anchor.file}:${anchor.line}`;
+        const indices = mat.lineIndex.get(key);
+        if (!indices) return -1;
+        for (let i = 0; i < indices.length; i++) {
+            const idx = indices[i];
+            if (idx > afterEventIdx && mat.events[idx].kind === "LINE") {
+                return idx;
+            }
+        }
+        return -1;
     }
 }

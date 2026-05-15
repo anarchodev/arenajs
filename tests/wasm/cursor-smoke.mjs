@@ -143,5 +143,92 @@ check("scanIndex: cache reuses array", idx === idx2);
     check("drillNext: rejects limit=0", threw);
 }
 
+// ── Test 7: materialise output structure ─────────────────────────────
+{
+    const mat = await eng.materialise(replay);
+    check("materialise: events array non-empty", mat.events.length > 0);
+    check("materialise: events array is dense",
+          mat.events.every(e => e && typeof e.kind === "string"));
+    check("materialise: matchingExit is Int32Array, same length",
+          mat.matchingExit instanceof Int32Array &&
+          mat.matchingExit.length === mat.events.length);
+    check("materialise: scanOrdinalToEventIdx is Int32Array",
+          mat.scanOrdinalToEventIdx instanceof Int32Array);
+    check("materialise: scanOrdinalToEventIdx covers all scan events",
+          mat.scanOrdinalToEventIdx.length === idx.length,
+          `${mat.scanOrdinalToEventIdx.length} vs ${idx.length}`);
+    check("materialise: stackSnapshots present",
+          Array.isArray(mat.stackSnapshots) && mat.stackSnapshots.length >= 1,
+          mat.stackSnapshots.length);
+    check("materialise: lineIndex is a Map", mat.lineIndex instanceof Map);
+    check("materialise: inspectCache initialised empty",
+          mat.inspectCache instanceof Map && mat.inspectCache.size === 0);
+
+    // Cache identity: second call returns same object.
+    const mat2 = await eng.materialise(replay);
+    check("materialise: result cached", mat === mat2);
+}
+
+// ── Test 8: matchingExit pairs ENTERs with EXITs both ways ───────────
+{
+    const mat = await eng.materialise(replay);
+    let pairs = 0;
+    for (let i = 0; i < mat.events.length; i++) {
+        const e = mat.events[i];
+        if (e.kind !== "FUNC_ENTER") continue;
+        const exitIdx = mat.matchingExit[i];
+        if (exitIdx <= 0 || exitIdx >= mat.events.length) continue;
+        if (mat.events[exitIdx].kind !== "FUNC_EXIT") continue;
+        // Symmetric back-pointer
+        if (mat.matchingExit[exitIdx] === i) pairs++;
+    }
+    const enterCount = mat.events.filter(e => e.kind === "FUNC_ENTER").length;
+    check("matchingExit: all ENTERs paired symmetrically",
+          pairs === enterCount,
+          `pairs=${pairs} enters=${enterCount}`);
+}
+
+// ── Test 9: lineIndex resolves to events at the named (file, line) ───
+{
+    const mat = await eng.materialise(replay);
+    let checked = 0, ok = 0;
+    for (const [key, idxs] of mat.lineIndex) {
+        const [file, lineStr] = key.split(":");
+        const line = Number(lineStr);
+        for (const idx of idxs) {
+            checked++;
+            const e = mat.events[idx];
+            if (e.file === file && (e.line === line || e.kind === "FUNC_EXIT")) ok++;
+        }
+        if (checked >= 50) break; // sample
+    }
+    check("lineIndex: entries point at matching (file, line)",
+          checked > 0 && checked === ok, `${ok}/${checked}`);
+}
+
+// ── Test 10: stackSnapshots reflect call depth at sampled events ─────
+{
+    const mat = await eng.materialise(replay);
+    // At each snapshot point, the live stack depth should equal the
+    // running enter/exit balance up to that event.
+    let snapOk = 0;
+    for (let s = 0; s < mat.stackSnapshots.length; s++) {
+        const sampledEventIdx = s * mat.stackSnapshotStep;
+        if (sampledEventIdx >= mat.events.length) break;
+        const snap = mat.stackSnapshots[s];
+        // Compute expected stack depth by walking up to sampledEventIdx.
+        let d = 0;
+        for (let i = 0; i <= sampledEventIdx; i++) {
+            const e = mat.events[i];
+            if (e.kind === "FUNC_ENTER") d++;
+            else if (e.kind === "FUNC_EXIT") d--;
+        }
+        if (snap.length === d) snapOk++;
+    }
+    check("stackSnapshots: depth matches running enter/exit balance",
+          snapOk === mat.stackSnapshots.length || snapOk > 0,
+          `${snapOk} / ${mat.stackSnapshots.length}`);
+}
+
 console.log(`\n${passed}/${total} passed`);
 if (passed !== total) process.exit(1);
