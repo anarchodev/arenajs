@@ -831,3 +831,112 @@ thermometer surfaces them.
     A base object that had been shadowed-and-mutated this request
     appeared unchanged to those readers. Route `p` through
     `js_object_active` at entry.
+
+## Future direction: request-allocator hybrid (back-pocket)
+
+Not built. Documented so that if the request bump arena's allocation
+ceiling becomes a problem on release, the fix is already designed and
+we don't rediscover it under pressure.
+
+### The property that bites
+
+The request bump allocator never reclaims mid-request — `js_free` is a
+no-op, memory comes back only at `JS_ResetRequestArena`. Consequence:
+
+> a request's arena consumption is its **cumulative** allocation, not
+> its **peak live set**.
+
+A handler whose live set is tiny at every instant can still exhaust
+the arena if it *churns* — `JSON.parse` a large body, `.map`/`.filter`
+through intermediate arrays, build-and-discard strings in a loop. A
+GC'd runtime reclaims those; arenajs holds every byte until reset. At
+~12M ops/sec a 10 ms handler touches ~100k+ allocations; an
+allocation-heavy transform can run to tens of MB of transient garbage.
+This is the documented arena trade-off, not a bug — but it is a real
+ceiling, and it surfaces as QJS-ng's OOM-during-error-construction
+fallback (`current_exception = JS_NULL`, see commit fixing the
+"exception: null" diagnostics).
+
+### The linchpin insight
+
+Address determinism + CoW shadowing → fast snapshot is a property the
+**base** needs (snapshot/restore is base-only; restore is memcpy/CoW
+to identical virtual addresses with no pointer relocation). Request
+allocations are never snapshotted — discarded at request end. Replay
+determinism comes from the I/O tapes, not memory addresses; JS
+semantics never expose addresses (object identity and Map/Set order
+are insertion-ordered regardless of allocator). So **request-time
+address determinism is incidental, not load-bearing.** The
+`JS_FreezeRuntime` boundary cleanly separates the two concerns and is
+a natural allocator-switch point. Nothing about the snapshot
+machinery, tapes, or replay determinism is affected by changing the
+request-side allocator.
+
+### The hybrid design
+
+Generational shape, one-way switch, per-request:
+
+- **Bump region = fast path / young gen.** Request allocations bump
+  exactly as today (~3 instructions). Handlers that fit pay *zero*
+  free-list cost — today's performance preserved exactly, no
+  regression for the common case.
+- **Slab + free-list = overflow / old gen.** When the bump pointer
+  would exceed the region, the request flips into slab mode instead of
+  OOMing. From there `js_free` returns slots to a segregated/TLSF-style
+  free-list inside a fixed slab, so refcount-reclaimed memory is
+  reused. Churn after the switch is bounded by peak live set, not
+  cumulative.
+
+Net effect: **OOM stops being a failure and becomes graceful
+degradation** — a handler that exceeds the bump region runs slower
+(free-list alloc) but keeps going and recycles its churn, instead of
+the request erroring out.
+
+End-of-request reset stays O(1): reset the bump pointer **and** reinit
+the slab header — walk nothing, same as today.
+
+### Subtleties to respect when building it
+
+1. **One-way, separate regions.** Objects already in the bump region
+   can't be retroactively reclaimed (no headers/sizes to build a
+   free-list over). Request memory is `[bump][slab]`; reclamation only
+   benefits post-switch allocations. Don't try to convert the bump
+   region in place.
+2. **`free()` origin test.** The allocator hook decides bump-region
+   (no-op) vs slab-region (return to free-list) by a pointer-range
+   check `ptr ∈ [slab_base, slab_end)` — one comparison. `realloc` of
+   a bump object after the switch → fresh slab alloc + copy; old bump
+   bytes leak until reset (fine).
+3. **Split point is a tuning knob, counterintuitive direction.** A
+   *smaller* bump region makes churning handlers switch into
+   reclaiming mode sooner (more headroom) but pushes well-behaved
+   handlers onto the slower path earlier. Likely: bump sized to cover
+   the p50 handler entirely, slab sized to absorb the heavy tail.
+4. **Cycle collector stays off.** QJS reclaims cycles via mark-sweep,
+   not refcount; running it mid-request reintroduces the
+   pause/nondeterminism the arena design avoids. Leave it off — cyclic
+   garbage still accumulates until reset, but that's exactly today's
+   behavior, so strictly better, never a regression. Acyclic churn
+   (the overwhelming majority) is reclaimed.
+5. **Hot-path cost.** The slab allocator only taxes requests that
+   overflow the bump region; the bump fast path is untouched, so
+   well-behaved handlers see zero slowdown. Measure the slab path's
+   per-alloc cost against the existing benches before committing.
+
+### Convergence with the snapshot tooling
+
+`snapshot_here`'s `emit_state` churn is post-freeze, request-time,
+acyclic allocation. A refcount-reclaiming request allocator reclaims
+it automatically (`emit_state` already `JS_FreeValue`s everything). So
+this hybrid **subsumes** the cursor pass-2 OOM fix — the
+byte-serialized-`emit_state` rewrite becomes an optional optimization
+rather than a necessity. One architectural change collapses two
+problems, which is a strong signal the direction is right.
+
+### Trigger
+
+Deploy this if, on release, real handlers hit the request-arena
+ceiling (watch for the `tag=NULL` OOM diagnostic in production logs).
+Until then it stays designed-but-unbuilt — the bump-only allocator is
+simpler and faster for handlers that fit, which is the expected
+common case.
