@@ -70,6 +70,63 @@ int arena_init(int base_kb, int request_kb)
     return 0;
 }
 
+/* Diagnostic dump for any exception arena_run_module unexpectedly
+   surfaces. The original "just call JS_ToCString(exc)" path was
+   useless under arena pressure: when the arena is full the cstring
+   alloc itself fails and we get "(null)" with no other context.
+   Print each piece independently so a partial failure still tells
+   us *something*. Tag identifies the value class; name/message/stack
+   come straight off the exception object via direct property lookup;
+   the toString fallback runs last because it can also fail. */
+static const char *tag_name(int tag)
+{
+    switch (tag) {
+        case JS_TAG_OBJECT:           return "OBJECT";
+        case JS_TAG_STRING:           return "STRING";
+        case JS_TAG_INT:              return "INT";
+        case JS_TAG_FLOAT64:          return "FLOAT64";
+        case JS_TAG_BOOL:             return "BOOL";
+        case JS_TAG_NULL:             return "NULL";
+        case JS_TAG_UNDEFINED:        return "UNDEFINED";
+        case JS_TAG_EXCEPTION:        return "EXCEPTION";
+        case JS_TAG_UNINITIALIZED:    return "UNINITIALIZED";
+        case JS_TAG_SYMBOL:           return "SYMBOL";
+        default:                      return "OTHER";
+    }
+}
+
+static void diagnose_exception(JSContext *ctx, JSValueConst exc, const char *where)
+{
+    int tag = JS_VALUE_GET_TAG(exc);
+    fprintf(stderr, "%s exception: tag=%s", where, tag_name(tag));
+
+    if (JS_IsObject(exc)) {
+        const char *fields[] = { "name", "message", "stack", NULL };
+        for (int i = 0; fields[i]; i++) {
+            JSValue v = JS_GetPropertyStr(ctx, exc, fields[i]);
+            if (JS_IsException(v)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                fprintf(stderr, " %s=<get-failed>", fields[i]);
+                continue;
+            }
+            if (JS_IsUndefined(v) || JS_IsNull(v)) {
+                JS_FreeValue(ctx, v);
+                continue;
+            }
+            const char *s = JS_ToCString(ctx, v);
+            fprintf(stderr, " %s=%s", fields[i], s ? s : "<cstring-failed>");
+            if (s) JS_FreeCString(ctx, s);
+            else JS_FreeValue(ctx, JS_GetException(ctx));
+            JS_FreeValue(ctx, v);
+        }
+    }
+
+    const char *toStr = JS_ToCString(ctx, exc);
+    fprintf(stderr, " toString=%s\n", toStr ? toStr : "<failed>");
+    if (toStr) JS_FreeCString(ctx, toStr);
+    else JS_FreeValue(ctx, JS_GetException(ctx));
+}
+
 /* Recognise the host-requested-stop sentinel: a thrown error with
    message exactly ARENA_TRACE_STOP_MSG. arena_run_module turns this
    into a clean rc=0 return rather than the usual rc=-1 error. */
@@ -101,13 +158,11 @@ static int drain_pending_jobs(void)
         if (r < 0) {
             JSContext *xc = ectx ? ectx : g_ctx;
             JSValue exc = JS_GetException(xc);
-            if (is_trace_stop(xc, exc)) {
+            if (is_trace_stop(xc, exc) || arena_trace_stop_armed()) {
                 JS_FreeValue(xc, exc);
                 return 0;
             }
-            const char *s = JS_ToCString(xc, exc);
-            fprintf(stderr, "pending-job exception: %s\n", s ? s : "(null)");
-            if (s) JS_FreeCString(xc, s);
+            diagnose_exception(xc, exc, "pending-job");
             JS_FreeValue(xc, exc);
             return -1;
         }
@@ -169,9 +224,7 @@ int arena_run(const char *src)
     JSValue v = JS_Eval(g_ctx, src, strlen(src), "<arena>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
         JSValue exc = JS_GetException(g_ctx);
-        const char *s = JS_ToCString(g_ctx, exc);
-        fprintf(stderr, "arena_run exception: %s\n", s ? s : "(null)");
-        if (s) JS_FreeCString(g_ctx, s);
+        diagnose_exception(g_ctx, exc, "arena_run");
         JS_FreeValue(g_ctx, exc);
         JS_FreeValue(g_ctx, v);
         return -1;
@@ -210,15 +263,17 @@ int arena_run_module(const char *entry_name, const char *entry_src)
     if (JS_IsException(v)) {
         JSValue exc = JS_GetException(g_ctx);
         /* host_trace returned truthy → trace module raised a sentinel
-           InternalError to unwind the stack cleanly. Return 0 so the
-           host can distinguish "stopped on purpose" from "errored". */
-        if (is_trace_stop(g_ctx, exc)) {
+           InternalError to unwind the stack cleanly. Two flavours:
+           (a) is_trace_stop matches the sentinel message → normal case.
+           (b) the sentinel's InternalError construction itself OOM-d
+               on arena pressure, exception value ended up JS_NULL,
+               but s_bail_armed in the trace module records that stop
+               was requested. Treat as clean stop. */
+        if (is_trace_stop(g_ctx, exc) || arena_trace_stop_armed()) {
             JS_FreeValue(g_ctx, exc);
             return 0;
         }
-        const char *s = JS_ToCString(g_ctx, exc);
-        fprintf(stderr, "arena_run_module exception: %s\n", s ? s : "(null)");
-        if (s) JS_FreeCString(g_ctx, s);
+        diagnose_exception(g_ctx, exc, "arena_run_module");
         JS_FreeValue(g_ctx, exc);
         return -1;
     }

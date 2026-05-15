@@ -288,6 +288,19 @@ static void emit_state(JSContext *ctx,
     }
     JS_FreeValue(ctx, json);
     JS_FreeValue(ctx, frames_arr);
+
+    /* emit_state must NEVER leave a pending exception on the context.
+       The loop above doesn't check exception status on every QJS API
+       call (and adding checks at every site would balloon the code) —
+       under arena pressure, JS_NewObject / JS_SetPropertyStr / etc.
+       can fail and leave ctx in an exception state. JSON.stringify's
+       cleanup above handles only its own exception. Flush whatever
+       else remains so snapshot_here is a true "fire and forget" path
+       from the host's perspective. JS_GetException returns JS_NULL
+       (and is a no-op for JS_FreeValue) when no exception is pending,
+       so this is safe to call unconditionally. */
+    JSValue stale = JS_GetException(ctx);
+    JS_FreeValue(ctx, stale);
 }
 
 /* ── stop handling ─────────────────────────────────────────────────── */
@@ -333,6 +346,11 @@ int arena_trace_snapshot_here(void)
     if (!s_active_ctx || s_bail_armed) return -1;
     emit_state(s_active_ctx, s_active_b, s_active_pc);
     return 0;
+}
+
+int arena_trace_stop_armed(void)
+{
+    return s_bail_armed;
 }
 
 /* ── hook implementations ──────────────────────────────────────────── */

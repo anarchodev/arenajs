@@ -61,6 +61,12 @@ void arena_trace_reset(void);             /* clear name-table between runs */
    success, -1 if called outside an active trace event. */
 int arena_trace_snapshot_here(void);
 
+/* True when raise_stop has been called this run — host_trace returned
+   truthy and we tried to throw the sentinel. arena_run_module checks
+   this so it can distinguish "stop sentinel was requested but its
+   allocation OOM-d" (treat as clean stop) from "unrelated exception". */
+int arena_trace_stop_armed(void);
+
 void arena_trace_func_enter(JSContext *ctx, struct JSFunctionBytecode *b);
 void arena_trace_func_exit(JSContext *ctx);
 void arena_trace_check_line(JSContext *ctx,

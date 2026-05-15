@@ -133,7 +133,8 @@ export class CursorEngine {
         }
 
         if (varStep > 0) {
-            const varSnapshots = await this._captureVarSnapshots(replay, varStep);
+            const varSnapshots = await this._captureVarSnapshots(
+                replay, varStep, base.events.length);
             base.varSnapshots = varSnapshots;
             base.varSnapshotStep = varStep;
         }
@@ -275,9 +276,13 @@ export class CursorEngine {
     }
 
     // Pass 2: drill again, snapshotting variables every `step` events.
-    // Discards the events themselves — pass 1 already captured them.
-    // Cheap host-side bookkeeping: just a counter and a snapshot trigger.
-    async _captureVarSnapshots(replay, step) {
+    // Stops cleanly via the trace stop sentinel after the last expected
+    // event (totalEvents-1) so we never reach the run's post-execution
+    // wind-down — that's where dense-snapshot replays were OOMing on
+    // accumulated arena leaks (failed allocation during microtask drain
+    // for the async-wrapped module body's resolution). All snapshots
+    // we wanted are already in hand by then.
+    async _captureVarSnapshots(replay, step, totalEvents) {
         this._installReplay(replay);
         const r = this._decoder();
         const varSnapshots = [];
@@ -290,16 +295,19 @@ export class CursorEngine {
         this.M.host_trace = (kind) => {
             if (kind === K_NAME) return 0;
             eventIdx++;
-            if (eventIdx % step !== 0) return 0;
-            pendingSnapshotJson = null;
-            this._snapshot();
-            let frames = [];
-            if (pendingSnapshotJson !== null) {
-                try { frames = JSON.parse(pendingSnapshotJson); }
-                catch { frames = []; }
+            if (eventIdx % step === 0) {
                 pendingSnapshotJson = null;
+                this._snapshot();
+                let frames = [];
+                if (pendingSnapshotJson !== null) {
+                    try { frames = JSON.parse(pendingSnapshotJson); }
+                    catch { frames = []; }
+                    pendingSnapshotJson = null;
+                }
+                varSnapshots.push({ eventOrdinal: eventIdx, frames });
             }
-            varSnapshots.push({ eventOrdinal: eventIdx, frames });
+            // Stop after the last expected event — see comment above.
+            if (totalEvents > 0 && eventIdx >= totalEvents - 1) return 1;
             return 0;
         };
 
