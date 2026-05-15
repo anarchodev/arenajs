@@ -374,6 +374,12 @@ if(EMSCRIPTEN)
         -sEXPORT_NAME=getArenaJs
         -sTEXTDECODER=1
         -sNO_DEFAULT_TO_CXX
+        # Allow linear memory to grow past the 16 MB INITIAL default.
+        # The request arena's snapshot_here path can produce many MB
+        # of transient JSValues for dense-cadence × deep-stack traces,
+        # so embedders need to size the arena generously and have
+        # WASM memory follow.
+        -sALLOW_MEMORY_GROWTH=1
         # HEAPU8/HEAPU16/HEAPU32 exposed so the host can decode binary
         # trace payloads written by the WASM into linear memory.
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU16,HEAPU32
