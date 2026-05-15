@@ -54,6 +54,13 @@ extern const char ARENA_TRACE_STOP_MSG[];
 void arena_trace_set_mode(int mode);
 void arena_trace_reset(void);             /* clear name-table between runs */
 
+/* Walk the live stack and ship the same JSON snapshot host_trace=2
+   emits, via _arena_host_state. Unlike host_trace=2, does NOT raise
+   the stop sentinel — execution continues. Must be called
+   synchronously from inside a host_trace callback. Returns 0 on
+   success, -1 if called outside an active trace event. */
+int arena_trace_snapshot_here(void);
+
 void arena_trace_func_enter(JSContext *ctx, struct JSFunctionBytecode *b);
 void arena_trace_func_exit(JSContext *ctx);
 void arena_trace_check_line(JSContext *ctx,

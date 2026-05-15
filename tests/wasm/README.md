@@ -32,6 +32,7 @@ bundled with emsdk works fine — `node tests/wasm/<name>.mjs`):
 | `state-smoke.mjs` | Stack walker — args, locals, captured locals, closure vars       |
 | `wire-smoke.mjs`  | RTAP bytes → parser → Module.tapes → handler — full round-trip   |
 | `cursor-smoke.mjs`| `CursorEngine` — scan-index cache, scan/line anchors, paging     |
+| `snapshot-here-smoke.mjs` | `arena_snapshot_here()` — snapshot mid-run without stop  |
 
 `rtap.mjs` is the parser/serializer module the wire test depends on.
 It mirrors `src/tape/root.zig`'s encoding rule-for-rule and is the

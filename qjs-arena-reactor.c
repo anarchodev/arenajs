@@ -234,6 +234,12 @@ void arena_set_trace_mode(int mode)
 }
 
 ARENA_EXPORT
+int arena_snapshot_here(void)
+{
+    return arena_trace_snapshot_here();
+}
+
+ARENA_EXPORT
 void arena_destroy(void)
 {
     if (g_ctx) {
