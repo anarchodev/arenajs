@@ -306,6 +306,67 @@ export class CursorEngine {
         return { events, next };
     }
 
+    // Exact-precision variable inspection for one event or a window
+    // around it. Re-runs the replay with snapshot-at-every-event policy
+    // bounded to the requested window. Results cached on the
+    // materialised so subsequent fine-steps inside the same window are
+    // O(1).
+    async inspectAt(mat, eventOrdinal, opts = {}) {
+        const cluster = Math.max(0, opts.cluster ?? 0);
+        const lo = Math.max(0, eventOrdinal - cluster);
+        const hi = Math.min(mat.events.length - 1, eventOrdinal + cluster);
+        if (lo > hi) return [];
+
+        // Cache hit: if every ordinal in [lo, hi] is cached, return
+        // them in order without re-running.
+        const cacheHits = [];
+        for (let k = lo; k <= hi; k++) {
+            const c = mat.inspectCache.get(k);
+            if (!c) { cacheHits.length = 0; break; }
+            cacheHits.push(c);
+        }
+        if (cacheHits.length === hi - lo + 1) return cacheHits;
+
+        this._installReplay(mat.replay);
+        const r = this._decoder();
+        let pendingSnapshotJson = null;
+        this.M.host_state = (ptr, len) => {
+            pendingSnapshotJson = r.str(ptr, len);
+        };
+
+        const results = [];
+        let eventIdx = -1;
+
+        this.M.host_trace = (kind) => {
+            if (kind === K_NAME) return 0;
+            eventIdx++;
+            if (eventIdx >= lo && eventIdx <= hi) {
+                pendingSnapshotJson = null;
+                this._snapshot();
+                let frames = [];
+                if (pendingSnapshotJson !== null) {
+                    try { frames = JSON.parse(pendingSnapshotJson); }
+                    catch { frames = []; }
+                    pendingSnapshotJson = null;
+                }
+                results.push({ eventOrdinal: eventIdx, frames });
+            }
+            if (eventIdx >= hi) return 1;
+            return 0;
+        };
+
+        this._setMode(TRACE_DRILL);
+        this._run(mat.replay.entry.name, mat.replay.entry.src);
+        this._setMode(TRACE_OFF);
+        this.M.host_trace = null;
+        this.M.host_state = null;
+
+        for (const snap of results) {
+            mat.inspectCache.set(snap.eventOrdinal, snap);
+        }
+        return results;
+    }
+
     _anchorToEventIdx(mat, anchor) {
         if (anchor.kind === "scan") {
             const ord = anchor.ordinal;

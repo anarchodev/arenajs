@@ -265,6 +265,103 @@ check("scanIndex: cache reuses array", idx === idx2);
     check("no-snap: varSnapshotStep undefined", mat.varSnapshotStep === undefined);
 }
 
+// ── Test 13: inspectAt single-point and cluster ──────────────────────
+{
+    const replay4 = {
+        entry: { name: "ins.js", src: `
+            let s = 0;
+            for (let i = 0; i < 20; i++) s += i;
+            globalThis._ = s;
+        ` },
+        tapes: {}, module_sources: {},
+    };
+    const mat = await eng.materialise(replay4);
+
+    // Find a LINE event inside the loop body to inspect.
+    let targetIdx = -1;
+    for (let i = 0; i < mat.events.length; i++) {
+        if (mat.events[i].kind === "LINE") { targetIdx = i; break; }
+    }
+    if (targetIdx < 0) throw new Error("no LINE events in test 13 replay");
+
+    // Default (no cluster) → exactly one snapshot at the requested ordinal.
+    const single = await eng.inspectAt(mat, targetIdx);
+    check("inspectAt: default returns one snapshot",
+          single.length === 1, single.length);
+    check("inspectAt: default ordinal matches",
+          single[0].eventOrdinal === targetIdx);
+    check("inspectAt: single point cached",
+          mat.inspectCache.has(targetIdx));
+
+    // Cluster 3 → up to 7 snapshots (or fewer at boundaries).
+    // Use an ordinal far enough in to avoid clipping.
+    const center = Math.min(targetIdx + 5, mat.events.length - 10);
+    const cluster = await eng.inspectAt(mat, center, { cluster: 3 });
+    check("inspectAt: cluster returns 2M+1 snapshots",
+          cluster.length === 7, cluster.length);
+    check("inspectAt: cluster ordinals are contiguous around center",
+          cluster.map(s => s.eventOrdinal).join(",") ===
+          [center-3, center-2, center-1, center, center+1, center+2, center+3].join(","));
+
+    // Cluster cache: re-fetch the same window — should not re-run
+    // the engine. Verify by timing: cached call should be <<< fresh.
+    const t0 = performance.now();
+    const cluster2 = await eng.inspectAt(mat, center, { cluster: 3 });
+    const t1 = performance.now();
+    check("inspectAt: cluster cache identity by content",
+          cluster2.length === cluster.length &&
+          cluster2.every((s, i) => s.eventOrdinal === cluster[i].eventOrdinal));
+    check("inspectAt: cached cluster call sub-ms", (t1 - t0) < 5,
+          `${(t1-t0).toFixed(2)}ms`);
+
+    // Snapshot near zero clipped to start.
+    const head = await eng.inspectAt(mat, 1, { cluster: 5 });
+    check("inspectAt: cluster clipped at lo=0",
+          head.length >= 1 && head[0].eventOrdinal === 0);
+}
+
+// ── Test 14: inspectAt frames carry live values ──────────────────────
+{
+    const replay5 = {
+        entry: { name: "live.js", src: `
+            function compute() {
+                let x = 100;
+                let y = 200;
+                let z = x + y;
+                return z;
+            }
+            globalThis._ = compute();
+        ` },
+        tapes: {}, module_sources: {},
+    };
+    const mat = await eng.materialise(replay5);
+    // Find a LINE event inside compute() — the FUNC_ENTER for compute
+    // is in scan events; we want a LINE event AFTER that.
+    let computeEnter = -1;
+    for (let i = 0; i < mat.events.length; i++) {
+        if (mat.events[i].kind === "FUNC_ENTER" &&
+            mat.events[i].name === "compute") { computeEnter = i; break; }
+    }
+    let firstLineInside = -1;
+    if (computeEnter >= 0) {
+        for (let i = computeEnter; i < mat.events.length; i++) {
+            if (mat.events[i].kind === "LINE") {
+                firstLineInside = i;
+                break;
+            }
+        }
+    }
+    if (firstLineInside < 0) throw new Error("no LINE inside compute()");
+
+    // Inspect a few events into compute (so x/y are assigned).
+    const snaps = await eng.inspectAt(mat, firstLineInside + 2, { cluster: 1 });
+    check("inspectAt: live values returned", snaps.length >= 1);
+    const hasComputeFrame = snaps.some(s =>
+        s.frames.some(f => f.func === "compute" && f.vars));
+    check("inspectAt: compute frame present in some snapshot",
+          hasComputeFrame, snaps);
+}
+
 // ── Test 10: stackSnapshots reflect call depth at sampled events ─────
 {
     const mat = await eng.materialise(replay);
