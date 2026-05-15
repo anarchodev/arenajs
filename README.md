@@ -9,6 +9,9 @@ initialized once into a frozen "base" snapshot; each request runs in a
 This README is the entry point for embedders. If you're here from the
 **rove** project to swap out the existing memcpy-restore vendor, jump
 to [Migrating from a memcpy-restore vendor](#migrating-from-a-memcpy-restore-vendor).
+For the browser-side time-travel replay UI (scrubbing / stepping a
+recorded request), see
+[Replay scrubbing & stepping](#replay-scrubbing--stepping-wasm).
 
 ## What's different vs upstream quickjs-ng
 
@@ -215,6 +218,152 @@ reset alone (floor)                        9 ns/iter
 Most of the per-request cost is parse + compile + eval of the source.
 The reset itself is the floor (9 ns). Pre-compiled bytecode gets you
 closer to the floor.
+
+## Replay scrubbing & stepping (WASM)
+
+The same determinism that makes per-request reset cheap also makes a
+**recorded request replayable, bit-for-bit, in the browser** — which
+is what powers a time-travel scrubber/stepper UI (the rove replay
+view). You record a request's non-deterministic inputs once
+(`kv` get/set/delete/prefix, `Date.now`, `Math.random`, `crypto.*`,
+the module loader) onto *tapes*; replaying the same entry script
+against those tapes re-executes the exact same program, so you can
+trace it as deeply as you like after the fact without the original
+environment.
+
+Design rationale and the full data model are in
+[`REPLAY_CURSOR_API.md`](REPLAY_CURSOR_API.md); build instructions for
+the WASM target are in [`tests/wasm/README.md`](tests/wasm/README.md).
+The host module described here (`tests/wasm/cursor.mjs`) is staged in
+this repo pending a lift into rove's tree — it is **tooling, not part
+of the embedder contract** (see [`CHANGELOG.md`](CHANGELOG.md)).
+
+### The pieces
+
+- **WASM build target `qjs_arena_wasm`.** Same arena runtime compiled
+  under Emscripten with `ARENA_TRACE_ENABLED=1` and
+  `-sALLOW_MEMORY_GROWTH=1`. Exposes `arena_init`, `arena_run_module`,
+  `arena_set_trace_mode`, `arena_snapshot_here`, the `arena_oom_*`
+  query functions, and `arena_destroy`. The native worker build has
+  the trace machinery compiled out (zero overhead) — scrubbing is a
+  WASM-only surface.
+- **Trace modes** (`arena_set_trace_mode`): `OFF` (0), `SCAN` (1) —
+  `FUNC_ENTER` / `FUNC_EXIT` / `THROW` only, cheap — and `DRILL` (2),
+  which adds a `LINE` event on every source-line transition. A
+  `host_trace` JS callback receives binary event payloads; returning
+  truthy stops execution cleanly via a sentinel.
+- **`arena_snapshot_here()`** walks the live stack and ships a JSON
+  snapshot (function/file/line + args/locals/closure vars per frame)
+  via a `host_state` callback **without** stopping execution — so one
+  replay pass can capture many variable snapshots.
+- **`CursorEngine`** (`tests/wasm/cursor.mjs`) wraps an
+  `arena_init`'d module and turns all of the above into a navigable
+  timeline.
+
+### Using the cursor module
+
+```js
+import getArenaJs from "./build-wasm/qjs_arena_wasm.js";
+import { CursorEngine } from "./tests/wasm/cursor.mjs";
+// import { buildTapesFromBlobs } from "./tests/wasm/rtap.mjs";  // RTAP → tapes
+
+const Module = await getArenaJs();
+// Size the request arena for the replay's churn (see "Sizing" below).
+if (Module.cwrap("arena_init", "number", ["number","number"])(8192, 16384) !== 0)
+    throw new Error("arena_init failed");
+const eng = new CursorEngine(Module);
+
+// A replay = the entry script + the recorded tapes it consumes.
+const replay = {
+    entry: { name: "handler.js", src: recordedEntrySource },
+    tapes: recordedTapes,            // from buildTapesFromBlobs(rtapBytes)
+    module_sources: recordedModules, // path-keyed import sources
+};
+
+// 1. Cheap coarse timeline — call/throw structure, no LINE events.
+const idx = await eng.scanIndex(replay);   // ScanRecord[]
+
+// 2. One drill pass → everything the scrubber needs in RAM.
+//    targetSnapshots = scrubber pixel width: the engine picks the
+//    variable-snapshot cadence so you get ~that many samples.
+const mat = await eng.materialise(replay, { targetSnapshots: 800 });
+//   mat.events                 dense DrillEvent[] (indexable by ordinal)
+//   mat.scanOrdinalToEventIdx   scan ordinal → events index
+//   mat.stackSnapshots[/step]   live call stack every stackSnapshotStep
+//   mat.matchingExit            ENTER idx ↔ EXIT idx (both directions)
+//   mat.lineIndex               "file:line" → event indices
+//   mat.varSnapshots[/step]     variable values at the chosen cadence
+```
+
+**Scrub mode** — continuous drag/animation, O(1) per frame, sample
+resolution. Map the scrubber pixel to an event ordinal and index
+straight into the materialised arrays; nothing re-runs:
+
+```js
+function frameAt(K) {                       // K = event ordinal
+    const ev    = mat.events[K];
+    const stack = mat.stackSnapshots[Math.floor(K / mat.stackSnapshotStep)];
+    const vars  = mat.varSnapshots?.[Math.floor(K / mat.varSnapshotStep)];
+    return { ev, stack, vars };             // current line + call stack + values
+}
+```
+
+Always-visible state (event, current line, call stack) is exact at
+every K; variable values are exact at sample points and
+stale-but-shown between them, which reads as continuous at scrubber
+resolution.
+
+**Step mode** — discrete arrow-key / click, ~ms, *exact*. Re-runs the
+replay to the landed position and snapshots a window around it; the
+window is cached on `mat.inspectCache` so subsequent fine-steps inside
+it are O(1):
+
+```js
+// Exact vars at K plus K-5..K+5 prefetched for instant arrow-keying.
+const snaps = await eng.inspectAt(mat, K, { cluster: 5 });
+const here  = snaps.find(s => s.eventOrdinal === K);
+```
+
+For "play forward from here" / windowed consumption rather than random
+access, use the paged cursor:
+
+```js
+const cur  = eng.openCursor(replay, { kind: "scan", ordinal: someScanOrd });
+let   page = await eng.drillNext(cur, 5000);   // { events, next }
+while (page.next) page = await eng.drillNext(page.next, 5000);
+```
+
+`openCursor` also accepts a `{ kind: "line", file, line, afterScan }`
+anchor to jump to a source position.
+
+### Sizing & failure signal
+
+Replay re-execution allocates into the request arena, which does not
+reclaim mid-run. Size `arena_init`'s request arena for the replay's
+*cumulative* allocation, not its peak — a churning handler needs more.
+`materialise` with `targetSnapshots` is two passes (count, then
+snapshot at the right cadence) and the snapshot path serializes
+directly to bytes, so deep stacks no longer blow the arena; the bench
+in `tests/wasm/cursor-ui-bench.mjs` covers tight-loop / call-heavy /
+deep-recursion / mixed shapes.
+
+If a replay exhausts the arena, the signal is unambiguous and
+actionable rather than a mystery failure:
+
+```js
+const rc = Module.cwrap("arena_run_module","number",["string","string"])(name, src);
+//  0  ok / clean stop
+// -1  the JS threw (a bug in the recorded handler)
+// -2  request arena exhausted — bump arena_init's request size
+if (Module.cwrap("arena_oom_hit","number",[])()) {
+    const used  = Module.cwrap("arena_oom_used","number",[])();
+    const limit = Module.cwrap("arena_oom_limit","number",[])();
+    // surface "replay needs a larger arena (used U / limit L)"
+}
+```
+
+(`CursorEngine` drives `arena_run_module` for you; you only need the
+raw return code / `arena_oom_*` if you embed the WASM module directly.)
 
 ## Migrating from a memcpy-restore vendor
 
