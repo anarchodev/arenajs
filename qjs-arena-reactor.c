@@ -383,3 +383,18 @@ void arena_destroy(void)
         g_rt = NULL;
     }
 }
+
+/* Seed the per-request PRNG used by Math.random (and, via
+ * JS_FillRandomBytes, by host crypto bindings). Splits a u64 into
+ * two u32s so the WASM ABI doesn't need BigInt — the JS host calls
+ * arena_set_random_seed(seed_lo, seed_hi) with the recorded request
+ * seed at replay start. The native server path also calls
+ * JS_SetRandomSeed directly with the per-request seed (one path,
+ * one PRNG state — see docs/primitive-gaps.md §9). */
+ARENA_EXPORT
+void arena_set_random_seed(uint32_t seed_lo, uint32_t seed_hi)
+{
+    if (!g_ctx) return;
+    uint64_t seed = ((uint64_t)seed_hi << 32) | seed_lo;
+    JS_SetRandomSeed(g_ctx, seed);
+}

@@ -40,14 +40,15 @@
  * Bytes out-params: host malloc's via Module._malloc, native copies + frees.
  */
 
-EM_JS(double, _arena_host_math_random, (int *err_ptr), {
-    const t = Module.tapes && Module.tapes.math_random;
-    if (!t) { HEAP32[err_ptr >> 2] = 1; return 0.0; }
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) { HEAP32[err_ptr >> 2] = 2; return 0.0; }
-    HEAP32[err_ptr >> 2] = 0;
-    return t[t._cursor++].value;
-});
+/* docs/primitive-gaps.md §9 — Math.random and crypto.* used to
+ * read recorded values from `Module.tapes.math_random` /
+ * `Module.tapes.crypto_random`. Post-§9 the WASM-side bindings
+ * draw from the same per-request `xorshift64star` PRNG state
+ * arenajs's native Math.random uses, seeded once at replay start
+ * via `arena_set_random_seed`. No host callback, no tape, no JS
+ * port — both server and replay run the same C PRNG. Date.now
+ * keeps the per-call host callback (a clock read is genuinely
+ * external; replay reads from the date tape). */
 
 EM_JS(double, _arena_host_date_now, (int *err_ptr), {
     const t = Module.tapes && Module.tapes.date;
@@ -58,32 +59,48 @@ EM_JS(double, _arena_host_date_now, (int *err_ptr), {
     return t[t._cursor++].ms;
 });
 
-EM_JS(int, _arena_host_crypto_random,
-      (int requested_len, int *out_ptr_ptr, int *out_len_ptr), {
-    const t = Module.tapes && Module.tapes.crypto_random;
-    if (!t) return 1;
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) return 2;
-    const e = t[t._cursor++];
-    if (e.bytes.byteLength !== requested_len) return -3;
-    const ptr = Module._malloc(e.bytes.byteLength || 1);
-    if (e.bytes.byteLength) HEAPU8.set(e.bytes, ptr);
-    HEAP32[out_ptr_ptr >> 2] = ptr;
-    HEAP32[out_len_ptr >> 2] = e.bytes.byteLength;
-    return 0;
-});
+/* rove §8 (docs/primitive-gaps.md): minimal kv read set. The
+   capture-side tape now records ONLY foreign reads — own-reads
+   (a kv.get of a key the same activation just wrote) resolve
+   against the activation's writeset overlay, and writes
+   (kv.set / kv.delete) are outputs not inputs. Replay maintains
+   an in-engine overlay (Module._kvOverlay, a Map keyed by string,
+   value = string for set, null for delete tombstone) populated by
+   the host's kv.set / kv.delete callbacks. kv.get checks the
+   overlay first; on miss it falls through to the existing tape-
+   consume path (the foreign-read entry the capture-side did
+   tape). Reset between replays via the JS-side bootloader. RTAP
+   wire version bumped 1 → 2 to signal the new semantics. */
 
 EM_JS(int, _arena_host_kv_get,
       (int key_ptr, int key_len,
        int *out_outcome_ptr, int *out_val_ptr_ptr, int *out_val_len_ptr), {
+    const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
+    const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
+    const overlay = Module._kvOverlay || (Module._kvOverlay = new Map());
+    if (overlay.has(key)) {
+        const ov = overlay.get(key);
+        if (ov === null) {
+            HEAP32[out_outcome_ptr >> 2] = 1; /* not_found */
+            HEAP32[out_val_ptr_ptr >> 2] = 0;
+            HEAP32[out_val_len_ptr >> 2] = 0;
+        } else {
+            const enc = Module._tapeEnc || (Module._tapeEnc = new TextEncoder());
+            const bytes = enc.encode(ov);
+            const ptr = Module._malloc(bytes.length || 1);
+            if (bytes.length) HEAPU8.set(bytes, ptr);
+            HEAP32[out_outcome_ptr >> 2] = 0; /* ok */
+            HEAP32[out_val_ptr_ptr >> 2] = ptr;
+            HEAP32[out_val_len_ptr >> 2] = bytes.length;
+        }
+        return 0;
+    }
     const t = Module.tapes && Module.tapes.kv;
     if (!t) return 1;
     if (t._cursor === undefined) t._cursor = 0;
     if (t._cursor >= t.length) return 2;
     const e = t[t._cursor++];
     if (e.op !== 0) return -3;
-    const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
-    const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
     if (e.key !== key) return -4;
     HEAP32[out_outcome_ptr >> 2] = e.outcome;
     if (e.outcome === 0) {
@@ -103,33 +120,22 @@ EM_JS(int, _arena_host_kv_get,
 EM_JS(int, _arena_host_kv_set,
       (int key_ptr, int key_len, int val_ptr, int val_len,
        int *out_outcome_ptr), {
-    const t = Module.tapes && Module.tapes.kv;
-    if (!t) return 1;
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) return 2;
-    const e = t[t._cursor++];
-    if (e.op !== 1) return -3;
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
     const val = dec.decode(HEAPU8.subarray(val_ptr, val_ptr + val_len));
-    if (e.key !== key) return -4;
-    if (e.value !== val) return -5;
-    HEAP32[out_outcome_ptr >> 2] = e.outcome;
+    const overlay = Module._kvOverlay || (Module._kvOverlay = new Map());
+    overlay.set(key, val);
+    HEAP32[out_outcome_ptr >> 2] = 0; /* ok */
     return 0;
 });
 
 EM_JS(int, _arena_host_kv_delete,
       (int key_ptr, int key_len, int *out_outcome_ptr), {
-    const t = Module.tapes && Module.tapes.kv;
-    if (!t) return 1;
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) return 2;
-    const e = t[t._cursor++];
-    if (e.op !== 2) return -3;
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
-    if (e.key !== key) return -4;
-    HEAP32[out_outcome_ptr >> 2] = e.outcome;
+    const overlay = Module._kvOverlay || (Module._kvOverlay = new Map());
+    overlay.set(key, null); /* null = delete tombstone */
+    HEAP32[out_outcome_ptr >> 2] = 0; /* ok */
     return 0;
 });
 
@@ -219,17 +225,6 @@ static JSValue throw_tape_error(JSContext *ctx, const char *channel, int rc)
     return JS_ThrowInternalError(ctx, "%s tape diverged (rc=%d)", channel, rc);
 }
 
-static JSValue jsb_math_random(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
-{
-    (void)this_val; (void)argc; (void)argv;
-    int err = 0;
-    double v = _arena_host_math_random(&err);
-    if (err)
-        return throw_tape_error(ctx, "math_random", err);
-    return JS_NewFloat64(ctx, v);
-}
-
 static JSValue jsb_date_now(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv)
 {
@@ -243,8 +238,11 @@ static JSValue jsb_date_now(JSContext *ctx, JSValueConst this_val,
     return JS_NewInt64(ctx, (int64_t)v);
 }
 
-/* crypto.getRandomValues(typedArray) — fills the array in place and
-   returns the same array. */
+/* docs/primitive-gaps.md §9 — crypto.* draws from the per-request
+ * PRNG state (xorshift64star) via JS_FillRandomBytes, sharing the
+ * stream with Math.random. Replay reproduces by re-seeding the
+ * same arenajs PRNG; no tape, no host callback. */
+
 static JSValue jsb_crypto_getRandomValues(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
@@ -262,16 +260,10 @@ static JSValue jsb_crypto_getRandomValues(JSContext *ctx, JSValueConst this_val,
     if (!ab_ptr) {
         return JS_ThrowTypeError(ctx, "getRandomValues: bad backing buffer");
     }
-    int host_ptr = 0, host_len = 0;
-    int rc = _arena_host_crypto_random((int)byte_length, &host_ptr, &host_len);
-    if (rc != 0)
-        return throw_tape_error(ctx, "crypto_random", rc);
-    memcpy(ab_ptr + byte_offset, (void *)(intptr_t)host_ptr, (size_t)host_len);
-    free((void *)(intptr_t)host_ptr);
+    JS_FillRandomBytes(ctx, ab_ptr + byte_offset, byte_length);
     return JS_DupValue(ctx, argv[0]);
 }
 
-/* crypto.randomBytes(n) — returns a fresh Uint8Array filled with bytes. */
 static JSValue jsb_crypto_randomBytes(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
@@ -279,34 +271,23 @@ static JSValue jsb_crypto_randomBytes(JSContext *ctx, JSValueConst this_val,
     int32_t n = 0;
     if (argc < 1 || JS_ToInt32(ctx, &n, argv[0]) < 0 || n < 0)
         return JS_ThrowTypeError(ctx, "randomBytes: expected non-negative integer");
-    int host_ptr = 0, host_len = 0;
-    int rc = _arena_host_crypto_random(n, &host_ptr, &host_len);
-    if (rc != 0)
-        return throw_tape_error(ctx, "crypto_random", rc);
-    JSValue ta = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)(intptr_t)host_ptr,
-                                       (size_t)host_len);
-    free((void *)(intptr_t)host_ptr);
+    uint8_t *buf = (uint8_t *)js_malloc(ctx, (size_t)n + 1);
+    if (!buf) return JS_ThrowOutOfMemory(ctx);
+    JS_FillRandomBytes(ctx, buf, (size_t)n);
+    JSValue ta = JS_NewUint8ArrayCopy(ctx, buf, (size_t)n);
+    js_free(ctx, buf);
     return ta;
 }
 
-/* crypto.randomUUID — formats 16 bytes as canonical UUID v4-style string.
-   The bytes come from the tape exactly as the original call produced
-   them, so we don't enforce the version/variant nibble layout — replay
-   must mirror what was recorded byte-for-byte. */
 static JSValue jsb_crypto_randomUUID(JSContext *ctx, JSValueConst this_val,
                                       int argc, JSValueConst *argv)
 {
     (void)this_val; (void)argc; (void)argv;
-    int host_ptr = 0, host_len = 0;
-    int rc = _arena_host_crypto_random(16, &host_ptr, &host_len);
-    if (rc != 0)
-        return throw_tape_error(ctx, "crypto_random", rc);
-    if (host_len != 16) {
-        free((void *)(intptr_t)host_ptr);
-        return JS_ThrowInternalError(ctx, "randomUUID: tape returned %d bytes",
-                                      host_len);
-    }
-    const uint8_t *b = (const uint8_t *)(intptr_t)host_ptr;
+    uint8_t b[16];
+    JS_FillRandomBytes(ctx, b, 16);
+    /* RFC 4122 v4 — set the version + variant nibbles. */
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
     char out[37];
     static const char hex[] = "0123456789abcdef";
     int o = 0;
@@ -316,7 +297,6 @@ static JSValue jsb_crypto_randomUUID(JSContext *ctx, JSValueConst this_val,
         out[o++] = hex[b[i] & 0xf];
     }
     out[36] = '\0';
-    free((void *)(intptr_t)host_ptr);
     return JS_NewStringLen(ctx, out, 36);
 }
 
@@ -495,13 +475,10 @@ int arena_install_replay_bindings(JSContext *ctx)
 {
     JSValue global = JS_GetGlobalObject(ctx);
 
-    /* Math.random */
-    JSValue math = JS_GetPropertyStr(ctx, global, "Math");
-    if (JS_IsObject(math)) {
-        JS_SetPropertyStr(ctx, math, "random",
-            JS_NewCFunction(ctx, jsb_math_random, "random", 0));
-    }
-    JS_FreeValue(ctx, math);
+    /* docs/primitive-gaps.md §9 — no Math.random override. arenajs's
+     * native `js_math_random` runs against the per-request PRNG
+     * state, seeded by `arena_set_random_seed` from the JS host
+     * (or by the embedder's JS_SetRandomSeed call). */
 
     /* Date.now: bind to the original Date constructor object first. */
     JSValue date_ctor = JS_GetPropertyStr(ctx, global, "Date");
