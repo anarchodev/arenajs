@@ -40,24 +40,12 @@
  * Bytes out-params: host malloc's via Module._malloc, native copies + frees.
  */
 
-/* docs/primitive-gaps.md §9 — Math.random and crypto.* used to
- * read recorded values from `Module.tapes.math_random` /
- * `Module.tapes.crypto_random`. Post-§9 the WASM-side bindings
- * draw from the same per-request `xorshift64star` PRNG state
- * arenajs's native Math.random uses, seeded once at replay start
- * via `arena_set_random_seed`. No host callback, no tape, no JS
- * port — both server and replay run the same C PRNG. Date.now
- * keeps the per-call host callback (a clock read is genuinely
- * external; replay reads from the date tape). */
-
-EM_JS(double, _arena_host_date_now, (int *err_ptr), {
-    const t = Module.tapes && Module.tapes.date;
-    if (!t) { HEAP32[err_ptr >> 2] = 1; return 0.0; }
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) { HEAP32[err_ptr >> 2] = 2; return 0.0; }
-    HEAP32[err_ptr >> 2] = 0;
-    return t[t._cursor++].ms;
-});
+/* docs/primitive-gaps.md §9 + §9 fold-in — Math.random, crypto.*,
+ * AND Date.now draw from per-context state (xorshift64star +
+ * `date_now_pinned`), not host tapes. Replay reseeds via
+ * `arena_set_random_seed` and pins Date.now via
+ * `arena_set_date_now` before running the handler. No host
+ * callbacks for any of them. */
 
 /* rove §8 (docs/primitive-gaps.md): minimal kv read set. The
    capture-side tape now records ONLY foreign reads — own-reads
@@ -225,18 +213,8 @@ static JSValue throw_tape_error(JSContext *ctx, const char *channel, int rc)
     return JS_ThrowInternalError(ctx, "%s tape diverged (rc=%d)", channel, rc);
 }
 
-static JSValue jsb_date_now(JSContext *ctx, JSValueConst this_val,
-                            int argc, JSValueConst *argv)
-{
-    (void)this_val; (void)argc; (void)argv;
-    int err = 0;
-    double v = _arena_host_date_now(&err);
-    if (err)
-        return throw_tape_error(ctx, "date", err);
-    /* Date.now returns an integer ms-since-epoch; tape stores it as an
-       exact value so a plain JS number suffices. */
-    return JS_NewInt64(ctx, (int64_t)v);
-}
+/* §9 fold-in: Date.now / new Date() are handled by arenajs natively
+ * via `date_now_pinned` set with JS_SetDateNow. No host hook needed. */
 
 /* docs/primitive-gaps.md §9 — crypto.* draws from the per-request
  * PRNG state (xorshift64star) via JS_FillRandomBytes, sharing the
@@ -475,63 +453,13 @@ int arena_install_replay_bindings(JSContext *ctx)
 {
     JSValue global = JS_GetGlobalObject(ctx);
 
-    /* docs/primitive-gaps.md §9 — no Math.random override. arenajs's
-     * native `js_math_random` runs against the per-request PRNG
-     * state, seeded by `arena_set_random_seed` from the JS host
-     * (or by the embedder's JS_SetRandomSeed call). */
-
-    /* Date.now: bind to the original Date constructor object first. */
-    JSValue date_ctor = JS_GetPropertyStr(ctx, global, "Date");
-    if (JS_IsObject(date_ctor)) {
-        JS_SetPropertyStr(ctx, date_ctor, "now",
-            JS_NewCFunction(ctx, jsb_date_now, "now", 0));
-    }
-    JS_FreeValue(ctx, date_ctor);
-
-    /* new Date() with no args: replace the Date constructor entirely
-       with a thin JS wrapper that funnels the no-arg case through the
-       tape-bound Date.now() and passes everything else to the original.
-       Statics (UTC, parse, now, …) and prototype are preserved so
-       `instanceof Date` and `Date.UTC(…)` keep working.
-
-       Written in JS rather than C because the prop-copy loop is
-       trivial in JS and ugly in C. Pre-freeze eval ⇒ wrapper lives in
-       base memory like the rest of the replay surface. */
-    static const char date_wrapper_src[] =
-        "(() => {\n"
-        "  const OrigDate = globalThis.Date;\n"
-        "  const D = function(...args) {\n"
-        "    if (new.target && args.length === 0) {\n"
-        "      return Reflect.construct(OrigDate, [Date.now()], new.target);\n"
-        "    }\n"
-        "    if (new.target) {\n"
-        "      return Reflect.construct(OrigDate, args, new.target);\n"
-        "    }\n"
-        "    return OrigDate(...args);\n"  /* Date() without new: passthrough */
-        "  };\n"
-        "  for (const k of Reflect.ownKeys(OrigDate)) {\n"
-        "    if (k === 'prototype' || k === 'name' || k === 'length') continue;\n"
-        "    try { D[k] = OrigDate[k]; } catch (e) {}\n"
-        "  }\n"
-        "  Object.defineProperty(D, 'prototype', {\n"
-        "    value: OrigDate.prototype, writable: false,\n"
-        "    enumerable: false, configurable: false,\n"
-        "  });\n"
-        "  globalThis.Date = D;\n"
-        "})()\n";
-    JSValue r = JS_Eval(ctx, date_wrapper_src, sizeof(date_wrapper_src) - 1,
-                         "<arena-date-wrapper>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(r)) {
-        JSValue exc = JS_GetException(ctx);
-        const char *s = JS_ToCString(ctx, exc);
-        fprintf(stderr, "Date wrapper install failed: %s\n", s ? s : "(null)");
-        if (s) JS_FreeCString(ctx, s);
-        JS_FreeValue(ctx, exc);
-        JS_FreeValue(ctx, r);
-        JS_FreeValue(ctx, global);
-        return -1;
-    }
-    JS_FreeValue(ctx, r);
+    /* docs/primitive-gaps.md §9 — no Math.random / Date.now
+     * overrides. arenajs's native `js_math_random` and `js_Date_now`
+     * (+ `js_date_constructor` no-args path) run against per-context
+     * state (xorshift64star + `date_now_pinned`), set per request by
+     * the embedder via `JS_SetRandomSeed` / `JS_SetDateNow` (server)
+     * or the WASM reactor `arena_set_random_seed` /
+     * `arena_set_date_now` exports (replay shell). */
 
     /* crypto namespace */
     JSValue crypto = JS_NewObject(ctx);

@@ -398,3 +398,20 @@ void arena_set_random_seed(uint32_t seed_lo, uint32_t seed_hi)
     uint64_t seed = ((uint64_t)seed_hi << 32) | seed_lo;
     JS_SetRandomSeed(g_ctx, seed);
 }
+
+/* Pin Date.now() to a fixed UTC-ms-since-epoch value for the next
+ * arena_run. Within one request, every Date.now() and
+ * `new Date()` (no args) returns this value — making the per-
+ * request clock-read sequence deterministic.  The 64-bit ms value
+ * is split across two u32s so the WASM ABI doesn't need BigInt
+ * (replay shell passes (lo, hi) from the captured timestamp).
+ * The server path calls JS_SetDateNow directly with the per-
+ * request value — one mechanism, one source.  See
+ * docs/primitive-gaps.md §9 fold-in in rove. */
+ARENA_EXPORT
+void arena_set_date_now(uint32_t lo, uint32_t hi)
+{
+    if (!g_ctx) return;
+    int64_t ms = (int64_t)(((uint64_t)hi << 32) | lo);
+    JS_SetDateNow(g_ctx, ms);
+}
