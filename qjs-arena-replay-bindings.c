@@ -447,6 +447,30 @@ int arena_install_replay_module_loader(JSRuntime *rt)
     return 0;
 }
 
+/* ───────────── entry-module namespace ───────────── */
+
+/* Defined in qjs-arena-reactor.c: the JSModuleDef of the module the
+   current arena_run_module call is evaluating. */
+JSModuleDef *arena_entry_module(void);
+
+/* `__arena_entry_ns()` — the namespace object of the entry module of
+   the CURRENT arena_run_module call. Lets a replay epilogue appended
+   to the entry source invoke the module's exports through the
+   namespace — including an anonymous `export default`, which has no
+   module-scope binding and is otherwise unreachable from appended
+   code (self-imports route through the host loader and diverge from
+   the module tape). Returns undefined when called outside a module
+   run. */
+static JSValue jsb_entry_ns(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    JSModuleDef *m = arena_entry_module();
+    if (!m)
+        return JS_UNDEFINED;
+    return JS_GetModuleNamespace(ctx, m);
+}
+
 /* ───────────── registration ───────────── */
 
 int arena_install_replay_bindings(JSContext *ctx)
@@ -482,6 +506,10 @@ int arena_install_replay_bindings(JSContext *ctx)
     JS_SetPropertyStr(ctx, kv, "prefix",
         JS_NewCFunction(ctx, jsb_kv_prefix, "prefix", 2));
     JS_SetPropertyStr(ctx, global, "kv", kv);
+
+    /* Entry-module namespace accessor for the replay epilogue. */
+    JS_SetPropertyStr(ctx, global, "__arena_entry_ns",
+        JS_NewCFunction(ctx, jsb_entry_ns, "__arena_entry_ns", 0));
 
     JS_FreeValue(ctx, global);
     return 0;

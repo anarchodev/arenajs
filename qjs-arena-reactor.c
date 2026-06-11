@@ -290,6 +290,21 @@ static int arena_oom_override(int rc, const char *where)
     return ARENA_RC_OOM;
 }
 
+/* The entry module of the CURRENT arena_run_module call. Lives in the
+   request arena — valid only between the compile inside one
+   arena_run_module call and the next request-arena reset. Consumed by
+   `__arena_entry_ns()` (replay bindings), which lets an appended
+   replay epilogue reach the entry module's namespace — the only way
+   to invoke an anonymous `export default` (no module-scope binding
+   exists for it, and both static and dynamic self-imports route
+   through the host loader, diverging from the module tape). */
+static JSModuleDef *g_entry_module = NULL;
+
+JSModuleDef *arena_entry_module(void)
+{
+    return g_entry_module;
+}
+
 /* Evaluate `entry_src` as the body of a module named `entry_name`.
    Imports inside it (and transitively) trigger the replay-mode module
    loader, which pulls source from Module.module_sources per
@@ -301,11 +316,28 @@ int arena_run_module(const char *entry_name, const char *entry_src)
     if (!g_rt || !g_ctx || !entry_name || !entry_src)
         return ARENA_RC_ERROR;
 
+    g_entry_module = NULL;        /* previous run's def died with its arena */
     JS_ResetRequestArena(g_rt);   /* also clears the per-request OOM record */
     arena_trace_reset();   /* clear name-table so host can dedupe by run */
 
-    JSValue v = JS_Eval(g_ctx, entry_src, strlen(entry_src), entry_name,
-                        JS_EVAL_TYPE_MODULE);
+    /* Compile-only first so the JSModuleDef is reachable for
+       __arena_entry_ns(); JS_EvalFunction then links + evaluates the
+       same instance (and consumes the wrapper value). */
+    JSValue compiled = JS_Eval(g_ctx, entry_src, strlen(entry_src), entry_name,
+                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(compiled)) {
+        JSValue exc = JS_GetException(g_ctx);
+        if (js_dual_arena_oom_hit(JS_GetDualArena(g_rt))) {
+            JS_FreeValue(g_ctx, exc);
+            return arena_oom_override(ARENA_RC_ERROR, "arena_run_module(compile)");
+        }
+        diagnose_exception(g_ctx, exc, "arena_run_module(compile)");
+        JS_FreeValue(g_ctx, exc);
+        return ARENA_RC_ERROR;
+    }
+    g_entry_module = JS_VALUE_GET_PTR(compiled);
+
+    JSValue v = JS_EvalFunction(g_ctx, compiled);
     /* The result is the module's evaluation Promise (QJS-ng returns one
        for every module to support top-level await). Await it so a
        module-body throw surfaces as a real exception instead of getting
