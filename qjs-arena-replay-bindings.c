@@ -21,10 +21,6 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-#else
-/* Stubs so this file compiles on native (for IDE indexing / sanity
-   builds); it's only linked into the WASM target in practice. */
-#define EM_JS(ret, name, args, body) static ret name args { return (ret)0; }
 #endif
 
 /* ───────────── host imports (C → JS) ───────────── */
@@ -60,9 +56,16 @@
    tape). Reset between replays via the JS-side bootloader. RTAP
    wire version bumped 1 → 2 to signal the new semantics. */
 
+/* On wasm32 the pointer params below marshal to JS as numeric addresses
+   (the EM_JS bodies index HEAPU8/HEAP32 with them, exactly as when they
+   were declared `int`). On native the matching dispatchers in the #else
+   branch receive genuine pointers — so a 64-bit native host never sees a
+   truncated address. The native sink lives after the last import. */
+#ifdef __EMSCRIPTEN__
+
 EM_JS(int, _arena_host_kv_get,
-      (int key_ptr, int key_len,
-       int *out_outcome_ptr, int *out_val_ptr_ptr, int *out_val_len_ptr), {
+      (const uint8_t *key_ptr, int key_len,
+       int *out_outcome_ptr, uint8_t **out_val_ptr_ptr, int *out_val_len_ptr), {
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
     const overlay = Module._kvOverlay || (Module._kvOverlay = new Map());
@@ -106,7 +109,7 @@ EM_JS(int, _arena_host_kv_get,
 });
 
 EM_JS(int, _arena_host_kv_set,
-      (int key_ptr, int key_len, int val_ptr, int val_len,
+      (const uint8_t *key_ptr, int key_len, const uint8_t *val_ptr, int val_len,
        int *out_outcome_ptr), {
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
@@ -118,7 +121,7 @@ EM_JS(int, _arena_host_kv_set,
 });
 
 EM_JS(int, _arena_host_kv_delete,
-      (int key_ptr, int key_len, int *out_outcome_ptr), {
+      (const uint8_t *key_ptr, int key_len, int *out_outcome_ptr), {
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const key = dec.decode(HEAPU8.subarray(key_ptr, key_ptr + key_len));
     const overlay = Module._kvOverlay || (Module._kvOverlay = new Map());
@@ -134,8 +137,8 @@ EM_JS(int, _arena_host_kv_delete,
    matches a hash-content-addressed store. Host malloc's the bytes;
    the native loader copies into a QJS string and frees. */
 EM_JS(int, _arena_host_module_load,
-      (int spec_ptr, int spec_len,
-       int *out_src_ptr, int *out_src_len), {
+      (const uint8_t *spec_ptr, int spec_len,
+       uint8_t **out_src_ptr, int *out_src_len), {
     const t = Module.tapes && Module.tapes.module;
     if (!t) return 1;
     if (t._cursor === undefined) t._cursor = 0;
@@ -168,9 +171,9 @@ EM_JS(int, _arena_host_module_load,
    binding parses via JS_ParseJSON. Result rows fit comfortably in
    memory for any realistic capture (prefix scan is capped by .limit). */
 EM_JS(int, _arena_host_kv_prefix,
-      (int prefix_ptr, int prefix_len,
-       int cursor_ptr, int cursor_len, int limit,
-       int *out_outcome_ptr, int *out_json_ptr_ptr, int *out_json_len_ptr), {
+      (const uint8_t *prefix_ptr, int prefix_len,
+       const uint8_t *cursor_ptr, int cursor_len, int limit,
+       int *out_outcome_ptr, uint8_t **out_json_ptr_ptr, int *out_json_len_ptr), {
     const t = Module.tapes && Module.tapes.kv;
     if (!t) return 1;
     if (t._cursor === undefined) t._cursor = 0;
@@ -201,6 +204,64 @@ EM_JS(int, _arena_host_kv_prefix,
     HEAP32[out_json_len_ptr >> 2] = bytes.length;
     return 0;
 });
+
+#else  /* native: dispatch each tape read to the registered host responder */
+
+/* Copy of the embedder's responder table (see qjs-arena-replay-bindings.h).
+   Zero-initialised, so before arena_replay_set_host() every channel is NULL
+   and reports "tape not installed" (code 1) — the same outcome the browser
+   host gives when Module.tapes.<channel> is absent. */
+static arena_replay_host s_host;
+static void              *s_host_user = NULL;
+
+void arena_replay_set_host(const arena_replay_host *host, void *user)
+{
+    if (host) s_host = *host;
+    else      memset(&s_host, 0, sizeof s_host);
+    s_host_user = user;
+}
+
+static int _arena_host_kv_get(const uint8_t *key, int key_len,
+                              int *out_outcome, uint8_t **out_val,
+                              int *out_val_len)
+{
+    if (!s_host.kv_get) return 1;
+    return s_host.kv_get(key, key_len, out_outcome, out_val, out_val_len,
+                         s_host_user);
+}
+
+static int _arena_host_kv_set(const uint8_t *key, int key_len,
+                              const uint8_t *val, int val_len, int *out_outcome)
+{
+    if (!s_host.kv_set) return 1;
+    return s_host.kv_set(key, key_len, val, val_len, out_outcome, s_host_user);
+}
+
+static int _arena_host_kv_delete(const uint8_t *key, int key_len,
+                                 int *out_outcome)
+{
+    if (!s_host.kv_delete) return 1;
+    return s_host.kv_delete(key, key_len, out_outcome, s_host_user);
+}
+
+static int _arena_host_kv_prefix(const uint8_t *prefix, int prefix_len,
+                                 const uint8_t *cursor, int cursor_len, int limit,
+                                 int *out_outcome, uint8_t **out_json,
+                                 int *out_json_len)
+{
+    if (!s_host.kv_prefix) return 1;
+    return s_host.kv_prefix(prefix, prefix_len, cursor, cursor_len, limit,
+                            out_outcome, out_json, out_json_len, s_host_user);
+}
+
+static int _arena_host_module_load(const uint8_t *spec, int spec_len,
+                                   uint8_t **out_src, int *out_src_len)
+{
+    if (!s_host.module_load) return 1;
+    return s_host.module_load(spec, spec_len, out_src, out_src_len, s_host_user);
+}
+
+#endif  /* __EMSCRIPTEN__ */
 
 /* ───────────── native QJS bindings (JS → C → host) ───────────── */
 
@@ -290,23 +351,23 @@ static JSValue jsb_kv_get(JSContext *ctx, JSValueConst this_val,
     const char *key = JS_ToCStringLen(ctx, &key_len, argv[0]);
     if (!key)
         return JS_EXCEPTION;
-    int outcome = 0, val_ptr = 0, val_len = 0;
-    int rc = _arena_host_kv_get((int)(intptr_t)key, (int)key_len,
-                                 &outcome, &val_ptr, &val_len);
+    int outcome = 0, val_len = 0;
+    uint8_t *val = NULL;
+    int rc = _arena_host_kv_get((const uint8_t *)key, (int)key_len,
+                                 &outcome, &val, &val_len);
     JS_FreeCString(ctx, key);
     if (rc != 0)
         return throw_tape_error(ctx, "kv", rc);
     if (outcome == 1) {  /* not_found */
-        if (val_ptr) free((void *)(intptr_t)val_ptr);
+        free(val);
         return JS_NULL;
     }
     if (outcome == 2) {  /* err */
-        if (val_ptr) free((void *)(intptr_t)val_ptr);
+        free(val);
         return JS_ThrowInternalError(ctx, "kv.get: recorded failure");
     }
-    JSValue v = JS_NewStringLen(ctx, (const char *)(intptr_t)val_ptr,
-                                 (size_t)val_len);
-    free((void *)(intptr_t)val_ptr);
+    JSValue v = JS_NewStringLen(ctx, (const char *)val, (size_t)val_len);
+    free(val);
     return v;
 }
 
@@ -323,8 +384,8 @@ static JSValue jsb_kv_set(JSContext *ctx, JSValueConst this_val,
     const char *val = JS_ToCStringLen(ctx, &val_len, argv[1]);
     if (!val) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
     int outcome = 0;
-    int rc = _arena_host_kv_set((int)(intptr_t)key, (int)key_len,
-                                 (int)(intptr_t)val, (int)val_len, &outcome);
+    int rc = _arena_host_kv_set((const uint8_t *)key, (int)key_len,
+                                 (const uint8_t *)val, (int)val_len, &outcome);
     JS_FreeCString(ctx, key);
     JS_FreeCString(ctx, val);
     if (rc != 0)
@@ -347,7 +408,7 @@ static JSValue jsb_kv_delete(JSContext *ctx, JSValueConst this_val,
     const char *key = JS_ToCStringLen(ctx, &key_len, argv[0]);
     if (!key) return JS_EXCEPTION;
     int outcome = 0;
-    int rc = _arena_host_kv_delete((int)(intptr_t)key, (int)key_len, &outcome);
+    int rc = _arena_host_kv_delete((const uint8_t *)key, (int)key_len, &outcome);
     JS_FreeCString(ctx, key);
     if (rc != 0)
         return throw_tape_error(ctx, "kv", rc);
@@ -391,22 +452,23 @@ static JSValue jsb_kv_prefix(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, lv);
     }
 
-    int outcome = 0, json_ptr = 0, json_len = 0;
+    int outcome = 0, json_len = 0;
+    uint8_t *json = NULL;
     int rc = _arena_host_kv_prefix(
-        (int)(intptr_t)prefix, (int)prefix_len,
-        (int)(intptr_t)cursor_arg, (int)cursor_len, limit,
-        &outcome, &json_ptr, &json_len);
+        (const uint8_t *)prefix, (int)prefix_len,
+        (const uint8_t *)cursor_arg, (int)cursor_len, limit,
+        &outcome, &json, &json_len);
     JS_FreeCString(ctx, prefix);
     if (cursor_buf) JS_FreeCString(ctx, cursor_buf);
     if (rc != 0)
         return throw_tape_error(ctx, "kv", rc);
     if (outcome == 2) {
-        if (json_ptr) free((void *)(intptr_t)json_ptr);
+        free(json);
         return JS_ThrowInternalError(ctx, "kv.prefix: recorded failure");
     }
-    JSValue arr = JS_ParseJSON(ctx, (const char *)(intptr_t)json_ptr,
+    JSValue arr = JS_ParseJSON(ctx, (const char *)json,
                                 (size_t)json_len, "<kv.prefix>");
-    free((void *)(intptr_t)json_ptr);
+    free(json);
     return arr;
 }
 
@@ -416,18 +478,19 @@ static JSModuleDef *jsb_module_loader(JSContext *ctx, const char *module_name,
                                        void *opaque)
 {
     (void)opaque;
-    int src_ptr = 0, src_len = 0;
+    uint8_t *src = NULL;
+    int src_len = 0;
     int rc = _arena_host_module_load(
-        (int)(intptr_t)module_name, (int)strlen(module_name),
-        &src_ptr, &src_len);
+        (const uint8_t *)module_name, (int)strlen(module_name),
+        &src, &src_len);
     if (rc != 0) {
         throw_tape_error(ctx, "module", rc);
         return NULL;
     }
-    JSValue compiled = JS_Eval(ctx, (const char *)(intptr_t)src_ptr,
+    JSValue compiled = JS_Eval(ctx, (const char *)src,
                                 (size_t)src_len, module_name,
                                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free((void *)(intptr_t)src_ptr);
+    free(src);
     if (JS_IsException(compiled))
         return NULL;
     /* The compiled value is a function-wrapper for the module def;

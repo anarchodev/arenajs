@@ -564,15 +564,33 @@ if(QJS_BUILD_EXAMPLES)
     # the qjs_arena_wasm target but with the C host-callback sink instead
     # of Module.host_trace. Native-only: no emscripten host here.
     if(NOT EMSCRIPTEN)
-        add_executable(arena_trace_native
+        # Native reactor + host-binding sources, shared by the examples
+        # below. Compiled with the trace emitter on so the trace sink is
+        # available; the replay sink is unconditional.
+        set(arena_native_host_sources
             ${qjs_sources}
             qjs-arena-reactor.c
             qjs-arena-replay-bindings.c
+        )
+
+        # Output side: drive a script and decode its trace events.
+        add_executable(arena_trace_native
+            ${arena_native_host_sources}
             examples/arena_trace_native.c
         )
         target_include_directories(arena_trace_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_definitions(arena_trace_native PRIVATE ${qjs_defines} ARENA_TRACE_ENABLED=1)
         target_link_libraries(arena_trace_native PRIVATE ${qjs_libs})
+
+        # Input side: replay a recorded request by serving its tapes
+        # (module source + kv reads) through a native arena_replay_host.
+        add_executable(arena_replay_native
+            ${arena_native_host_sources}
+            examples/arena_replay_native.c
+        )
+        target_include_directories(arena_replay_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(arena_replay_native PRIVATE ${qjs_defines} ARENA_TRACE_ENABLED=1)
+        target_link_libraries(arena_replay_native PRIVATE ${qjs_libs})
     endif()
 
     add_library(fib MODULE examples/fib.c)
