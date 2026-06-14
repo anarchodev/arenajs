@@ -40,6 +40,15 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.2.0] - 2026-06-14
+
+Completes the **native host-callback surface**: a native driver (e.g. a
+replay/simulation CLI with no JS host) can now both feed a recorded
+request its inputs and observe its execution, using the same wire formats
+the browser scrubber gets via `Module.tapes` / `Module.host_trace`.
+
 ### Added
 
 - `arena_trace_set_host(on_event, on_state, user)` — native trace sink.
