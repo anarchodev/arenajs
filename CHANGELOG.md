@@ -40,7 +40,48 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- `arena_trace_set_host(on_event, on_state, user)` — native trace sink.
+  In the browser build the trace emitter dispatches to `Module.host_trace`
+  / `Module.host_state`; on a native build (no JS host) it now dispatches
+  to C callbacks the embedder registers here. Same `kind` + payload wire
+  format and same `0`/`1`/`2` return-code contract as the browser host,
+  so a decoder written against `Module.host_trace` works on bytes captured
+  natively. Declared in `qjs-arena-trace.h`, available only when the
+  emitter is compiled in (`-DARENA_TRACE_ENABLED=1`). See the new
+  `examples/arena_trace_native.c` for a complete decoder.
+- `arena_replay_set_host(host, user)` — native replay sink (the input
+  counterpart to the trace sink). In the browser build the replay bindings
+  pull recorded values from `Module.tapes` via EM_JS imports; on a native
+  build they now dispatch each tape read — `kv.get` / `kv.set` /
+  `kv.delete` / `kv.prefix` and the module loader — to an
+  `arena_replay_host` responder the embedder registers. Same outcome /
+  divergence code contract as the browser host. With this plus
+  `arena_trace_set_host`, `arena_set_date_now`, `arena_set_random_seed`,
+  and the existing `arena_*` reactor entry points, a native driver has the
+  complete hook surface to replay (and simulate) a recorded request with
+  no JS host. Declared in `qjs-arena-replay-bindings.h`.
+- `examples/arena_trace_native.c` / `arena_replay_native.c` + the
+  `arena_trace_native` / `arena_replay_native` CMake targets (built under
+  `-DQJS_BUILD_EXAMPLES=ON`): the output side (decode trace events) and the
+  input side (serve module source + kv reads through `arena_replay_host`)
+  of the native hook surface.
+
+### Changed
+
+- The trace-emitter host imports (`_arena_host_trace` / `_arena_host_state`)
+  and the replay host imports (`_arena_host_kv_*`, `_arena_host_module_load`)
+  now take their pointer arguments as real pointers rather than `int`
+  addresses. On wasm32 this is identical on the wire (emscripten marshals
+  each pointer to the same numeric address the `Module.*` host already
+  received), so the browser contract is unchanged. The previous
+  `(int)(intptr_t)` casts truncated 64-bit pointers, which is why native
+  sinks were not previously possible.
+
+⚠ **Contract:** the browser host wire formats (trace `kind`/payload,
+snapshot JSON, return codes; tape outcome/divergence codes) are unchanged
+— this is a MINOR addition of native-only entry points, not a break.
 
 ## [0.1.0] - 2026-05-15
 

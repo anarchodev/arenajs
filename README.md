@@ -244,9 +244,9 @@ of the embedder contract** (see [`CHANGELOG.md`](CHANGELOG.md)).
   under Emscripten with `ARENA_TRACE_ENABLED=1` and
   `-sALLOW_MEMORY_GROWTH=1`. Exposes `arena_init`, `arena_run_module`,
   `arena_set_trace_mode`, `arena_snapshot_here`, the `arena_oom_*`
-  query functions, and `arena_destroy`. The native worker build has
-  the trace machinery compiled out (zero overhead) — scrubbing is a
-  WASM-only surface.
+  query functions, and `arena_destroy`. By default the native worker
+  build has the trace machinery compiled out (zero overhead); it can be
+  turned on for a native build too — see **Native tracing** below.
 - **Trace modes** (`arena_set_trace_mode`): `OFF` (0), `SCAN` (1) —
   `FUNC_ENTER` / `FUNC_EXIT` / `THROW` only, cheap — and `DRILL` (2),
   which adds a `LINE` event on every source-line transition. A
@@ -259,6 +259,82 @@ of the embedder contract** (see [`CHANGELOG.md`](CHANGELOG.md)).
 - **`CursorEngine`** (`tests/wasm/cursor.mjs`) wraps an
   `arena_init`'d module and turns all of the above into a navigable
   timeline.
+
+### Native host surface (replay & tracing without a browser)
+
+The browser scrubber is a *UI*, not the only way to drive replay. Every
+input the WASM build pulls from JS and every event it pushes to JS has a
+native C-callback equivalent, so a native tool (e.g. a CLI in another
+repo) can replay — and simulate — a recorded request with no JS host:
+
+| What the WASM build uses | Native equivalent | Header |
+|---|---|---|
+| `Module.tapes.kv` (get/set/delete/prefix) | `arena_replay_host` responder | `qjs-arena-replay-bindings.h` |
+| `Module.tapes.module` + `module_sources` | `arena_replay_host.module_load` | `qjs-arena-replay-bindings.h` |
+| `Module.host_trace` / `host_state` | `arena_trace_set_host` callbacks | `qjs-arena-trace.h` |
+| (pinned at run start) `Date.now`, PRNG | `arena_set_date_now` / `arena_set_random_seed` | reactor |
+
+Build it (the trace sink needs the emitter compiled in; the replay sink
+is always present):
+
+```sh
+# default: trace machinery compiled out — every patch site folds to a no-op
+cmake -B build
+
+# host surface + the native examples below
+cmake -B build -DARENA_TRACE_ENABLED=1 -DQJS_BUILD_EXAMPLES=ON
+cmake --build build --target arena_replay_native arena_trace_native
+./build/arena_replay_native   # input side: serve tapes
+./build/arena_trace_native    # output side: decode events
+```
+
+`-DARENA_TRACE_ENABLED=1` turns on the per-opcode hooks in `quickjs.c`
+and the emitter in `qjs-arena-trace.c`. (The replay bindings compile
+unconditionally — only the *trace* side is behind the knob.)
+
+**Input — serve the recorded tapes.** Register a responder; the engine
+asks for each `kv` read and module source, the host answers (from a tape,
+or — to *simulate* — with a value the recording didn't contain):
+
+```c
+#include "qjs-arena-replay-bindings.h"
+
+static int kv_get(const uint8_t *key, int key_len, int *outcome,
+                  uint8_t **val, int *val_len, void *user) {
+    // *outcome: 0 ok · 1 not_found (→ null) · 2 err (→ throw)
+    // *val must be malloc()'d; the engine copies then free()s it
+    return 0;   // 0 ok · 1 tape-absent · 2 exhausted · <0 divergence
+}
+arena_replay_host host = { .kv_get = kv_get, /* .module_load = ..., etc. */ };
+arena_replay_set_host(&host, /*user=*/NULL);
+arena_set_date_now(0, 0);
+arena_set_random_seed(seed_lo, seed_hi);
+```
+
+**Output — observe execution.** Where the browser dispatches each event
+to `Module.host_trace`, a native build dispatches to a C callback:
+
+```c
+#include "qjs-arena-trace.h"
+
+static int on_event(int kind, const uint8_t *payload, int len, void *user) {
+    // kind: 0 NAME, 1 FUNC_ENTER, 2 FUNC_EXIT, 3 LINE, 4 THROW
+    // payload: same little-endian wire format as Module.host_trace
+    return 0;   // 0 continue · 1 stop · 2 stop+inspect (→ on_state)
+}
+arena_trace_set_host(on_event, /*on_state=*/NULL, /*user=*/NULL);
+arena_set_trace_mode(2 /* DRILL */);
+arena_run_module("main.js", entry_src);
+```
+
+Wire formats (tape outcome/divergence codes, trace `kind`/payload layout,
+return-code semantics) are identical to the browser host, so decoders and
+tape logic port between the two unchanged. The native sinks
+(`arena_replay_set_host`, `arena_trace_set_host`) are native-only entry
+points — the WASM build uses `Module.tapes` / `Module.host_trace` instead.
+Worked examples:
+[`arena_replay_native.c`](examples/arena_replay_native.c) (input) and
+[`arena_trace_native.c`](examples/arena_trace_native.c) (output).
 
 ### Using the cursor module
 
