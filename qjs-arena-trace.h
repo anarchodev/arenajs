@@ -54,6 +54,48 @@ extern const char ARENA_TRACE_STOP_MSG[];
 void arena_trace_set_mode(int mode);
 void arena_trace_reset(void);             /* clear name-table between runs */
 
+#ifndef __EMSCRIPTEN__
+/* ── native trace sink ─────────────────────────────────────────────────
+ * In the browser build the emitter calls Module.host_trace / host_state
+ * (see qjs-arena-trace.c). A native build has no JS host, so it dispatches
+ * to a C callback the embedder registers here.
+ *
+ * on_event receives, for each structural event, the event `kind` and the
+ * raw little-endian payload bytes — the SAME wire format the browser host
+ * gets via Module.host_trace(kind, ptr, len):
+ *
+ *   kind 0  NAME       [atom u32][len u16][utf8 bytes]   atom→string intern
+ *   kind 1  FUNC_ENTER [name_atom u32][file_atom u32][line u32]
+ *   kind 2  FUNC_EXIT  (no payload)
+ *   kind 3  LINE       [file_atom u32][line u32]         DRILL mode only
+ *   kind 4  THROW      [file_atom u32][line u32][len u16][utf8 message]
+ *
+ * Atoms are interned: a NAME event is emitted once before the first event
+ * that references a given atom, so the host can build an id→string table.
+ *
+ * Return value controls execution, mirroring the browser contract:
+ *   0  continue
+ *   1  stop  (engine raises the stop sentinel; arena_run* returns rc 0)
+ *   2  stop AND inspect (engine walks the live stack, ships a JSON
+ *      snapshot to on_state, then stops)
+ * Any other value is treated as 0.
+ *
+ * on_state receives that JSON stack snapshot (UTF-8, not NUL-terminated —
+ * use the length) when on_event returns 2, or on an explicit
+ * arena_trace_snapshot_here() call. It may be NULL if the host never
+ * returns 2. `user` is passed back to both callbacks unchanged.
+ *
+ * The payload pointer and snapshot bytes are owned by the engine and only
+ * valid for the duration of the call — copy anything you need to keep. */
+typedef int  (*arena_trace_event_fn)(int kind, const uint8_t *payload,
+                                     int len, void *user);
+typedef void (*arena_trace_state_fn)(const uint8_t *payload, int len,
+                                     void *user);
+
+void arena_trace_set_host(arena_trace_event_fn on_event,
+                          arena_trace_state_fn on_state, void *user);
+#endif
+
 /* Walk the live stack and ship the same JSON snapshot host_trace=2
    emits, via _arena_host_state. Unlike host_trace=2, does NOT raise
    the stop sentinel — execution continues. Must be called

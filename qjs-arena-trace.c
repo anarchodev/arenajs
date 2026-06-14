@@ -88,11 +88,21 @@ static uint8_t scratch[SCRATCH_CAP];
      1 — stop (raise sentinel exception, unwind)
      2 — stop AND inspect (walk stack first, ship via host_state,
          then stop)
-   Anything else is treated as "continue". */
+   Anything else is treated as "continue".
+
+   The payload is passed as a real pointer, NOT an `int` address. On
+   wasm32 a pointer is 32 bits so emscripten marshals it to JS as the
+   numeric address verbatim (Module.host_trace still receives a Number).
+   On a 64-bit native build the same call hands the C host the genuine
+   pointer — casting it through `int` at the call site (as the old wasm-
+   only code did) would truncate the high half and hand the callback a
+   garbage address. One signature, both targets. */
+#ifdef __EMSCRIPTEN__
+
 EM_JS(int, _arena_host_trace,
-      (int kind, int payload_ptr, int payload_len), {
+      (int kind, const uint8_t *payload, int payload_len), {
     if (!Module.host_trace) return 0;
-    const r = Module.host_trace(kind, payload_ptr, payload_len);
+    const r = Module.host_trace(kind, payload, payload_len);
     return (r === 1 || r === 2) ? r : 0;
 });
 
@@ -100,9 +110,40 @@ EM_JS(int, _arena_host_trace,
    (each frame: function name, file, line, vars). Host parses with
    JSON.parse and renders. Fires only when host_trace returned 2. */
 EM_JS(void, _arena_host_state,
-      (int payload_ptr, int payload_len), {
-    if (Module.host_state) Module.host_state(payload_ptr, payload_len);
+      (const uint8_t *payload, int payload_len), {
+    if (Module.host_state) Module.host_state(payload, payload_len);
 });
+
+#else  /* native: dispatch to a host-registered C callback */
+
+static arena_trace_event_fn s_event_cb = NULL;
+static arena_trace_state_fn s_state_cb = NULL;
+static void               *s_cb_user   = NULL;
+
+void arena_trace_set_host(arena_trace_event_fn on_event,
+                          arena_trace_state_fn on_state, void *user)
+{
+    s_event_cb = on_event;
+    s_state_cb = on_state;
+    s_cb_user  = user;
+}
+
+/* Mirror the JS shim exactly: no sink installed behaves like a missing
+   Module.host_trace (return 0 = continue), and any return other than
+   1 or 2 is clamped to 0 so a careless host can't wedge execution. */
+static int _arena_host_trace(int kind, const uint8_t *payload, int payload_len)
+{
+    if (!s_event_cb) return 0;
+    int r = s_event_cb(kind, payload, payload_len, s_cb_user);
+    return (r == 1 || r == 2) ? r : 0;
+}
+
+static void _arena_host_state(const uint8_t *payload, int payload_len)
+{
+    if (s_state_cb) s_state_cb(payload, payload_len, s_cb_user);
+}
+
+#endif
 
 /* ── name-table interning ──────────────────────────────────────────── */
 
@@ -135,7 +176,7 @@ static int emit_name(JSContext *ctx, uint32_t atom)
     memcpy(scratch + 4, &slen16, 2);
     memcpy(scratch + 6, s, slen);
     JS_FreeCString(ctx, s);
-    return _arena_host_trace(0, (int)(intptr_t)scratch, (int)(6 + slen));
+    return _arena_host_trace(0, scratch, (int)(6 + slen));
 }
 
 /* Guarantee NAME has been emitted for this atom before emitting an
@@ -421,7 +462,7 @@ static void emit_state(JSContext *ctx,
     jb_ch(&j, ']');
 
     if (!j.err)
-        _arena_host_state((int)(intptr_t)j.buf, (int)j.len);
+        _arena_host_state((const uint8_t *)j.buf, (int)j.len);
     free(j.buf);
 
     /* emit_state must NEVER leave a pending exception on the context.
@@ -514,7 +555,7 @@ void arena_trace_func_enter(JSContext *ctx, struct JSFunctionBytecode *b)
     memcpy(scratch + 4, &file_atom, 4);
     uint32_t line32 = (uint32_t)line;
     memcpy(scratch + 8, &line32, 4);
-    stop = merge_stop(stop, _arena_host_trace(1, (int)(intptr_t)scratch, 12));
+    stop = merge_stop(stop, _arena_host_trace(1, scratch, 12));
     s_active_ctx = NULL; s_active_b = NULL; s_active_pc = NULL;
 
     /* New frame — reset line tracker so first LINE event in this frame
@@ -529,7 +570,7 @@ void arena_trace_func_exit(JSContext *ctx)
 {
     if (arena_trace_mode == ARENA_TRACE_OFF || s_bail_armed) return;
     s_active_ctx = ctx; s_active_b = NULL; s_active_pc = NULL;
-    int stop = _arena_host_trace(2, (int)(intptr_t)scratch, 0);
+    int stop = _arena_host_trace(2, scratch, 0);
     s_active_ctx = NULL;
     last_line_emitted = -1;
     last_file_atom = 0;
@@ -554,7 +595,7 @@ void arena_trace_check_line(JSContext *ctx,
     memcpy(scratch + 0, &file_atom, 4);
     uint32_t line32 = (uint32_t)line;
     memcpy(scratch + 4, &line32, 4);
-    stop = merge_stop(stop, _arena_host_trace(3, (int)(intptr_t)scratch, 8));
+    stop = merge_stop(stop, _arena_host_trace(3, scratch, 8));
     s_active_ctx = NULL; s_active_b = NULL; s_active_pc = NULL;
     handle_stop_code(ctx, stop, b, pc);
 }
@@ -585,7 +626,7 @@ void arena_trace_op_throw(JSContext *ctx,
     memcpy(scratch + 8, &mlen16, 2);
     if (msg) memcpy(scratch + 10, msg, mlen);
     if (msg) JS_FreeCString(ctx, msg);
-    stop = merge_stop(stop, _arena_host_trace(4, (int)(intptr_t)scratch, (int)(10 + mlen)));
+    stop = merge_stop(stop, _arena_host_trace(4, scratch, (int)(10 + mlen)));
     s_active_ctx = NULL; s_active_b = NULL; s_active_pc = NULL;
     handle_stop_code(ctx, stop, b, pc);
 }

@@ -40,7 +40,34 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- `arena_trace_set_host(on_event, on_state, user)` — native trace sink.
+  In the browser build the trace emitter dispatches to `Module.host_trace`
+  / `Module.host_state`; on a native build (no JS host) it now dispatches
+  to C callbacks the embedder registers here. Same `kind` + payload wire
+  format and same `0`/`1`/`2` return-code contract as the browser host,
+  so a decoder written against `Module.host_trace` works on bytes captured
+  natively. Declared in `qjs-arena-trace.h`, available only when the
+  emitter is compiled in (`-DARENA_TRACE_ENABLED=1`). See the new
+  `examples/arena_trace_native.c` for a complete decoder.
+- `examples/arena_trace_native.c` + the `arena_trace_native` CMake target
+  (built under `-DQJS_BUILD_EXAMPLES=ON`): drives the reactor natively and
+  prints decoded structural events through `arena_trace_set_host`.
+
+### Changed
+
+- The trace-emitter host imports (`_arena_host_trace` / `_arena_host_state`)
+  now take the payload as a real pointer rather than an `int` address. On
+  wasm32 this is identical on the wire (emscripten marshals the pointer to
+  the same numeric address `Module.host_trace` already received), so the
+  browser contract is unchanged. The previous `(int)(intptr_t)` cast at the
+  emit sites truncated 64-bit pointers, which is why a native trace sink
+  was not previously possible.
+
+⚠ **Contract:** the browser host wire format (`kind`, payload bytes,
+snapshot JSON, return codes) is unchanged — this is a MINOR addition of a
+native-only entry point, not a break.
 
 ## [0.1.0] - 2026-05-15
 

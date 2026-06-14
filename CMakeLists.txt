@@ -32,6 +32,13 @@ xoption(BUILD_SHARED_LIBS "Build a shared library" OFF)
 xoption(QJS_ENABLE_INSTALL "Enable quickjs installation" ON)
 xoption(QJS_BUILD_WERROR "Build with -Werror" OFF)
 xoption(QJS_BUILD_EXAMPLES "Build examples" OFF)
+# Compile the structural trace emitter into every target (incl. the native
+# libqjs). OFF by default: every trace patch site in quickjs.c folds to a
+# no-op, so the default native worker pays nothing. ON wires up the emitter
+# and the native arena_trace_set_host() sink — see README "Native tracing".
+# (The qjs_arena_wasm and arena_trace_native targets force this on for
+# themselves regardless of this global option.)
+xoption(ARENA_TRACE_ENABLED "Compile the trace emitter into all targets" OFF)
 xoption(QJS_BUILD_CLI_STATIC "Build a static qjs executable" OFF)
 xoption(QJS_BUILD_CLI_WITH_MIMALLOC "Build the qjs executable with mimalloc" OFF)
 xoption(QJS_BUILD_CLI_WITH_STATIC_MIMALLOC "Build the qjs executable with mimalloc (statically linked)" OFF)
@@ -549,6 +556,24 @@ if(QJS_BUILD_EXAMPLES)
     target_include_directories(hello_module PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_definitions(hello_module PRIVATE ${qjs_defines})
     target_link_libraries(hello_module PRIVATE qjs)
+
+    # Native trace example. The trace emitter is OFF in libqjs (default
+    # ARENA_TRACE_ENABLED=0 → every patch site in quickjs.c folds to a
+    # no-op), so this can't link libqjs — it recompiles the core sources +
+    # reactor + replay bindings with ARENA_TRACE_ENABLED=1, exactly like
+    # the qjs_arena_wasm target but with the C host-callback sink instead
+    # of Module.host_trace. Native-only: no emscripten host here.
+    if(NOT EMSCRIPTEN)
+        add_executable(arena_trace_native
+            ${qjs_sources}
+            qjs-arena-reactor.c
+            qjs-arena-replay-bindings.c
+            examples/arena_trace_native.c
+        )
+        target_include_directories(arena_trace_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(arena_trace_native PRIVATE ${qjs_defines} ARENA_TRACE_ENABLED=1)
+        target_link_libraries(arena_trace_native PRIVATE ${qjs_libs})
+    endif()
 
     add_library(fib MODULE examples/fib.c)
     set_target_properties(fib PROPERTIES

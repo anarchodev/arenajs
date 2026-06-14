@@ -244,9 +244,9 @@ of the embedder contract** (see [`CHANGELOG.md`](CHANGELOG.md)).
   under Emscripten with `ARENA_TRACE_ENABLED=1` and
   `-sALLOW_MEMORY_GROWTH=1`. Exposes `arena_init`, `arena_run_module`,
   `arena_set_trace_mode`, `arena_snapshot_here`, the `arena_oom_*`
-  query functions, and `arena_destroy`. The native worker build has
-  the trace machinery compiled out (zero overhead) — scrubbing is a
-  WASM-only surface.
+  query functions, and `arena_destroy`. By default the native worker
+  build has the trace machinery compiled out (zero overhead); it can be
+  turned on for a native build too — see **Native tracing** below.
 - **Trace modes** (`arena_set_trace_mode`): `OFF` (0), `SCAN` (1) —
   `FUNC_ENTER` / `FUNC_EXIT` / `THROW` only, cheap — and `DRILL` (2),
   which adds a `LINE` event on every source-line transition. A
@@ -259,6 +259,49 @@ of the embedder contract** (see [`CHANGELOG.md`](CHANGELOG.md)).
 - **`CursorEngine`** (`tests/wasm/cursor.mjs`) wraps an
   `arena_init`'d module and turns all of the above into a navigable
   timeline.
+
+### Native tracing
+
+The same emitter runs in a native build — the scrubber is a browser
+*UI*, not a WASM-only *capability*. The trace machinery is gated behind
+a compile-time knob so the default native worker pays nothing for it:
+
+```sh
+# default: trace machinery compiled out — every patch site folds to a no-op
+cmake -B build
+
+# tracing compiled in (and the native example below)
+cmake -B build -DARENA_TRACE_ENABLED=1 -DQJS_BUILD_EXAMPLES=ON
+cmake --build build --target arena_trace_native
+./build/arena_trace_native
+```
+
+`-DARENA_TRACE_ENABLED=1` turns on the per-opcode hooks in `quickjs.c`
+and the emitter in `qjs-arena-trace.c`. Where the browser dispatches each
+event to `Module.host_trace`, a native build dispatches to a C callback
+the embedder registers:
+
+```c
+#include "qjs-arena-trace.h"
+
+static int on_event(int kind, const uint8_t *payload, int len, void *user) {
+    // kind: 0 NAME, 1 FUNC_ENTER, 2 FUNC_EXIT, 3 LINE, 4 THROW
+    // payload: same little-endian wire format as Module.host_trace
+    return 0;   // 0 continue · 1 stop · 2 stop+inspect (→ on_state)
+}
+arena_trace_set_host(on_event, /*on_state=*/NULL, /*user=*/NULL);
+arena_set_trace_mode(2 /* DRILL */);
+arena_run_module("main.js", src);
+```
+
+The `kind` values, payload layout, and return-code semantics are
+identical to the browser host, so a decoder written against
+`Module.host_trace` consumes natively-captured bytes unchanged.
+[`examples/arena_trace_native.c`](examples/arena_trace_native.c) is a
+complete decoder — it interns NAME events and pretty-prints the call
+tree. Note `arena_trace_set_host` exists only when the emitter is
+compiled in; it is a native-only entry point (the WASM build uses
+`Module.host_trace` instead).
 
 ### Using the cursor module
 
