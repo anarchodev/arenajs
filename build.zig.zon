@@ -1,6 +1,6 @@
 .{
     .name = .arenajs,
-    .version = "0.2.0",
+    .version = "0.2.1",
     .fingerprint = 0x63674e5469b18241,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{},
@@ -13,6 +13,12 @@
         "libregexp.c",
         "libunicode.c",
         "dtoa.c",
+        // Native replay/trace host TUs — compiled (with ARENA_TRACE_ENABLED=1)
+        // into the `arenajs-replay` artifact for native replay/simulation
+        // embedders (see build.zig). The browser path builds them via CMake.
+        "qjs-arena-reactor.c",
+        "qjs-arena-replay-bindings.c",
+        "qjs-arena-trace.c",
         // All root headers (every transitive include is flat at root).
         "builtin-array-fromasync.h",
         "builtin-iterator-zip-keyed.h",

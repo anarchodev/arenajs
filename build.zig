@@ -9,6 +9,17 @@
 //! my_mod.linkLibrary(dep.artifact("arenajs"));
 //! ```
 //!
+//! Two artifacts are installed:
+//!   - `arenajs`        — the worker engine: the 5 runtime TUs, trace OFF, no
+//!                        reactor/replay host (zero per-opcode trace cost).
+//!   - `arenajs-replay` — the native replay/simulation engine: the same TUs +
+//!                        the reactor + replay-bindings + trace sink, compiled
+//!                        with ARENA_TRACE_ENABLED=1 (mirrors the browser
+//!                        `qjs_arena_wasm` CMake target). A native embedder
+//!                        (`arena_init`/`arena_run_module`/`arena_replay_set_host`
+//!                        /`arena_trace_set_host`) links THIS one instead.
+//! Never link both into one binary (duplicate quickjs symbols) — pick per use.
+//!
 //! The C flags below MUST match how consumers historically compiled
 //! these sources — the arena base-snapshot freeze is sensitive to build
 //! settings, so changing them can corrupt the frozen snapshot.
@@ -25,6 +36,15 @@ const sources = [_][]const u8{
     "dtoa.c",
 };
 
+// `arenajs-replay` = the runtime TUs + the native host surface (trace emitter +
+// reactor + replay tape responders). Mirrors the browser `qjs_arena_wasm`
+// CMake target's source set.
+const replay_sources = sources ++ [_][]const u8{
+    "qjs-arena-trace.c",
+    "qjs-arena-reactor.c",
+    "qjs-arena-replay-bindings.c",
+};
+
 const cflags = [_][]const u8{
     "-std=c11",
     "-D_GNU_SOURCE",
@@ -39,10 +59,26 @@ const cflags = [_][]const u8{
     "-fno-sanitize=undefined",
 };
 
+// The replay engine wires the trace patch sites in quickjs.c; the worker engine
+// leaves them folded out (ARENA_TRACE_ENABLED defaults to 0).
+const replay_cflags = cflags ++ [_][]const u8{"-DARENA_TRACE_ENABLED=1"};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    b.installArtifact(arenaLib(b, target, optimize, "arenajs", &sources, &cflags));
+    b.installArtifact(arenaLib(b, target, optimize, "arenajs-replay", &replay_sources, &replay_cflags));
+}
+
+fn arenaLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    name: []const u8,
+    files: []const []const u8,
+    flags: []const []const u8,
+) *std.Build.Step.Compile {
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -51,12 +87,6 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("m", .{});
     mod.linkSystemLibrary("pthread", .{});
     mod.addIncludePath(b.path("."));
-    mod.addCSourceFiles(.{ .files = &sources, .flags = &cflags });
-
-    const lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "arenajs",
-        .root_module = mod,
-    });
-    b.installArtifact(lib);
+    mod.addCSourceFiles(.{ .files = files, .flags = flags });
+    return b.addLibrary(.{ .linkage = .static, .name = name, .root_module = mod });
 }
