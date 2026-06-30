@@ -29,6 +29,9 @@
    never profile arena pages). The thermometer (mprotect+SIGSEGV based) is
    compiled out entirely; the arena buffer uses aligned_alloc instead of mmap
    since page alignment was only ever a thermometer requirement. */
+#if defined(_WIN32)
+#include <malloc.h>   /* _aligned_malloc / _aligned_free; mingw has no aligned_alloc */
+#endif
 #else
 #include <signal.h>
 #include <sys/mman.h>
@@ -125,7 +128,11 @@ static int arena_init(JSArena *a, size_t capacity)
     capacity = (capacity + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
     if (capacity < ARENA_PREFIX_LEN + ARENA_HEADER_SIZE + ARENA_ALIGN)
         return -1;
+#if defined(_WIN32)
+    void *buf = _aligned_malloc(capacity, ARENA_ALIGN); /* mingw: (size, align), no aligned_alloc */
+#else
     void *buf = aligned_alloc(ARENA_ALIGN, capacity);
+#endif
     if (!buf)
         return -1;
     memset(buf, 0, capacity);
@@ -157,7 +164,11 @@ static void arena_destroy(JSArena *a)
 {
     if (a->buf) {
 #if defined(__wasm__) || defined(ARENA_NO_THERM)
+#if defined(_WIN32)
+        _aligned_free(a->buf);
+#else
         free(a->buf);
+#endif
 #else
         munmap(a->buf, a->capacity);
 #endif
