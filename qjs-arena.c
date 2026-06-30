@@ -29,10 +29,15 @@
    uses aligned_alloc instead of mmap since page alignment was only ever
    a thermometer requirement. */
 #else
-#include <execinfo.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+/* backtrace()/backtrace_symbols_fd() are a glibc extension (execinfo.h); musl
+   has no equivalent. The thermometer itself (mprotect+SIGSEGV) works on musl —
+   only the optional, off-by-default symbolized backtrace is glibc-gated below. */
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#endif
 #endif
 
 #define ARENA_ALIGN          16
@@ -564,14 +569,16 @@ static void therm_sigsegv(int sig, siginfo_t *info, void *ctx)
     }
 
     if (therm_trace_lo && addr >= therm_trace_lo && addr < therm_trace_hi) {
-        void *frames[16];
-        int nframes = backtrace(frames, 16);
         char header[128];
         int hlen = snprintf(header, sizeof(header),
                             "[therm] fault at base+%zu (addr=%p)\n",
                             addr - (uintptr_t)s->lo, (void *)addr);
         write(2, header, (size_t)hlen);
+#if defined(__GLIBC__)
+        void *frames[16];
+        int nframes = backtrace(frames, 16);
         backtrace_symbols_fd(frames, nframes, 2);
+#endif
     }
 
     void *page_addr = (void *)((uintptr_t)s->lo + page_idx * (size_t)therm_page_size);
