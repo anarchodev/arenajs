@@ -23,11 +23,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__wasm__)
-/* WASM has no signals, no page protection, no backtrace. The thermometer
-   (mprotect+SIGSEGV based) is compiled out entirely; the arena buffer
-   uses aligned_alloc instead of mmap since page alignment was only ever
-   a thermometer requirement. */
+#if defined(__wasm__) || defined(ARENA_NO_THERM)
+/* No thermometer path: either WASM (no signals/page-protection/backtrace) or
+   an explicit ARENA_NO_THERM opt-out (e.g. the rewind CLI / Windows, which
+   never profile arena pages). The thermometer (mprotect+SIGSEGV based) is
+   compiled out entirely; the arena buffer uses aligned_alloc instead of mmap
+   since page alignment was only ever a thermometer requirement. */
 #else
 #include <signal.h>
 #include <sys/mman.h>
@@ -118,7 +119,7 @@ static int arena_init(JSArena *a, size_t capacity)
 {
     if (capacity == 0)
         capacity = ARENA_DEFAULT_SIZE;
-#if defined(__wasm__)
+#if defined(__wasm__) || defined(ARENA_NO_THERM)
     /* No mprotect on WASM, so the buffer doesn't need page-aligned starts.
        Round capacity to ARENA_ALIGN and grab a 16-byte-aligned block. */
     capacity = (capacity + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
@@ -155,7 +156,7 @@ static int arena_init(JSArena *a, size_t capacity)
 static void arena_destroy(JSArena *a)
 {
     if (a->buf) {
-#if defined(__wasm__)
+#if defined(__wasm__) || defined(ARENA_NO_THERM)
         free(a->buf);
 #else
         munmap(a->buf, a->capacity);
@@ -490,7 +491,7 @@ void JS_ResetRequestArena(JSRuntime *rt)
  * callers see "not supported" cleanly.
  */
 
-#if !defined(__wasm__)
+#if !defined(__wasm__) && !defined(ARENA_NO_THERM)
 
 struct therm_state {
     const uint8_t *lo;

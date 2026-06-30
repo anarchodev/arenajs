@@ -60,8 +60,12 @@ const cflags = [_][]const u8{
 };
 
 // The replay engine wires the trace patch sites in quickjs.c; the worker engine
-// leaves them folded out (ARENA_TRACE_ENABLED defaults to 0).
-const replay_cflags = cflags ++ [_][]const u8{"-DARENA_TRACE_ENABLED=1"};
+// leaves them folded out (ARENA_TRACE_ENABLED defaults to 0). The replay engine
+// also opts out of the thermometer (ARENA_NO_THERM): the page-dirtiness profiler
+// is a worker-side dev tool, never used by replay/simulation embedders (the
+// rewind CLI), and dropping it removes the POSIX mmap/signal dependency so the
+// replay engine cross-compiles to musl and Windows.
+const replay_cflags = cflags ++ [_][]const u8{ "-DARENA_TRACE_ENABLED=1", "-DARENA_NO_THERM=1" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
