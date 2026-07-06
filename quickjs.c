@@ -52686,6 +52686,29 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
     js_free_rt(rt, wr);
 }
 
+/* arena: records of a base-resident (snapshot) Map/Set are immortal.
+   The iteration protocol's lock refcounts (ref_count++ while a record
+   is the iterator's current element / forEach's locked element, decref
+   after) exist so a record deleted mid-iteration outlives its zombie —
+   but snapshot collections are immutable post-freeze (the mutators
+   below throw), so a base record can never be deleted mid-iteration
+   and needs no lock. Skipping the lock keeps iteration of snapshot
+   collections at zero base writes. */
+static inline bool js_map_record_is_base(JSRuntime *rt, const JSMapRecord *mr)
+{
+    return rt->is_arena && js_arena_ptr_is_base(mr);
+}
+
+/* arena: mutating a snapshot collection would need shadow-on-write for
+   the record list and hash table; until an embedder needs that, throw.
+   Handlers that need a mutable copy: `new Map(snapshotMap)` (reads
+   only). */
+static bool js_map_is_immutable_base(JSContext *ctx, JSValueConst this_val)
+{
+    return ctx->rt->is_arena
+        && js_arena_ptr_is_base(JS_VALUE_GET_OBJ(this_val));
+}
+
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
 {
     if (mr->empty)
@@ -52711,6 +52734,8 @@ static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
 
 static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
 {
+    if (js_map_record_is_base(rt, mr))
+        return; /* immortal; never locked (see js_map_record_is_base) */
     if (--mr->ref_count == 0) {
         /* the record can be safely removed */
         assert(mr->empty);
@@ -52729,6 +52754,8 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     is_set = (magic & MAGIC_SET);
     key = map_normalize_key_const(ctx, argv[0]);
     if (s->is_weak && !is_valid_weakref_target(key))
@@ -52776,6 +52803,8 @@ static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
     JSValueConst key;
     JSValue value;
 
+    if (s && js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     if (!s)
         return JS_EXCEPTION;
     if (computed && check_function(ctx, argv[1]))
@@ -52828,6 +52857,8 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     key = map_normalize_key_const(ctx, argv[0]);
     mr = map_find_record(ctx, s, key);
     if (!mr)
@@ -52845,6 +52876,8 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     list_for_each_safe(el, el1, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         map_delete_record(ctx->rt, s, mr);
@@ -52884,7 +52917,8 @@ static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
     while (el != &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         if (!mr->empty) {
-            mr->ref_count++;
+            if (!js_map_record_is_base(ctx->rt, mr))
+                mr->ref_count++;
             /* must duplicate in case the record is deleted */
             args[1] = js_dup(mr->key);
             if (magic)
@@ -53153,7 +53187,8 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     }
 
     /* lock the record so that it won't be freed */
-    mr->ref_count++;
+    if (!js_map_record_is_base(ctx->rt, mr))
+        mr->ref_count++;
     it->cur_record = mr;
     *pdone = false;
 

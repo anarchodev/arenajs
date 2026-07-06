@@ -58,6 +58,20 @@ safe consumer pattern spelled out.
 
 ### Fixed
 
+- **⚠ Contract** — closed the last known inviolate-base hole:
+  iterating a Map/Set that lives in the snapshot wrote the iteration
+  lock refcounts into base-resident map records (invisible to test262,
+  which only builds request-side collections). Snapshot collections
+  are now **readable and iterable forever, immutable after freeze**:
+  the record-lock refcounts are skipped for base records (sound —
+  immutability means no mid-iteration deletion to protect against),
+  and every mutator (`set`/`add`/`delete`/`clear`/`getOrInsert`, all
+  four collection classes) throws
+  `TypeError: snapshot collection is immutable` on a base receiver.
+  Handlers needing a mutable copy: `new Map(snapshotMap)` (reads
+  only). arena-smoke asserts iteration + reads + copy at zero base
+  pages and all mutators throwing.
+
 - The WASM reactor ran **unseeded** after a host `arena_set_random_seed`:
   the seed landed in `JSRequestState` (relocated there for Math.random
   base-cleanliness), but `arena_run` / `arena_run_module` reset the
