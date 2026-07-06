@@ -2240,7 +2240,12 @@ int JS_RelocateReqState(JSRuntime *rt)
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
-    rt->req = new_req;
+    /* Same-value store guard: on reset new_req == rt->req (asserted
+       above), and skipping the store keeps reset at zero base writes —
+       an unconditional store dirties the JSRuntime page every reset,
+       which materializes a CoW page and pollutes the thermometer. */
+    if (rt->req != new_req)
+        rt->req = new_req;
     return 0;
 }
 
