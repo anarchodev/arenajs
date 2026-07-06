@@ -26,11 +26,12 @@
 
 const std = @import("std");
 
-// The five translation units that make up the runtime. The remaining
+// The six translation units that make up the runtime. The remaining
 // root `.c` files are tests/benches/examples and are not part of the lib.
 const sources = [_][]const u8{
     "quickjs.c",
     "qjs-arena.c",
+    "qjs-dlmalloc.c",
     "libregexp.c",
     "libunicode.c",
     "dtoa.c",

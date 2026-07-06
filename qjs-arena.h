@@ -1,19 +1,24 @@
 /*
- * QuickJS dual bump-arena allocator
+ * QuickJS dual-region allocator: bump base, reclaiming request heap
  *
- * Two-arena model for request-scoped JS execution:
- *   - base arena: holds the snapshot (runtime, prelude, prototypes); never reset.
- *   - request arena: holds per-request allocations; reset between requests.
+ * Two-region model for request-scoped JS execution:
+ *   - base region: bump arena holding the snapshot (runtime, prelude,
+ *     prototypes); built pre-freeze, never written again, never reset.
+ *   - request region: a dlmalloc mspace confined to a fixed buffer.
+ *     js_free actually reclaims, so refcount-zero objects return their
+ *     memory mid-request (hybrid-gc branch; the master branch bump
+ *     allocator's ceiling was cumulative allocation, this one's is peak
+ *     live set).
  *
- * Each arena owns a single contiguous buffer of fixed capacity, sized at
+ * Each region owns a single contiguous buffer of fixed capacity, sized at
  * js_dual_arena_new() time. Allocations beyond capacity return NULL (which
- * propagates as JS OOM); the buffer never grows.
+ * propagates as JS OOM); neither buffer ever grows.
  *
- * The active arena is selected by a mode flag flipped via js_dual_arena_freeze().
- * Allocations are bump-pointer; js_free is a no-op; js_realloc extends in place
- * when the buffer is the most recent allocation, otherwise copies. Reset of
- * the request arena is one store: the bump cursor lives at offset 0 inside
- * the buffer.
+ * The active region is selected by a mode flag flipped via
+ * js_dual_arena_freeze(), which also creates the mspace over the request
+ * buffer. Reset stays O(1): stomp a fresh mspace header over the same
+ * (dirty) buffer — all allocator state lives inside it, so every prior
+ * allocation is forgotten in constant time and pages stay resident.
  */
 #ifndef QUICKJS_ARENA_H
 #define QUICKJS_ARENA_H
@@ -97,6 +102,27 @@ static inline bool js_arena_ptr_is_base(const void *p)
  * -1 if the per-thread range table is full (raise JS_ARENA_RANGES_MAX). */
 JS_EXTERN int  js_arena_register_base(const uint8_t *lo, const uint8_t *hi);
 JS_EXTERN void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi);
+
+/* Same registry pattern for request-region ranges (the dlmalloc mspace
+ * backing buffers). Needed because js_malloc_usable_size receives only
+ * the pointer — no opaque — and must dispatch between mspace chunks
+ * (mspace_usable_size) and bump-header allocations (base arena and all
+ * pre-freeze pointers). Registered at freeze alongside the base range. */
+extern __thread struct js_arena_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
+extern __thread int                   js_arena_req_range_count;
+
+static inline bool js_arena_ptr_is_request(const void *p)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    for (int i = 0; i < js_arena_req_range_count; i++) {
+        if (b >= js_arena_req_ranges[i].lo && b < js_arena_req_ranges[i].hi)
+            return true;
+    }
+    return false;
+}
+
+JS_EXTERN int  js_arena_register_request(const uint8_t *lo, const uint8_t *hi);
+JS_EXTERN void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi);
 
 /* JSMallocFunctions table; pass &js_dual_arena_malloc_funcs to JS_NewRuntime2
    together with a JSDualArena* as the opaque parameter. */

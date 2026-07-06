@@ -89,6 +89,30 @@ safe consumer pattern spelled out.
   the vanilla constant-stack discipline, rebuilt in request memory with
   zero base writes. Also a prerequisite for enabling the cycle
   collector on the hybrid-gc branch.
+### Changed
+
+- **⚠ Contract** (hybrid-gc branch) — the request region is now a
+  reclaiming dlmalloc mspace instead of a bump arena. `js_free`
+  actually frees post-freeze, so refcount-zero objects return their
+  memory mid-request: the per-request allocation ceiling is now **peak
+  live set (plus fragmentation)**, not cumulative allocation. Handlers
+  that previously OOM'd on churn (large `JSON.parse` + transform
+  pipelines) now run to completion in the same region size.
+  Consumer notes:
+  - `js_dual_arena_request_used()` now reports **live** bytes (it
+    previously reported cumulative bump usage); it can go down.
+  - `js_dual_arena_oom_used()` at a refusal likewise means live bytes —
+    an OOM is now a genuine sizing signal rather than a churn artefact.
+    `js_dual_arena_oom_limit()` reports full buffer capacity (it
+    previously excluded the 16-byte cursor prefix).
+  - Reset is still O(1) (fresh mspace header stomped over the dirty
+    buffer; nothing freed or purged) and the "first post-reset
+    allocation lands at the same address" invariant still holds —
+    dlmalloc is deterministic for a fixed call sequence, and
+    `JS_RelocateReqState` still aborts if that ever drifts.
+  - New TU `qjs-dlmalloc.c` (vendored `dlmalloc.c` 2.8.6, unmodified)
+    joins the runtime source set; static-linking embedders that list
+    TUs explicitly must add it.
 
 ## [0.2.0] - 2026-06-14
 

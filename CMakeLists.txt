@@ -275,6 +275,7 @@ set(qjs_sources
     libregexp.c
     libunicode.c
     qjs-arena.c
+    qjs-dlmalloc.c
     qjs-arena-trace.c
     quickjs.c
 )

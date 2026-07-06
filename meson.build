@@ -138,6 +138,7 @@ qjs_srcs = files(
   'libregexp.c',
   'libunicode.c',
   'qjs-arena.c',
+  'qjs-dlmalloc.c',
   'quickjs.c',
 )
 qjs_hdrs = files(

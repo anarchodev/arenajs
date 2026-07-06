@@ -1,21 +1,28 @@
 /*
- * QuickJS dual bump-arena allocator implementation.
+ * QuickJS dual-region allocator implementation.
  *
- * Each arena owns a single contiguous buffer of fixed capacity. Allocations
- * never spill across arenas and never grow the buffer; an alloc beyond
- * capacity returns NULL (which propagates as JS OOM).
- *
- * Buffer layout:
+ * Base region: bump arena, unchanged from the master branch. Buffer layout:
  *   bytes  0..8  : bump cursor (size_t)
  *   bytes  8..16 : padding, keeps payload 16-byte aligned
  *   bytes 16..   : allocations, each [ 8B size ][ 8B pad ][ payload ... ]
- *
  * The cursor lives INSIDE the buffer (not in JSArena) so that a future
  * snapshot/restore step can memcpy the buffer and have the cursor relocate
- * automatically — same trick as ~/src/rove/src/qjs/snap.zig. Reset is one
- * store: write ARENA_PREFIX_LEN to the first 8 bytes.
+ * automatically — same trick as ~/src/rove/src/qjs/snap.zig.
+ *
+ * Request region (hybrid-gc): a dlmalloc mspace created over the request
+ * buffer at freeze time. HAVE_MMAP=0 + HAVE_MORECORE=0 confine it to the
+ * buffer, so exhaustion returns NULL exactly like the bump ceiling did —
+ * but js_free reclaims, so the ceiling is peak live set, not cumulative
+ * allocation. Reset stays O(1): create_mspace_with_base over the same
+ * dirty buffer stomps a fresh header and forgets every allocation; no
+ * frees, no purge, pages stay resident. Determinism note: dlmalloc is
+ * deterministic for a fixed call sequence over a fixed base, so the
+ * "JSRequestState lands at the same address after every reset" invariant
+ * (asserted in JS_RelocateReqState) holds just as it did for the bump
+ * cursor.
  */
 #include "qjs-arena.h"
+#include "qjs-dlmalloc.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -73,14 +80,20 @@ typedef struct {
 
 struct JSDualArena {
     JSArena base;
-    JSArena request;
+    JSArena request;            /* buf/capacity double as the mspace backing */
     JSArenaMode mode;
     JSArenaOOM  oom;
+    mspace msp;                 /* NULL until freeze; recreated on reset */
+    size_t request_used;        /* live bytes (usable_size sums) in the mspace */
 };
 
 /* Per-thread list of registered arena base ranges; see qjs-arena.h. */
 __thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
 __thread int                   js_arena_range_count = 0;
+
+/* Per-thread list of registered request (mspace) ranges; see qjs-arena.h. */
+__thread struct js_arena_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
+__thread int                   js_arena_req_range_count = 0;
 
 int js_arena_register_base(const uint8_t *lo, const uint8_t *hi)
 {
@@ -101,6 +114,29 @@ void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi)
             js_arena_ranges[i] = js_arena_ranges[js_arena_range_count];
             js_arena_ranges[js_arena_range_count].lo = NULL;
             js_arena_ranges[js_arena_range_count].hi = NULL;
+            return;
+        }
+    }
+}
+
+int js_arena_register_request(const uint8_t *lo, const uint8_t *hi)
+{
+    if (js_arena_req_range_count >= JS_ARENA_RANGES_MAX)
+        return -1;
+    js_arena_req_ranges[js_arena_req_range_count].lo = lo;
+    js_arena_req_ranges[js_arena_req_range_count].hi = hi;
+    js_arena_req_range_count++;
+    return 0;
+}
+
+void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi)
+{
+    for (int i = 0; i < js_arena_req_range_count; i++) {
+        if (js_arena_req_ranges[i].lo == lo && js_arena_req_ranges[i].hi == hi) {
+            js_arena_req_range_count--;
+            js_arena_req_ranges[i] = js_arena_req_ranges[js_arena_req_range_count];
+            js_arena_req_ranges[js_arena_req_range_count].lo = NULL;
+            js_arena_req_ranges[js_arena_req_range_count].hi = NULL;
             return;
         }
     }
@@ -287,9 +323,13 @@ void js_dual_arena_free(JSDualArena *da)
        tearing down — otherwise the SIGSEGV handler stays installed pointing
        into munmap'd memory. */
     js_arena_thermometer_disable_range(lo, hi);
-    /* Drop this arena's range from the per-thread list so a stale
-       check after teardown doesn't read freed memory. */
+    /* Drop this arena's ranges from the per-thread lists so a stale
+       check after teardown doesn't read freed memory. No destroy_mspace:
+       the mspace's only segment is our buffer (EXTERN_BIT), reclaimed by
+       arena_destroy below. */
     js_arena_unregister_base(lo, hi);
+    js_arena_unregister_request(da->request.buf,
+                                da->request.buf + da->request.capacity);
     arena_destroy(&da->base);
     arena_destroy(&da->request);
     free(da);
@@ -298,12 +338,30 @@ void js_dual_arena_free(JSDualArena *da)
 void js_dual_arena_freeze(JSDualArena *da)
 {
     da->mode = JS_ARENA_MODE_REQUEST;
+    /* The request buffer becomes a dlmalloc mspace. The bump cursor that
+       arena_init wrote at offset 0 is dead from here on; the mspace
+       header overwrites it. */
+    da->msp = create_mspace_with_base(da->request.buf, da->request.capacity, 0);
+    assert(da->msp); /* fails only if capacity is absurdly small */
+    da->request_used = 0;
     js_arena_register_base(da->base.buf, da->base.buf + da->base.capacity);
+    js_arena_register_request(da->request.buf,
+                              da->request.buf + da->request.capacity);
 }
 
 void js_dual_arena_reset_request(JSDualArena *da)
 {
-    arena_reset(&da->request);
+    if (da->msp) {
+        /* O(1) reset: stomp a fresh mspace header over the dirty buffer.
+           All allocator state lives inside the buffer, so this forgets
+           every allocation without freeing, purging, or unmapping —
+           the mspace analogue of the bump-cursor rewind. */
+        da->msp = create_mspace_with_base(da->request.buf,
+                                          da->request.capacity, 0);
+        da->request_used = 0;
+    } else {
+        arena_reset(&da->request); /* pre-freeze reset: still a bump region */
+    }
     da->oom.hit = 0;
     da->oom.requested = 0;
     da->oom.used = 0;
@@ -319,8 +377,11 @@ static void note_oom(JSDualArena *da, size_t requested)
         return;
     da->oom.hit = 1;
     da->oom.requested = requested;
-    da->oom.used = arena_cursor(&da->request) - ARENA_PREFIX_LEN;
-    da->oom.limit = da->request.capacity - ARENA_PREFIX_LEN;
+    /* `used` is live bytes, not cumulative — with the reclaiming mspace a
+       refusal means the PEAK LIVE SET (plus fragmentation) hit capacity,
+       which is a genuine sizing signal rather than a churn artefact. */
+    da->oom.used = da->request_used;
+    da->oom.limit = da->request.capacity;
 }
 
 bool js_dual_arena_oom_hit(const JSDualArena *da)
@@ -365,57 +426,119 @@ size_t js_dual_arena_base_used(const JSDualArena *da)
 
 size_t js_dual_arena_request_used(const JSDualArena *da)
 {
-    return arena_cursor(&da->request) - ARENA_PREFIX_LEN;
+    /* Live bytes in the mspace (0 pre-freeze, matching the old cursor
+       math on an untouched request buffer). */
+    return da->request_used;
 }
 
-/* ----- JSMallocFunctions glue ----- */
-
-static inline JSArena *active_arena(JSDualArena *da)
-{
-    return (da->mode == JS_ARENA_MODE_BASE) ? &da->base : &da->request;
-}
+/* ----- JSMallocFunctions glue -----
+ *
+ * Base mode (pre-freeze): bump into the base arena, free is a no-op —
+ * unchanged from master; the snapshot build still wants append-only,
+ * address-stable allocation.
+ *
+ * Request mode (post-freeze): dlmalloc mspace over the request buffer.
+ * free/realloc must classify the pointer first: base-arena pointers
+ * (immortal snapshot memory, bump headers) can still reach these hooks —
+ * e.g. a realloc growing a structure allocated pre-freeze — and must
+ * never be handed to the mspace. */
 
 static void *jda_calloc(void *opaque, size_t count, size_t size)
 {
+    JSDualArena *da = opaque;
     if (count == 0 || size == 0)
         return NULL;
     if (count > (size_t)-1 / size)
         return NULL;
     size_t total = count * size;
-    void *p = arena_alloc(active_arena(opaque), total);
+    if (da->mode == JS_ARENA_MODE_BASE) {
+        void *p = arena_alloc(&da->base, total);
+        if (p)
+            memset(p, 0, total);
+        return p;
+    }
+    /* mspace_calloc memsets explicitly (its chunks are never fresh mmap
+       pages here), so reused dirty buffer memory can't leak a previous
+       request's bytes into zero-initialized allocations. */
+    void *p = mspace_calloc(da->msp, count, size);
     if (p)
-        memset(p, 0, total);
+        da->request_used += mspace_usable_size(p);
     else
-        note_oom(opaque, total);
+        note_oom(da, total);
     return p;
 }
 
 static void *jda_malloc(void *opaque, size_t size)
 {
-    void *p = arena_alloc(active_arena(opaque), size);
-    if (!p)
-        note_oom(opaque, size);
+    JSDualArena *da = opaque;
+    if (da->mode == JS_ARENA_MODE_BASE)
+        return arena_alloc(&da->base, size);
+    void *p = mspace_malloc(da->msp, size);
+    if (p)
+        da->request_used += mspace_usable_size(p);
+    else
+        note_oom(da, size);
     return p;
 }
 
 static void jda_free(void *opaque, void *ptr)
 {
-    (void)opaque;
-    (void)ptr;
+    JSDualArena *da = opaque;
+    if (!ptr || da->mode == JS_ARENA_MODE_BASE)
+        return;
+    if (!arena_contains(&da->request, ptr))
+        return; /* base pointer: immortal, not an mspace chunk */
+    da->request_used -= mspace_usable_size(ptr);
+    mspace_free(da->msp, ptr);
 }
 
 static void *jda_realloc(void *opaque, void *ptr, size_t size)
 {
-    void *p = arena_realloc(active_arena(opaque), ptr, size);
-    if (!p && size != 0)
-        note_oom(opaque, size);
-    return p;
+    JSDualArena *da = opaque;
+    if (da->mode == JS_ARENA_MODE_BASE) {
+        return arena_realloc(&da->base, ptr, size);
+    }
+    if (!ptr)
+        return jda_malloc(opaque, size);
+    if (size == 0) {
+        /* Parity with the bump allocator: return NULL, leave ptr live.
+           quickjs frees size==0 at its own layer, so this path is cold;
+           not freeing here keeps any caller that treats NULL as failure
+           from seeing its pointer die. */
+        return NULL;
+    }
+    if (arena_contains(&da->request, ptr)) {
+        size_t old = mspace_usable_size(ptr);
+        void *np = mspace_realloc(da->msp, ptr, size);
+        if (!np) {
+            note_oom(da, size);
+            return NULL;
+        }
+        da->request_used += mspace_usable_size(np) - old;
+        return np;
+    }
+    /* Growing a base (bump-header) allocation post-freeze: copy into the
+       mspace, leave the immortal base bytes untouched. */
+    size_t old_size = (size_t)arena_user_size(ptr);
+    void *np = mspace_malloc(da->msp, size);
+    if (!np) {
+        note_oom(da, size);
+        return NULL;
+    }
+    memcpy(np, ptr, size < old_size ? size : old_size);
+    da->request_used += mspace_usable_size(np);
+    return np;
 }
 
 static size_t jda_usable_size(const void *ptr)
 {
     if (!ptr)
         return 0;
+    /* No opaque on this hook — dispatch by pointer provenance. Request
+       (mspace) chunks carry dlmalloc headers; everything else (base
+       arena, all pre-freeze pointers) carries a bump header. */
+    if (js_arena_ptr_is_request(ptr))
+        return mspace_usable_size(ptr);
     return (size_t)arena_user_size(ptr);
 }
 
