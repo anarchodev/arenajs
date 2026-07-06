@@ -156,6 +156,26 @@ int main(void)
        monotonic since boot. */
     if (eval_print(ctx, "performance.now() > 0", "now-positive")) return 1;
 
+    /* arena: the determinism pins must land in JSRequestState, not
+       base — regression check for the date/timeOrigin relocation.
+       Re-arm the thermometer, re-pin everything, read the values back
+       from JS, and require zero base pages dirtied. */
+    if (js_arena_thermometer_enable() < 0) {
+        fprintf(stderr, "thermometer re-enable failed\n"); return 1;
+    }
+    js_arena_thermometer_reset();
+    JS_SetRandomSeed(ctx, 0x1234567890abcdefULL);
+    JS_SetTimeOrigin(ctx, 777.25);
+    JS_SetDateNow(ctx, 1704067200000LL);
+    if (eval_print(ctx, "Date.now()", "date-pinned")) return 1;
+    if (eval_print(ctx, "performance.timeOrigin", "timeOrigin-repinned")) return 1;
+    {
+        size_t pin_pages = js_arena_thermometer_pages();
+        printf("determinism-pin base pages dirtied: %zu (expect 0)\n", pin_pages);
+        if (pin_pages != 0) return 1;
+    }
+    js_arena_thermometer_disable();
+
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
        (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
        etc.) are for the refcount-based default path. In arena mode the

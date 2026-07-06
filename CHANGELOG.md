@@ -40,7 +40,31 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+### Changed
+
+- **⚠ Contract** — the determinism pins (`JS_SetDateNow`,
+  `JS_SetTimeOrigin`) now store per-request state in `JSRequestState`
+  instead of the base-resident `JSContext`, completing the
+  `random_state`/`interrupt_counter` relocation pattern. Two
+  consequences for native embedders: pinning is no longer a base write
+  (a per-request `arena_set_date_now` used to dirty the ctx page every
+  request — poison for the shared-base/CoW future), and pins no longer
+  leak across requests — `JS_ResetRequestArena` restores defined
+  defaults (clock unpinned, origin 0, PRNG state zero). Call the
+  setters AFTER the reset, before eval. The WASM reactor ABI is
+  unchanged: `arena_set_random_seed` / `arena_set_date_now` remain
+  sticky "set, then run" — the reactor buffers the latest values and
+  re-applies them after its internal reset.
+
 ### Fixed
+
+- The WASM reactor ran **unseeded** after a host `arena_set_random_seed`:
+  the seed landed in `JSRequestState` (relocated there for Math.random
+  base-cleanliness), but `arena_run` / `arena_run_module` reset the
+  request state FIRST, zeroing the PRNG before eval. The buffered
+  re-apply above fixes it; the Date pin never hit this only because it
+  still lived (wrongly) in base. arena-smoke now asserts the whole pin
+  set dirties zero base pages.
 
 - **⚠ Contract** — post-freeze modifications of base (snapshot)
   objects were invisible to any lookup that reached the object through

@@ -286,6 +286,14 @@ typedef struct JSRequestState {
     bool in_build_stack_trace;
     struct JSStackFrame *current_stack_frame;
     JSValueLink *parent_promise;
+    /* Per-request twins of ctx->date_now_pinned / ctx->time_origin
+       (both base-resident on JSContext). JS_SetDateNow /
+       JS_SetTimeOrigin write here in arena mode, so pinning the clock
+       per request is not a base write, and reset restores the defined
+       defaults (unpinned / origin 0) instead of leaking the previous
+       request's pin. Same pattern as random_state_req. */
+    int64_t date_now_pinned_req;
+    double time_origin_req;
     /* Request-side twin of rt->gc_zero_ref_count_list + rt->gc_phase
        (both base-resident on JSRuntime, so arena mode can't touch
        them). Refcount-zero request objects queue here and are drained
@@ -2238,6 +2246,8 @@ int JS_RelocateReqState(JSRuntime *rt)
     init_list_head(&new_req->gc_zero_ref_count_list);
     new_req->gc_phase = JS_GC_PHASE_NONE;
     new_req->error_back_trace_req = JS_UNDEFINED;
+    new_req->date_now_pinned_req = -1;   /* unpinned until the host pins */
+    new_req->time_origin_req = 0;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
     /* Same-value store guard: on reset new_req == rt->req (asserted
@@ -56071,6 +56081,25 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
     return js_new_string8_len(ctx, buf, pos);
 }
 
+/* arena: route the pinned clock and the performance timeOrigin
+   through the per-request shadow, same dispatch as
+   js_random_state_active — writing them per request must not dirty
+   the base ctx page, and a reset must restore the defined defaults
+   rather than leak the previous request's pin. */
+static inline int64_t *js_date_now_pinned_active(JSContext *ctx)
+{
+    if (ctx->rt->is_arena)
+        return &ctx->rt->req->date_now_pinned_req;
+    return &ctx->date_now_pinned;
+}
+
+static inline double *js_time_origin_active(JSContext *ctx)
+{
+    if (ctx->rt->is_arena)
+        return &ctx->rt->req->time_origin_req;
+    return &ctx->time_origin;
+}
+
 /* OS dependent: return the UTC time in ms since 1970.
    arena: when the context has a pinned value (set via
    JS_SetDateNow), return that instead — embedders use this to make
@@ -56079,8 +56108,8 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
    (e.g. helper functions called before context setup); we fall
    through to gettimeofday in that case. */
 static int64_t date_now(JSContext *ctx) {
-    if (ctx && ctx->date_now_pinned >= 0)
-        return ctx->date_now_pinned;
+    if (ctx && *js_date_now_pinned_active(ctx) >= 0)
+        return *js_date_now_pinned_active(ctx);
     return js__gettimeofday_us() / 1000;
 }
 
@@ -61240,7 +61269,7 @@ static double js__now_ms(void)
 
 static JSValue js_perf_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
-    return js_float64(js__now_ms() - ctx->time_origin);
+    return js_float64(js__now_ms() - *js_time_origin_active(ctx));
 }
 
 static JSValue js_perf_time_origin_get(JSContext *ctx, JSValueConst this_val)
@@ -61248,7 +61277,7 @@ static JSValue js_perf_time_origin_get(JSContext *ctx, JSValueConst this_val)
     /* arena: live getter rather than a stored value, so that
        JS_SetTimeOrigin updates both performance.timeOrigin and the
        performance.now() anchor through a single field write. */
-    return js_float64(ctx->time_origin);
+    return js_float64(*js_time_origin_active(ctx));
 }
 
 static const JSCFunctionListEntry js_perf_proto_funcs[] = {
@@ -61273,12 +61302,16 @@ int JS_AddPerformance(JSContext *ctx)
 
 void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms)
 {
-    ctx->time_origin = time_origin_ms;
+    /* arena: lands in JSRequestState — call AFTER the per-request
+       reset (reset restores origin 0). */
+    *js_time_origin_active(ctx) = time_origin_ms;
 }
 
 void JS_SetDateNow(JSContext *ctx, int64_t date_now_ms)
 {
-    ctx->date_now_pinned = date_now_ms;
+    /* arena: lands in JSRequestState — call AFTER the per-request
+       reset (reset restores the unpinned default). */
+    *js_date_now_pinned_active(ctx) = date_now_ms;
 }
 
 /* Equality comparisons and sameness */
