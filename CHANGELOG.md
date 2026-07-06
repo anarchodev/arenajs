@@ -64,6 +64,21 @@ safe consumer pattern spelled out.
   actually take effect through instances — code that accidentally
   relied on the old half-applied behavior will see the override win.
 
+- **⚠ Contract** — `Object.prototype.__proto__ = x` (and
+  `Reflect/Object.setPrototypeOf` reached via the `__proto__` setter)
+  failed to throw the required TypeError for the immutable-prototype
+  exotic object post-freeze: the setter receives the shadow of
+  Object.prototype as `this`, and the immutability identity check
+  compared the shadow pointer against the base `class_proto`, silently
+  missing. The wrongly-written prototype then lived invisibly in the
+  shadow — and once chain walks honored shadows (fix above), it became
+  a live prototype cycle that hung the first lookup to walk it.
+  Identity checks in `JS_SetPrototypeInternal` now normalize through
+  `js_object_base_identity()` (the inverse of the shadow redirect), so
+  they hold regardless of whether a base or shadow pointer arrives.
+  Full test262 sweep after both fixes: 46,020/46,020 base-clean, no
+  hangs.
+
 ## [0.2.0] - 2026-06-14
 
 Completes the **native host-callback surface**: a native driver (e.g. a

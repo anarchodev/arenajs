@@ -3364,6 +3364,26 @@ static JSObject *js_object_shadow_lookup(JSRuntime *rt, JSObject *p)
     return NULL;
 }
 
+/* Inverse of js_object_active: map a shadow back to the base identity
+   it stands for. Identity checks (e.g. "is this Object.prototype?", the
+   setPrototypeOf cycle check) must compare base identities, but a
+   possibly-shadow pointer can reach them — JS_SetPropertyInternal swaps
+   this_obj to the shadow in lockstep with the receiver, so the
+   __proto__ setter's `this` arrives as the shadow. Non-shadow pointers
+   pass through. */
+static JSObject *js_object_base_identity(JSRuntime *rt, JSObject *p)
+{
+    if (likely(!rt->is_arena))
+        return p;
+    if (js_arena_ptr_is_base(p))
+        return p;
+    for (JSObjectShadow *e = rt->req->shadow_map; e; e = e->next) {
+        if (e->shadow == p)
+            return e->base;
+    }
+    return p;
+}
+
 /* Read path: returns the active object. If `p` is a base JSObject and
    has a shadow, the shadow is returned; otherwise `p` is returned
    unchanged. Pre-freeze and request-arena pointers are passed through
@@ -9046,7 +9066,7 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
        below is the base chain — any in-arena shadowed prototype shows
        up in those walks as its base identity, so identity comparisons
        must be against base. */
-    JSObject *p_base = p;
+    JSObject *p_base = js_object_base_identity(ctx->rt, p);
     if (ctx->rt->is_arena && js_arena_ptr_is_base(p)) {
         p = js_object_for_write(ctx, p);
         if (!p)
