@@ -9306,7 +9306,7 @@ static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
         /* arena: read the proto via any shadow (post-freeze
            setPrototypeOf lives there); chain values stay base
            identities so the comparison below is unaffected. */
-        proto1 = js_object_active(ctx->rt, p)->shape->proto;
+        proto1 = js_object_active(ctx->rt, (JSObject *)p)->shape->proto;
         if (!proto1) {
             /* slow case if proxy in the prototype chain */
             if (unlikely(p->class_id == JS_CLASS_PROXY)) {
