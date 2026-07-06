@@ -121,10 +121,17 @@ safe consumer pattern spelled out.
   request objects are reclaimed mid-request; cycles passing through a
   shadowed base object (e.g. hung off a monkey-patched base prototype)
   are a known blind spot — conservatively kept alive until request
-  reset, exactly as today. No automatic trigger yet: run it explicitly
-  between work items, or build with `-DFORCE_GC_AT_MALLOC` for torture
-  testing. Collection dirties zero base pages (thermometer-verified,
-  incl. GC at every allocation over 400 spec tests under ASan).
+  reset, exactly as today. Collection fires automatically: the trigger
+  compares the allocator's LIVE byte count against a per-request
+  threshold (seeded from `JS_SetGCThreshold`'s value at freeze, default
+  256 KB; ratchets to 1.5x the surviving live set, floored at the
+  seed). Because frees are real, acyclic churn never advances the live
+  count — the threshold detects exactly cyclic accumulation, and
+  handlers that build fewer cycles than the seed never pay a single
+  collection. `-DFORCE_GC_AT_MALLOC` collects at every allocation for
+  torture builds. Collection dirties zero base pages
+  (thermometer-verified, incl. GC at every allocation over 4000 spec
+  tests under ASan).
 
 ## [0.2.0] - 2026-06-14
 

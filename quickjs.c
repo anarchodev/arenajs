@@ -305,6 +305,14 @@ typedef struct JSRequestState {
        request memory: zero base writes. */
     struct list_head gc_obj_list;
     struct list_head tmp_obj_list;
+    /* Live-byte ceiling that arms the automatic cycle collection
+       (js_trigger_gc). Compared against the mspace's live-byte counter:
+       acyclic churn never advances that counter (frees are real), so
+       crossing the threshold means refcount-immune garbage — cycles —
+       is accumulating. Seeded from rt->malloc_gc_threshold each
+       request; ratchets to 1.5x the surviving live set after each
+       collection, mirroring the vanilla policy. */
+    size_t gc_threshold;
     /* Step 4: shape overlay. Lazily-allocated request-arena shape hash
        table for transitions discovered during this request. Lookups
        (find_hashed_shape_*) check this first then fall through to the
@@ -1708,15 +1716,28 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
-    /* arena: the collector itself is arena-safe now (request-side
-       registry + base guards in the child callbacks), but the
-       threshold trigger below reads malloc_state accounting that arena
-       mode doesn't maintain yet — that's the remaining step. Until it
-       lands, the collector runs only via explicit JS_RunGC, or at
-       every allocation under the FORCE_GC_AT_MALLOC torture define. */
     if (rt->is_arena) {
 #ifdef FORCE_GC_AT_MALLOC
         JS_RunGC(rt);
+#else
+        /* Live-byte threshold against the reclaiming request
+           allocator. request_used counts LIVE bytes (frees are real),
+           so acyclic churn never advances it — crossing the threshold
+           means cycles are accumulating, which is exactly the one job
+           the collector has. Handlers that build fewer cycles than the
+           seed threshold never pay a single collection. */
+        JSDualArena *da = (JSDualArena *)rt->malloc_state.opaque;
+        size_t used = js_dual_arena_request_used(da);
+        if (unlikely(used + size > rt->req->gc_threshold)) {
+            JS_RunGC(rt);
+            /* Ratchet: 1.5x the surviving live set, floored at the
+               seed so a tiny live set can't re-trigger every alloc.
+               Both stores land in request memory. */
+            used = js_dual_arena_request_used(da);
+            rt->req->gc_threshold = used + (used >> 1);
+            if (rt->req->gc_threshold < rt->malloc_gc_threshold)
+                rt->req->gc_threshold = rt->malloc_gc_threshold;
+        }
 #endif
         return;
     }
@@ -2262,6 +2283,11 @@ int JS_RelocateReqState(JSRuntime *rt)
        objects died wholesale with the allocator reset, links and all. */
     init_list_head(&new_req->gc_obj_list);
     init_list_head(&new_req->tmp_obj_list);
+    /* rt->malloc_gc_threshold is read-only post-freeze (the vanilla GC
+       ratchet that mutates it is off in arena mode), so it doubles as
+       the per-request seed and the floor for the ratchet in
+       js_trigger_gc. */
+    new_req->gc_threshold = rt->malloc_gc_threshold;
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
