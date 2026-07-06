@@ -9096,7 +9096,8 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
                 }
             }
             /* Note: for Proxy objects, proto is NULL */
-            p1 = p1->shape->proto;
+            /* arena: follow shadow-held proto mutations. */
+            p1 = js_object_active(ctx->rt, p1)->shape->proto;
         } while (p1 != NULL);
         js_dup(proto_val);
     }
@@ -9178,6 +9179,10 @@ JSValue JS_GetPrototype(JSContext *ctx, JSValueConst obj)
         if (unlikely(p->class_id == JS_CLASS_PROXY)) {
             val = js_proxy_getPrototypeOf(ctx, obj);
         } else {
+            /* arena: a shadowed base object may carry a post-freeze
+               setPrototypeOf; read the proto from the shadow. */
+            if (ctx->rt->is_arena)
+                p = js_object_active(ctx->rt, p);
             p = p->shape->proto;
             if (!p)
                 val = JS_NULL;
@@ -9236,7 +9241,10 @@ static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
     proto = JS_VALUE_GET_OBJ(obj_proto);
     p = JS_VALUE_GET_OBJ(val);
     for(;;) {
-        proto1 = p->shape->proto;
+        /* arena: read the proto via any shadow (post-freeze
+           setPrototypeOf lives there); chain values stay base
+           identities so the comparison below is unaffected. */
+        proto1 = js_object_active(ctx->rt, p)->shape->proto;
         if (!proto1) {
             /* slow case if proxy in the prototype chain */
             if (unlikely(p->class_id == JS_CLASS_PROXY)) {
@@ -9713,6 +9721,11 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
         p = p->shape->proto;
         if (!p)
             break;
+        /* arena: a base prototype reached mid-chain must be read via
+           its shadow, or post-freeze overrides of base prototype
+           members are invisible to instances. */
+        if (ctx->rt->is_arena)
+            p = js_object_active(ctx->rt, p);
     }
     if (unlikely(throw_ref_error)) {
         return JS_ThrowReferenceErrorNotDefined(ctx, prop);
@@ -9986,6 +9999,10 @@ static int __exception JS_GetOwnPropertyNamesInternal(JSContext *ctx,
     exotic_keys_count = 0;
     exotic_count = 0;
     tab_exotic = NULL;
+    /* arena: enumerate the shadowed view of a base object (Object.keys,
+       for-in enumeration, spread all funnel here). */
+    if (ctx->rt->is_arena)
+        p = js_object_active(ctx->rt, p);
     sh = p->shape;
     for(i = 0, prs = sh->prop; i < sh->prop_count; i++, prs++) {
         atom = prs->atom;
@@ -10381,6 +10398,11 @@ int JS_HasProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
                 return false;
             }
         }
+        /* arena: advance via the shadow so post-freeze setPrototypeOf
+           on a base object is honored (the own-prop reads above
+           already self-redirect). */
+        if (ctx->rt->is_arena)
+            p = js_object_active(ctx->rt, p);
         p = p->shape->proto;
         if (!p)
             break;
@@ -11186,6 +11208,10 @@ retry:
     prototype_lookup:
         if (!p1)
             break;
+        /* arena: a base prototype reached mid-chain must be read via
+           its shadow (setters defined post-freeze live there). */
+        if (ctx->rt->is_arena)
+            p1 = js_object_active(ctx->rt, p1);
 
     retry2:
         prs = find_own_property(&pr, p1, prop);
@@ -18716,6 +18742,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
+                    /* arena: same redirect as OP_get_field. */
+                    if (rt->is_arena)
+                        p = js_object_active(ctx->rt, p);
                     for(;;) {
                         prs = find_own_property(&pr, p, atom);
                         if (prs) {
@@ -18734,6 +18763,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             val = JS_UNDEFINED;
                             break;
                         }
+                        /* arena: mid-chain shadow redirect. */
+                        if (rt->is_arena)
+                            p = js_object_active(ctx->rt, p);
                     }
                 } else {
                 get_length_slow_path:
@@ -19950,6 +19982,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             val = JS_UNDEFINED;
                             break;
                         }
+                        /* arena: mid-chain shadow redirect. */
+                        if (rt->is_arena)
+                            p = js_object_active(ctx->rt, p);
                     }
                 } else {
                 get_field_slow_path:
@@ -20001,6 +20036,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             val = JS_UNDEFINED;
                             break;
                         }
+                        /* arena: mid-chain shadow redirect. */
+                        if (rt->is_arena)
+                            p = js_object_active(ctx->rt, p);
                     }
                 } else {
                 get_field2_slow_path:

@@ -40,7 +40,29 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **⚠ Contract** — post-freeze modifications of base (snapshot)
+  objects were invisible to any lookup that reached the object through
+  the prototype chain, rather than directly. `Map.prototype.set = f`
+  read back correctly from `Map.prototype.set` but `(new Map()).set`
+  still called the snapshot original; same for setters, `in`, `for-in`
+  enumeration, `Object.keys` on the shadowed object,
+  `Object.setPrototypeOf` on a base object, and `instanceof` after a
+  proto mutation. Root cause: chain walks advanced with a bare
+  `p = p->shape->proto` and never consulted the shadow overlay; only
+  the walk's *starting* object was redirected. All chain walks
+  (`JS_GetPropertyInternal`, `JS_SetPropertyInternal`, `JS_HasProperty`,
+  `JS_GetPrototype`, `JS_OrdinaryIsInstanceOf`, the setPrototypeOf
+  cycle check, the interpreter get_field/get_field2/get_length fast
+  paths) now redirect each hop through `js_object_active`;
+  `JS_GetOwnPropertyNamesInternal` gained the same entry redirect the
+  other own-property readers already had. Read-only redirects: no new
+  base writes (test262 walker stays 0-dirty), and no measurable cost
+  on the arena benches (the redirect early-outs on non-base pointers).
+  Consumer note: handlers that monkey-patch snapshot prototypes now
+  actually take effect through instances — code that accidentally
+  relied on the old half-applied behavior will see the override win.
 
 ## [0.2.0] - 2026-06-14
 
