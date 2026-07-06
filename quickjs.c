@@ -286,6 +286,15 @@ typedef struct JSRequestState {
     bool in_build_stack_trace;
     struct JSStackFrame *current_stack_frame;
     JSValueLink *parent_promise;
+    /* Request-side twin of rt->gc_zero_ref_count_list + rt->gc_phase
+       (both base-resident on JSRuntime, so arena mode can't touch
+       them). Refcount-zero request objects queue here and are drained
+       iteratively by free_zero_refcount_req — the worklist replaces the
+       call stack, so teardown of arbitrarily deep object graphs runs at
+       constant stack depth. Base objects can never enter: their
+       refcounts are guarded immortal and never reach zero. */
+    struct list_head gc_zero_ref_count_list;
+    JSGCPhaseEnum gc_phase;
     /* Step 4: shape overlay. Lazily-allocated request-arena shape hash
        table for transitions discovered during this request. Lookups
        (find_hashed_shape_*) check this first then fall through to the
@@ -2224,8 +2233,10 @@ int JS_RelocateReqState(JSRuntime *rt)
     new_req->atom_overlay_free_index = 0;
     /* job_list head is self-referential; the memcpy left next/prev
        pointing at the old struct's location, so re-init for the new
-       address. */
+       address. Same for the zero-refcount worklist head. */
     init_list_head(&new_req->job_list);
+    init_list_head(&new_req->gc_zero_ref_count_list);
+    new_req->gc_phase = JS_GC_PHASE_NONE;
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
@@ -7367,6 +7378,30 @@ static void free_zero_refcount(JSRuntime *rt)
     rt->gc_phase = JS_GC_PHASE_NONE;
 }
 
+/* arena: request-side twin of free_zero_refcount, draining
+   rt->req->gc_zero_ref_count_list with rt->req->gc_phase as the
+   re-entrancy latch. Children whose refcounts hit zero while an object
+   is being freed are appended to the list by js_free_value_rt (which
+   sees gc_phase != NONE) and picked up by this loop — constant stack
+   depth for arbitrarily deep teardowns, zero base writes. */
+static void free_zero_refcount_req(JSRuntime *rt)
+{
+    JSRequestState *req = rt->req;
+    struct list_head *el;
+    JSGCObjectHeader *p;
+
+    req->gc_phase = JS_GC_PHASE_DECREF;
+    for(;;) {
+        el = req->gc_zero_ref_count_list.next;
+        if (el == &req->gc_zero_ref_count_list)
+            break;
+        p = list_entry(el, JSGCObjectHeader, link);
+        assert(p->ref_count == 0);
+        free_gc_object(rt, p);
+    }
+    req->gc_phase = JS_GC_PHASE_NONE;
+}
+
 /* called with the ref_count of 'v' reaches zero. */
 static void js_free_value_rt(JSRuntime *rt, JSValue v)
 {
@@ -7405,11 +7440,18 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
         {
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
             if (rt->is_arena) {
-                /* arena: bypass the gc_zero_ref_count_list dance whose
-                   head lives in base. Free directly; finalizers run as
-                   normal. Recursion through children is bounded by JS
-                   call depth in practice. */
-                free_gc_object(rt, p);
+                /* arena: the vanilla dance below is off-limits (list
+                   head and gc_phase live in base), but direct recursion
+                   overflows the C stack on deep object graphs (test262
+                   staging/sm/regress/regress-1507322-deep-weakmap.js:
+                   a 100k-link WeakMap chain). Use the request-side
+                   worklist twin instead. p's link is self-looped
+                   (add_gc_object arena branch) or on the worklist
+                   already, so list_del is always safe. */
+                list_del(&p->link);
+                list_add(&p->link, &rt->req->gc_zero_ref_count_list);
+                if (rt->req->gc_phase == JS_GC_PHASE_NONE)
+                    free_zero_refcount_req(rt);
             } else if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                 list_del(&p->link);
                 list_add(&p->link, &rt->gc_zero_ref_count_list);

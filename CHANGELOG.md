@@ -79,6 +79,17 @@ safe consumer pattern spelled out.
   Full test262 sweep after both fixes: 46,020/46,020 base-clean, no
   hangs.
 
+- Teardown of deep object graphs no longer risks C stack overflow.
+  Arena mode bypassed the `gc_zero_ref_count_list` deferral (its head
+  lives in base) and freed refcount-zero objects by direct recursion —
+  one stack frame per object, which overflowed on a 100k-link WeakMap
+  chain (test262 `staging/sm/regress/regress-1507322-deep-weakmap.js`).
+  `JSRequestState` now carries a request-side zero-refcount worklist +
+  `gc_phase` latch, drained iteratively by `free_zero_refcount_req` —
+  the vanilla constant-stack discipline, rebuilt in request memory with
+  zero base writes. Also a prerequisite for enabling the cycle
+  collector on the hybrid-gc branch.
+
 ## [0.2.0] - 2026-06-14
 
 Completes the **native host-callback surface**: a native driver (e.g. a
