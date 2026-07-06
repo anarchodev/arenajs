@@ -295,6 +295,16 @@ typedef struct JSRequestState {
        refcounts are guarded immortal and never reach zero. */
     struct list_head gc_zero_ref_count_list;
     JSGCPhaseEnum gc_phase;
+    /* Request-side GC registry: every post-freeze GC object (objects,
+       shapes, function bytecode, var refs, async functions) links here
+       instead of the base-resident rt->gc_obj_list, which holds the
+       immortal pre-freeze set and is never touched after freeze. This
+       is exactly the collectible set the cycle collector will walk.
+       tmp_obj_list is the collector's scratch list (idle until the
+       collector is enabled). Both heads and every linked node are
+       request memory: zero base writes. */
+    struct list_head gc_obj_list;
+    struct list_head tmp_obj_list;
     /* Step 4: shape overlay. Lazily-allocated request-arena shape hash
        table for transitions discovered during this request. Lookups
        (find_hashed_shape_*) check this first then fall through to the
@@ -2139,6 +2149,12 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     /* atom_overlay_base = UINT32_MAX disables the overlay dispatch path
        pre-freeze; JS_RelocateReqState lowers it to rt->atom_size. */
     rt->req_state.atom_overlay_base = UINT32_MAX;
+    /* Init the embedded state's GC list heads so they're valid even in
+       the freeze-time window before JS_RelocateReqState swaps in the
+       arena-resident struct (e.g. if that relocation OOMs). */
+    init_list_head(&rt->req_state.gc_zero_ref_count_list);
+    init_list_head(&rt->req_state.gc_obj_list);
+    init_list_head(&rt->req_state.tmp_obj_list);
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -2237,6 +2253,10 @@ int JS_RelocateReqState(JSRuntime *rt)
     init_list_head(&new_req->job_list);
     init_list_head(&new_req->gc_zero_ref_count_list);
     new_req->gc_phase = JS_GC_PHASE_NONE;
+    /* GC registry starts empty each request: the previous request's
+       objects died wholesale with the allocator reset, links and all. */
+    init_list_head(&new_req->gc_obj_list);
+    init_list_head(&new_req->tmp_obj_list);
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
@@ -6091,15 +6111,22 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         if (!sh_alloc)
             return -1;
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-        if (!ctx->rt->is_arena)
+        if (!ctx->rt->is_arena) {
             list_del(&old_sh->header.link);
+        } else if (!js_arena_ptr_is_base(old_sh)) {
+            /* arena: a request shape being abandoned (storage freed
+               below) must leave the request registry first, or the
+               list would keep a node in memory the allocator is about
+               to recycle. Base shapes are immortal and stay linked in
+               the base list, untouched. */
+            list_del(&old_sh->header.link);
+        }
         /* copy all the fields and the properties */
         memcpy(sh, old_sh,
                sizeof(JSShape) + sizeof(sh->prop[0]) * old_sh->prop_count);
-        /* arena: gc_obj_list lives in base; skip linking here, mirrors
-           add_gc_object's self-loop behaviour. */
+        /* arena: new storage registers in the request-side list. */
         if (ctx->rt->is_arena)
-            init_list_head(&sh->header.link);
+            list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
         else
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
         new_hash_mask = new_hash_size - 1;
@@ -6116,21 +6143,32 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         js_free(ctx, get_alloc_from_shape(old_sh));
     } else {
         /* only resize the properties */
-        if (!ctx->rt->is_arena)
+        bool arena_was_linked = false;
+        if (!ctx->rt->is_arena) {
             list_del(&sh->header.link);
+        } else if (!js_arena_ptr_is_base(sh)) {
+            /* arena: the realloc below may move (and free) a request
+               shape's storage — unlink from the request registry
+               first. A base shape stays linked in the base list; the
+               realloc copies it into request storage and leaves the
+               base bytes untouched. (The old code init_list_head'd
+               even base shapes on the OOM path — a base write.) */
+            list_del(&sh->header.link);
+            arena_was_linked = true;
+        }
         sh_alloc = js_realloc(ctx, get_alloc_from_shape(sh),
                               get_shape_size(new_hash_size, new_size));
         if (unlikely(!sh_alloc)) {
             /* insert again in the GC list */
-            if (ctx->rt->is_arena)
-                init_list_head(&sh->header.link);
-            else
+            if (!ctx->rt->is_arena)
                 list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
+            else if (arena_was_linked)
+                list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
             return -1;
         }
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
         if (ctx->rt->is_arena)
-            init_list_head(&sh->header.link);
+            list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
         else
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
     }
@@ -6167,12 +6205,15 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     if (!sh_alloc)
         return -1;
     sh = get_shape_from_alloc(sh_alloc, new_hash_size);
-    /* arena: don't touch the gc_obj_list — base shapes are immortal
-       and stay in their original slot; new shapes get a self-link.
-       This matches the gating in resize_properties above. */
+    /* arena: a request old shape is freed below — unlink it from the
+       request registry first; base old shapes are immortal and stay
+       linked in the base list. New storage registers in the
+       request-side list. Matches the gating in resize_properties. */
     if (ctx->rt->is_arena) {
+        if (!js_arena_ptr_is_base(old_sh))
+            list_del(&old_sh->header.link);
         memcpy(sh, old_sh, sizeof(JSShape));
-        init_list_head(&sh->header.link);
+        list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
     } else {
         list_del(&old_sh->header.link);
         memcpy(sh, old_sh, sizeof(JSShape));
@@ -7445,9 +7486,10 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
                    overflows the C stack on deep object graphs (test262
                    staging/sm/regress/regress-1507322-deep-weakmap.js:
                    a 100k-link WeakMap chain). Use the request-side
-                   worklist twin instead. p's link is self-looped
-                   (add_gc_object arena branch) or on the worklist
-                   already, so list_del is always safe. */
+                   worklist twin instead. p's link is on the request
+                   gc_obj_list (add_gc_object arena branch) or already
+                   on the worklist, so list_del is always safe and
+                   never touches base memory. */
                 list_del(&p->link);
                 list_add(&p->link, &rt->req->gc_zero_ref_count_list);
                 if (rt->req->gc_phase == JS_GC_PHASE_NONE)
@@ -7505,12 +7547,14 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
     h->mark = 0;
     h->gc_obj_type = type;
     if (rt->is_arena) {
-        /* arena: gc_obj_list head lives in base; linking into it would
-           dirty a base page on every allocation. We don't traverse the
-           list (GC is suppressed; teardown walks gated by ENABLE_DUMPS),
-           so just initialize the link to a self-loop so subsequent
-           list_del is a no-op. */
-        init_list_head(&h->link);
+        /* arena: rt->gc_obj_list lives in base and holds the immortal
+           pre-freeze set (linked while is_arena was still false); it is
+           never touched after freeze. Post-freeze GC objects register
+           in the request-side list — exactly the collectible set the
+           cycle collector will walk. Head and neighbors are always
+           request memory (base objects are on the other list), so
+           linking and unlinking never writes base. */
+        list_add_tail(&h->link, &rt->req->gc_obj_list);
         return;
     }
     list_add_tail(&h->link, &rt->gc_obj_list);
@@ -7772,6 +7816,14 @@ static void gc_free_cycles(JSRuntime *rt)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    /* arena: the collector is not enabled yet — gc_decref/gc_scan walk
+       rt->gc_obj_list (the immortal base set) and write ref_counts
+       directly, bypassing the base guards, which would corrupt the
+       deliberately-frozen base refcounts. The request-side registry
+       (rt->req->gc_obj_list) is populated and ready; flip this to walk
+       it once the child-callback base guards land. */
+    if (rt->is_arena)
+        return;
     /* decrement the reference of the children of each object. mark =
        1 after this pass. */
     gc_decref(rt);
@@ -9306,7 +9358,7 @@ static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
         /* arena: read the proto via any shadow (post-freeze
            setPrototypeOf lives there); chain values stay base
            identities so the comparison below is unaffected. */
-        proto1 = js_object_active(ctx->rt, p)->shape->proto;
+        proto1 = js_object_active(ctx->rt, (JSObject *)p)->shape->proto;
         if (!proto1) {
             /* slow case if proxy in the prototype chain */
             if (unlikely(p->class_id == JS_CLASS_PROXY)) {
