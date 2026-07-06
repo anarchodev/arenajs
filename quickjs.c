@@ -1708,13 +1708,18 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
-    /* arena: the cycle collector walks gc_obj_list and directly decrements
-       ref_counts (bypassing our chokepoint), which would underflow the
-       deliberately-small ref_counts on base-arena objects. We don't need
-       GC anyway — the request arena is reset wholesale between requests
-       and base is immortal. Suppress here. */
-    if (rt->is_arena)
+    /* arena: the collector itself is arena-safe now (request-side
+       registry + base guards in the child callbacks), but the
+       threshold trigger below reads malloc_state accounting that arena
+       mode doesn't maintain yet — that's the remaining step. Until it
+       lands, the collector runs only via explicit JS_RunGC, or at
+       every allocation under the FORCE_GC_AT_MALLOC torture define. */
+    if (rt->is_arena) {
+#ifdef FORCE_GC_AT_MALLOC
+        JS_RunGC(rt);
+#endif
         return;
+    }
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = true;
 #else
@@ -2260,7 +2265,12 @@ int JS_RelocateReqState(JSRuntime *rt)
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
-    rt->req = new_req;
+    /* Same-value store guard: on reset new_req == rt->req (asserted
+       above), and skipping the store keeps reset at zero base writes —
+       an unconditional store dirties the JSRuntime page every reset,
+       which materializes a CoW page and pollutes the thermometer. */
+    if (rt->req != new_req)
+        rt->req = new_req;
     return 0;
 }
 
@@ -7341,6 +7351,40 @@ static void js_for_in_iterator_mark(JSRuntime *rt, JSValueConst val,
     JS_MarkValue(rt, it->obj, mark_func);
 }
 
+/* arena: the collector's working state (object list, scratch list,
+   zero-refcount list, phase latch) lives on JSRuntime for vanilla
+   runtimes and on JSRequestState for arena runtimes, where the
+   JSRuntime copies are base memory that must stay untouched. These
+   selectors keep the collector and free paths shared between the two. */
+static inline struct list_head *gc_obj_list_head(JSRuntime *rt)
+{
+    return rt->is_arena ? &rt->req->gc_obj_list : &rt->gc_obj_list;
+}
+
+static inline struct list_head *gc_tmp_obj_list_head(JSRuntime *rt)
+{
+    return rt->is_arena ? &rt->req->tmp_obj_list : &rt->tmp_obj_list;
+}
+
+static inline struct list_head *gc_zero_list_head(JSRuntime *rt)
+{
+    return rt->is_arena ? &rt->req->gc_zero_ref_count_list
+                        : &rt->gc_zero_ref_count_list;
+}
+
+static inline JSGCPhaseEnum gc_phase_get(JSRuntime *rt)
+{
+    return rt->is_arena ? rt->req->gc_phase : rt->gc_phase;
+}
+
+static inline void gc_phase_set(JSRuntime *rt, JSGCPhaseEnum phase)
+{
+    if (rt->is_arena)
+        rt->req->gc_phase = phase;
+    else
+        rt->gc_phase = phase;
+}
+
 static void free_object(JSRuntime *rt, JSObject *p)
 {
     int i;
@@ -7381,8 +7425,8 @@ static void free_object(JSRuntime *rt, JSObject *p)
     p->u.func.home_object = NULL;
 
     remove_gc_object(&p->header);
-    if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && p->header.ref_count != 0) {
-        list_add_tail(&p->header.link, &rt->gc_zero_ref_count_list);
+    if (gc_phase_get(rt) == JS_GC_PHASE_REMOVE_CYCLES && p->header.ref_count != 0) {
+        list_add_tail(&p->header.link, gc_zero_list_head(rt));
     } else {
         js_free_rt(rt, p);
     }
@@ -7451,7 +7495,7 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
 #ifdef ENABLE_DUMPS // JS_DUMP_FREE
     if (check_dump_flag(rt, JS_DUMP_FREE)) {
         /* Prevent invalid object access during GC */
-        if ((rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES)
+        if ((gc_phase_get(rt) != JS_GC_PHASE_REMOVE_CYCLES)
         ||  (tag != JS_TAG_OBJECT && tag != JS_TAG_FUNCTION_BYTECODE)) {
             printf("Freeing ");
             if (tag == JS_TAG_OBJECT) {
@@ -7489,11 +7533,15 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
                    worklist twin instead. p's link is on the request
                    gc_obj_list (add_gc_object arena branch) or already
                    on the worklist, so list_del is always safe and
-                   never touches base memory. */
-                list_del(&p->link);
-                list_add(&p->link, &rt->req->gc_zero_ref_count_list);
-                if (rt->req->gc_phase == JS_GC_PHASE_NONE)
-                    free_zero_refcount_req(rt);
+                   never touches base memory. During REMOVE_CYCLES the
+                   object is in the collector's hands — do nothing,
+                   same as vanilla, or it gets freed twice. */
+                if (rt->req->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
+                    list_del(&p->link);
+                    list_add(&p->link, &rt->req->gc_zero_ref_count_list);
+                    if (rt->req->gc_phase == JS_GC_PHASE_NONE)
+                        free_zero_refcount_req(rt);
+                }
             } else if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                 list_del(&p->link);
                 list_add(&p->link, &rt->gc_zero_ref_count_list);
@@ -7694,13 +7742,29 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     }
 }
 
+/* arena: the load-bearing guard for running the cycle collector on an
+   arena runtime. The child callbacks below write ref_count directly,
+   bypassing the immortal-base refcount chokepoints — a base child must
+   be skipped entirely or its deliberately-frozen ref_count corrupts.
+   Skipping is SOUND because base never points into request memory
+   (all post-freeze mutation of base objects shadows into the request
+   arena), so no collectible request object can hide behind a base
+   edge: base children are immortal leaves from the collector's
+   perspective. */
+static inline bool gc_child_is_base(const JSGCObjectHeader *p)
+{
+    return js_arena_ptr_is_base(p);
+}
+
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (gc_child_is_base(p))
+        return;
     assert(p->ref_count > 0);
     p->ref_count--;
     if (p->ref_count == 0 && p->mark == 1) {
         list_del(&p->link);
-        list_add_tail(&p->link, &rt->tmp_obj_list);
+        list_add_tail(&p->link, gc_tmp_obj_list_head(rt));
     }
 }
 
@@ -7709,37 +7773,41 @@ static void gc_decref(JSRuntime *rt)
     struct list_head *el, *el1;
     JSGCObjectHeader *p;
 
-    init_list_head(&rt->tmp_obj_list);
+    init_list_head(gc_tmp_obj_list_head(rt));
 
     /* decrement the refcount of all the children of all the GC
        objects and move the GC objects with zero refcount to
        tmp_obj_list */
-    list_for_each_safe(el, el1, &rt->gc_obj_list) {
+    list_for_each_safe(el, el1, gc_obj_list_head(rt)) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->mark == 0);
         mark_children(rt, p, gc_decref_child);
         p->mark = 1;
         if (p->ref_count == 0) {
             list_del(&p->link);
-            list_add_tail(&p->link, &rt->tmp_obj_list);
+            list_add_tail(&p->link, gc_tmp_obj_list_head(rt));
         }
     }
 }
 
 static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (gc_child_is_base(p))
+        return;
     p->ref_count++;
     if (p->ref_count == 1) {
         /* ref_count was 0: remove from tmp_obj_list and add at the
            end of gc_obj_list */
         list_del(&p->link);
-        list_add_tail(&p->link, &rt->gc_obj_list);
+        list_add_tail(&p->link, gc_obj_list_head(rt));
         p->mark = 0; /* reset the mark for the next GC call */
     }
 }
 
 static void gc_scan_incref_child2(JSRuntime *rt, JSGCObjectHeader *p)
 {
+    if (gc_child_is_base(p))
+        return;
     p->ref_count++;
 }
 
@@ -7749,7 +7817,7 @@ static void gc_scan(JSRuntime *rt)
     JSGCObjectHeader *p;
 
     /* keep the objects with a refcount > 0 and their children. */
-    list_for_each(el, &rt->gc_obj_list) {
+    list_for_each(el, gc_obj_list_head(rt)) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->ref_count > 0);
         p->mark = 0; /* reset the mark for the next GC call */
@@ -7757,7 +7825,7 @@ static void gc_scan(JSRuntime *rt)
     }
 
     /* restore the refcount of the objects to be deleted. */
-    list_for_each(el, &rt->tmp_obj_list) {
+    list_for_each(el, gc_tmp_obj_list_head(rt)) {
         p = list_entry(el, JSGCObjectHeader, link);
         mark_children(rt, p, gc_scan_incref_child2);
     }
@@ -7771,11 +7839,11 @@ static void gc_free_cycles(JSRuntime *rt)
     bool header_done = false;
 #endif
 
-    rt->gc_phase = JS_GC_PHASE_REMOVE_CYCLES;
+    gc_phase_set(rt, JS_GC_PHASE_REMOVE_CYCLES);
 
     for(;;) {
-        el = rt->tmp_obj_list.next;
-        if (el == &rt->tmp_obj_list)
+        el = gc_tmp_obj_list_head(rt)->next;
+        if (el == gc_tmp_obj_list_head(rt))
             break;
         p = list_entry(el, JSGCObjectHeader, link);
         /* Only need to free the GC object associated with JS
@@ -7798,32 +7866,31 @@ static void gc_free_cycles(JSRuntime *rt)
             break;
         default:
             list_del(&p->link);
-            list_add_tail(&p->link, &rt->gc_zero_ref_count_list);
+            list_add_tail(&p->link, gc_zero_list_head(rt));
             break;
         }
     }
-    rt->gc_phase = JS_GC_PHASE_NONE;
+    gc_phase_set(rt, JS_GC_PHASE_NONE);
 
-    list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
+    list_for_each_safe(el, el1, gc_zero_list_head(rt)) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT ||
                p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
         js_free_rt(rt, p);
     }
 
-    init_list_head(&rt->gc_zero_ref_count_list);
+    init_list_head(gc_zero_list_head(rt));
 }
 
 void JS_RunGC(JSRuntime *rt)
 {
-    /* arena: the collector is not enabled yet — gc_decref/gc_scan walk
-       rt->gc_obj_list (the immortal base set) and write ref_counts
-       directly, bypassing the base guards, which would corrupt the
-       deliberately-frozen base refcounts. The request-side registry
-       (rt->req->gc_obj_list) is populated and ready; flip this to walk
-       it once the child-callback base guards land. */
-    if (rt->is_arena)
-        return;
+    /* arena: the collector runs against the request-side registry
+       (rt->req->gc_obj_list) — exactly the post-freeze collectible
+       set. Base objects are reachable only as children and the
+       gc_child_is_base guards skip them: immortal leaves. Cycles that
+       pass through a shadowed base object stay uncollectible by
+       design (the shadow map's strong ref makes them look externally
+       rooted) and die at request reset, exactly as before. */
     /* decrement the reference of the children of each object. mark =
        1 after this pass. */
     gc_decref(rt);
@@ -36900,8 +36967,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     js_free_rt(rt, b->source);
 
     remove_gc_object(&b->header);
-    if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
-        list_add_tail(&b->header.link, &rt->gc_zero_ref_count_list);
+    if (gc_phase_get(rt) == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
+        list_add_tail(&b->header.link, gc_zero_list_head(rt));
     } else {
         js_free_rt(rt, b);
     }

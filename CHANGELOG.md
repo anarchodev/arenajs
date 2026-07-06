@@ -114,6 +114,18 @@ safe consumer pattern spelled out.
     joins the runtime source set; static-linking embedders that list
     TUs explicitly must add it.
 
+- **⚠ Contract** (hybrid-gc branch) — `JS_RunGC` now runs the cycle
+  collector on frozen arena runtimes (previously an unsafe walk,
+  temporarily a no-op). It walks only the request-side registry; base
+  objects are immortal leaves behind pointer guards. Cycles confined to
+  request objects are reclaimed mid-request; cycles passing through a
+  shadowed base object (e.g. hung off a monkey-patched base prototype)
+  are a known blind spot — conservatively kept alive until request
+  reset, exactly as today. No automatic trigger yet: run it explicitly
+  between work items, or build with `-DFORCE_GC_AT_MALLOC` for torture
+  testing. Collection dirties zero base pages (thermometer-verified,
+  incl. GC at every allocation over 400 spec tests under ASan).
+
 ## [0.2.0] - 2026-06-14
 
 Completes the **native host-callback surface**: a native driver (e.g. a
