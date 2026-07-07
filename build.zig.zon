@@ -19,6 +19,10 @@
         "qjs-arena-reactor.c",
         "qjs-arena-replay-bindings.c",
         "qjs-arena-trace.c",
+        // GC-mode allocator (0.3.0): qjs-dlmalloc.c #includes dlmalloc.c.
+        "qjs-dlmalloc.c",
+        "qjs-dlmalloc.h",
+        "dlmalloc.c",
         // All root headers (every transitive include is flat at root).
         "builtin-array-fromasync.h",
         "builtin-iterator-zip-keyed.h",
