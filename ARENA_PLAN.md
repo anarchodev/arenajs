@@ -1,8 +1,16 @@
 # arenajs: One-Shot Per-Request JS VM Plan
 
 Working plan for turning this clone of quickjs-ng into a JS VM optimized for
-request-scoped server execution: no GC, bump allocator, per-request "restore"
-collapses to a single bump-cursor write (~10 ns) instead of a memcpy.
+request-scoped server execution. Original thesis: no GC, bump allocator,
+per-request "restore" collapses to a single bump-cursor write (~10 ns)
+instead of a memcpy. As built (hybrid-gc branch, 2026-07-06), the request
+side offers TWO per-reset-selectable regimes over the same buffer — the
+original bump mode, and a GC mode (dlmalloc mspace + refcount reclaim +
+cycle collector) whose ceiling is peak live set instead of cumulative
+allocation. Restore stays O(1) in both (~7 ns cursor rewind / ~65 ns mspace
+header stomp), and the inviolate-base invariant is now MMU-enforceable in
+production (js_dual_arena_harden). See "Request-allocator hybrid — AS
+BUILT" at the end of this file.
 
 ## End State
 
@@ -10,10 +18,15 @@ collapses to a single bump-cursor write (~10 ns) instead of a memcpy.
   - **base**: snapshot region. Holds runtime, prelude, prototypes, base atoms,
     base shapes. Allocated during snapshot build, never written again.
   - **request**: per-request region. Holds everything else. Reset between
-    requests by writing one byte to the cursor.
-- "Restore between requests" = `*(uint64_t *)request_arena.buf = 16`.
+    requests in O(1) — cursor rewind (bump mode) or a fresh mspace header
+    stomped over the dirty buffer (GC mode); see AS BUILT.
+- "Restore between requests" = the cursor store (bump) / header stomp (GC);
+  in both regimes the first JS_ARENA_REQUEST_SLOT_SIZE bytes are a fixed
+  JSRequestState slot outside the allocator, re-initialized in place.
 - The base arena can also be `mmap`'d shared across worker processes, but that
-  is an optimization not required by the design.
+  is an optimization not required by the design. (Its precondition — zero
+  base writes per request, including host-API writes — now holds and is
+  enforceable via js_dual_arena_harden.)
 
 ### Inviolate base — the load-bearing invariant
 
@@ -832,11 +845,112 @@ thermometer surfaces them.
     appeared unchanged to those readers. Route `p` through
     `js_object_active` at entry.
 
-## Future direction: request-allocator hybrid (back-pocket)
+- **2026-07-05/06 — the hybrid-gc arc** (see AS BUILT below). Along
+  the way the reclaiming allocator flushed out three master bugs the
+  thermometer could not see, each masked by the bump arena's OOM
+  backstop:
+  - proto-chain lookups missed the shadow overlay — post-freeze
+    overrides of base prototype members were invisible to instances
+    (every chain walk now redirects each hop via `js_object_active`);
+  - `JS_SetPrototypeInternal`'s identity checks compared a SHADOW
+    pointer against base `class_proto` (the `__proto__` setter receives
+    the shadow as `this`) — `Object.prototype` immutability silently
+    failed; fixed via `js_object_base_identity`, the inverse map;
+  - refcount-zero teardown recursed one C frame per object — a 100k
+    WeakMap chain overflowed the stack; replaced by the request-side
+    `gc_zero_ref_count_list` worklist (constant stack).
+  Also closed: the base-Map/Set record-refcount hole (snapshot
+  collections are now readable/iterable forever, IMMUTABLE after
+  freeze — mutators throw; iteration skips record locks for base
+  records), the per-request determinism pins relocated to
+  JSRequestState (`JS_SetDateNow`/`JS_SetTimeOrigin`; also fixed the
+  wasm reactor running unseeded), and JSRequestState moved to a fixed
+  512 B head slot ahead of the allocator (rt->req written once at
+  freeze; no allocator-layout coupling).
+- **Hard enforcement**: `js_dual_arena_harden()` maps base PROT_READ
+  post-freeze; any write dies with an `[arena-harden] base+offset`
+  diagnostic + backtrace. `ARENA_HARDEN=1` runs the test262 walker in
+  that mode. Full corpus (46,020 tests) completed under ASan with base
+  hardened — the invariant is now certified by the MMU, not just
+  measured by the thermometer.
 
-Not built. Documented so that if the request bump arena's allocation
-ceiling becomes a problem on release, the fix is already designed and
-we don't rediscover it under pressure.
+## Request-allocator hybrid — AS BUILT (supersedes the back-pocket design)
+
+Built 2026-07-05/06 on the `hybrid-gc` branch (merged with master at
+`54b0b3d`). The back-pocket design below anticipated a bump front end
+with an in-request one-way overflow into a slab; what got built is
+simpler and strictly more capable — summarized here, with the original
+design kept underneath for the record.
+
+### What got built
+
+- **GC mode** (default): the request region is a dlmalloc mspace
+  (vendored `dlmalloc.c` 2.8.6 via `qjs-dlmalloc.c`, ONLY_MSPACES,
+  HAVE_MMAP=0/HAVE_MORECORE=0 — confined to the buffer, exhaustion is
+  NULL→JS OOM). `js_free` reclaims, so acyclic churn costs nothing
+  cumulative; the ceiling is peak live set. Chosen over a hand-rolled
+  slab: QuickJS's allocation mix under arbitrary JS is fully general
+  (variable sizes, heavy realloc), and dlmalloc has thirty years of
+  adversarial workloads behind it.
+- **Full cycle GC on top of refcounting**: request-side registry
+  (`rt->req->gc_obj_list`), base-pointer guards in the collector's
+  direct-refcount callbacks (`gc_child_is_base` — sound because base
+  never points into request memory), vanilla/arena state selectors so
+  the collector code is shared, and an automatic trigger: live bytes
+  vs a per-request threshold (seeded from `JS_SetGCThreshold`, ratchet
+  1.5x, floored). Because frees are real, acyclic churn never advances
+  live bytes — the threshold detects exactly cyclic accumulation, and
+  handlers that build fewer cycles than the seed never pay a single
+  collection. Known blind spot: cycles through shadowed base objects
+  look externally rooted and die at reset (conservative, bounded).
+- **Bump mode, per-reset selectable**: `js_dual_arena_set_request_mode`
+  picks the regime for the NEXT request (applied at reset — the one
+  moment all request allocations die, so pointers always match the
+  current mode). Bump = the original semantics (no-op free, GC off,
+  cumulative ceiling), ~14% faster per request on alloc-heavy
+  micro-patterns. Intended host policy: run handlers on BUMP; on
+  `oom_hit` (which reports cumulative `used` in bump mode) retry the
+  request under GC and tag the handler churny.
+- **O(1) reset in both regimes**: cursor rewind (~7 ns) or
+  create_mspace_with_base stomped over the dirty buffer (~65 ns) —
+  all allocator state lives inside the buffer; nothing is freed,
+  purged, or unmapped; pages stay resident and warm.
+- **Fixed JSRequestState slot**: 512 B reserved at the head of the
+  request buffer, outside both allocators. rt->req is written once at
+  freeze; resets re-init in place; the mode can flip without a base
+  write (mandatory under harden).
+- **Costs measured**: GC mode is 22–27% slower than bump on
+  per-request micro-benches (A: 3953→4830 ns; D: +9%); the automatic
+  trigger and the mode dispatch are noise. A 200k-pair cycle generator
+  (~44 MB cyclic garbage — an OOM under bump in a 16 MB region)
+  completes at ~5 KB live under GC mode.
+- **Validation**: full 46,020-test corpus base-clean under ASan +
+  dlmalloc FOOTERS + thermometer, under GC-at-every-allocation
+  torture (FORCE_GC_AT_MALLOC), and under hardened (PROT_READ) base.
+  Eval outcomes byte-identical across all configurations.
+
+### Still-future ideas (kept from the back-pocket thinking)
+
+- In-request bump front end + GC overflow tier (the original design):
+  only worth it if profiles show the GC-mode delta in real handler
+  latencies AND the per-reset selector's retry pattern is not enough.
+  If built, treat bump-region objects like base in the collector
+  (skip in child callbacks — they cannot die before reset, so their
+  refs genuinely are roots); do NOT put them in the GC registry, or
+  the first post-switch collection walks the whole bump population.
+- Reserve/commit growth for the request region (grow capacity at a
+  stable address on oom_hit), guard page after base, MADV_HUGEPAGE
+  on the request region.
+- WASM reactor exposure of the mode setter, if the replay side ever
+  wants per-run regimes.
+
+## Original back-pocket design (historical)
+
+Superseded by AS BUILT above; kept because the "linchpin insight"
+section is still the correctness argument for why the allocator switch
+is sound. Originally: not built, documented so that if the request
+bump arena's allocation ceiling became a problem on release, the fix
+was already designed.
 
 ### The property that bites
 
