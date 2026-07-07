@@ -52766,7 +52766,8 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
     if (!s)
         return JS_EXCEPTION;
     if (js_map_is_immutable_base(ctx, this_val))
-        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
+        return JS_ThrowTypeError(ctx,
+            "cannot mutate a frozen base collection; copy it first (e.g. new Map(m))");
     is_set = (magic & MAGIC_SET);
     key = map_normalize_key_const(ctx, argv[0]);
     if (s->is_weak && !is_valid_weakref_target(key))
@@ -52814,8 +52815,6 @@ static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
     JSValueConst key;
     JSValue value;
 
-    if (s && js_map_is_immutable_base(ctx, this_val))
-        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     if (!s)
         return JS_EXCEPTION;
     if (computed && check_function(ctx, argv[1]))
@@ -52825,6 +52824,11 @@ static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeError(ctx, "invalid value used as WeakMap key");
     mr = map_find_record(ctx, s, key);
     if (!mr) {
+        /* arena: only the insert branch mutates; a present-key lookup is
+           a safe read-through even on a frozen base collection. */
+        if (js_map_is_immutable_base(ctx, this_val))
+            return JS_ThrowTypeError(ctx,
+                "cannot mutate a frozen base collection; copy it first (e.g. new Map(m))");
         if (computed) {
             value = JS_Call(ctx, argv[1], JS_UNDEFINED, 1, &key);
             if (JS_IsException(value))
@@ -52869,7 +52873,8 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
     if (!s)
         return JS_EXCEPTION;
     if (js_map_is_immutable_base(ctx, this_val))
-        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
+        return JS_ThrowTypeError(ctx,
+            "cannot mutate a frozen base collection; copy it first (e.g. new Map(m))");
     key = map_normalize_key_const(ctx, argv[0]);
     mr = map_find_record(ctx, s, key);
     if (!mr)
@@ -52888,7 +52893,8 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
     if (!s)
         return JS_EXCEPTION;
     if (js_map_is_immutable_base(ctx, this_val))
-        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
+        return JS_ThrowTypeError(ctx,
+            "cannot mutate a frozen base collection; copy it first (e.g. new Map(m))");
     list_for_each_safe(el, el1, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         map_delete_record(ctx->rt, s, mr);

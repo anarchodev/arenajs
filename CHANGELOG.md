@@ -93,10 +93,14 @@ safe consumer pattern spelled out.
   immutability means no mid-iteration deletion to protect against),
   and every mutator (`set`/`add`/`delete`/`clear`/`getOrInsert`, all
   four collection classes) throws
-  `TypeError: snapshot collection is immutable` on a base receiver.
-  Handlers needing a mutable copy: `new Map(snapshotMap)` (reads
-  only). arena-smoke asserts iteration + reads + copy at zero base
-  pages and all mutators throwing.
+  `TypeError: cannot mutate a frozen base collection; copy it first
+  (e.g. new Map(m))` on a base receiver — except `getOrInsert` with a
+  PRESENT key, which is a pure read-through and succeeds. Handlers
+  needing a mutable copy: `new Map(snapshotMap)` (reads only).
+  arena-smoke asserts iteration + reads + copy at zero base pages and
+  the mutators throwing; the dedicated arena-basemap harness (from the
+  base-collection-safety branch, which independently built this same
+  fix first) covers the full matrix in the test-arena sweep.
 
 - The WASM reactor ran **unseeded** after a host `arena_set_random_seed`:
   the seed landed in `JSRequestState` (relocated there for Math.random
