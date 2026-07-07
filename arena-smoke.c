@@ -252,6 +252,24 @@ int main(void)
         fprintf(stderr, "unharden failed\n"); return 1;
     }
 
+    /* --- per-reset allocator mode selection --- */
+    /* Bump mode: master semantics — cumulative usage, free is a no-op. */
+    js_dual_arena_set_request_mode(da, JS_ARENA_REQ_MODE_BUMP);
+    JS_ResetRequestArena(rt);
+    if (js_dual_arena_request_mode(da) != JS_ARENA_REQ_MODE_BUMP) {
+        fprintf(stderr, "mode getter mismatch\n"); return 1;
+    }
+    if (eval_print(ctx, "GREET('bump mode')", "mode-bump")) return 1;
+    size_t bump_used = js_dual_arena_request_used(da);
+    /* Back to GC mode: live-byte semantics return. */
+    js_dual_arena_set_request_mode(da, JS_ARENA_REQ_MODE_GC);
+    JS_ResetRequestArena(rt);
+    if (eval_print(ctx, "GREET('gc mode')", "mode-gc")) return 1;
+    printf("mode flip: bump used=%zu (cumulative), gc live=%zu, post-reset=%s\n",
+           bump_used, js_dual_arena_request_used(da),
+           js_dual_arena_request_mode(da) == JS_ARENA_REQ_MODE_GC ? "GC" : "BUMP");
+    if (bump_used == 0) { fprintf(stderr, "bump accounting broken\n"); return 1; }
+
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
        (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
        etc.) are for the refcount-based default path. In arena mode the

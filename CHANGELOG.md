@@ -40,6 +40,25 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+### Added
+
+- **⚠ Contract** (hybrid-gc branch) — per-reset request-allocator
+  selection: `js_dual_arena_set_request_mode(da, mode)` /
+  `js_dual_arena_request_mode(da)` with `JS_ARENA_REQ_MODE_GC`
+  (default: dlmalloc mspace, frees reclaim, refcount + cycle GC,
+  ceiling = peak live set) and `JS_ARENA_REQ_MODE_BUMP` (bump cursor,
+  free is a no-op, GC off, ceiling = cumulative allocation — master
+  semantics, ~14% faster per request on alloc-heavy micro-benches).
+  The choice takes effect at the NEXT reset; a request always runs
+  entirely under one regime. `request_used`/`oom_used` follow the
+  mode's semantics (live vs cumulative). Intended production pattern:
+  run handlers on BUMP; on `oom_hit`, retry the request under GC and
+  tag the handler churny. Mode state lives in the heap-side JSDualArena
+  and JSRequestState — switching writes zero base bytes (validated by
+  50 alternating hardened requests). Enabled by the fixed
+  JSRequestState head slot, which makes rt->req independent of either
+  allocator's layout.
+
 ### Fixed
 
 - **⚠ Contract** — post-freeze modifications of base (snapshot)

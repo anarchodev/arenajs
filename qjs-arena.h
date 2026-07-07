@@ -103,13 +103,21 @@ static inline bool js_arena_ptr_is_base(const void *p)
 JS_EXTERN int  js_arena_register_base(const uint8_t *lo, const uint8_t *hi);
 JS_EXTERN void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi);
 
-/* Same registry pattern for request-region ranges (the dlmalloc mspace
- * backing buffers). Needed because js_malloc_usable_size receives only
- * the pointer — no opaque — and must dispatch between mspace chunks
- * (mspace_usable_size) and bump-header allocations (base arena and all
- * pre-freeze pointers). Registered at freeze alongside the base range. */
-extern __thread struct js_arena_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
-extern __thread int                   js_arena_req_range_count;
+/* Same registry pattern for request-region ranges. Needed because
+ * js_malloc_usable_size receives only the pointer — no opaque — and
+ * must dispatch between mspace chunks (mspace_usable_size) and
+ * bump-header allocations. Each entry carries a pointer to its arena's
+ * CURRENT request mode: with per-reset allocator selection, whether a
+ * request-range pointer is an mspace chunk or a bump allocation is a
+ * property of the arena's mode this request — and every live request
+ * pointer matches the current mode, because a reset (the only moment
+ * the mode can change) kills all request allocations wholesale. */
+struct js_arena_req_range {
+    const uint8_t *lo, *hi;
+    const uint8_t *mode;   /* -> JSDualArena.req_mode (JSArenaReqMode) */
+};
+extern __thread struct js_arena_req_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
+extern __thread int                       js_arena_req_range_count;
 
 static inline bool js_arena_ptr_is_request(const void *p)
 {
@@ -121,7 +129,8 @@ static inline bool js_arena_ptr_is_request(const void *p)
     return false;
 }
 
-JS_EXTERN int  js_arena_register_request(const uint8_t *lo, const uint8_t *hi);
+JS_EXTERN int  js_arena_register_request(const uint8_t *lo, const uint8_t *hi,
+                                         const uint8_t *mode);
 JS_EXTERN void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi);
 
 /* Fixed per-request state slot. The first JS_ARENA_REQUEST_SLOT_SIZE
@@ -136,6 +145,30 @@ JS_EXTERN void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi)
  * without a base write to re-point rt->req. */
 #define JS_ARENA_REQUEST_SLOT_SIZE 512
 JS_EXTERN void *js_dual_arena_request_slot(JSDualArena *da);
+
+/* Per-reset request-allocator selection. Two regimes over the same
+ * buffer (past the fixed state slot):
+ *
+ *   JS_ARENA_REQ_MODE_GC   — dlmalloc mspace: js_free reclaims,
+ *     refcount + cycle GC live, ceiling = peak live set. Default.
+ *   JS_ARENA_REQ_MODE_BUMP — bump cursor: ~3-instruction allocs,
+ *     js_free is a no-op, GC off, ceiling = CUMULATIVE allocation
+ *     (master semantics; OOM is the capacity signal — see oom_hit).
+ *
+ * js_dual_arena_set_request_mode() records the choice; it takes effect
+ * at the NEXT reset (a request always runs entirely under one regime —
+ * mid-request switching would orphan live allocations' provenance).
+ * The intended production pattern: run handlers on BUMP for speed; on
+ * oom_hit, retry the request under GC and tag the handler churny.
+ * Switching costs nothing beyond the reset itself and touches no base
+ * memory (mode state lives in the heap-allocated JSDualArena). */
+typedef enum {
+    JS_ARENA_REQ_MODE_GC = 0,
+    JS_ARENA_REQ_MODE_BUMP = 1,
+} JSArenaReqMode;
+JS_EXTERN void          js_dual_arena_set_request_mode(JSDualArena *da,
+                                                       JSArenaReqMode mode);
+JS_EXTERN JSArenaReqMode js_dual_arena_request_mode(const JSDualArena *da);
 
 /* JSMallocFunctions table; pass &js_dual_arena_malloc_funcs to JS_NewRuntime2
    together with a JSDualArena* as the opaque parameter. */

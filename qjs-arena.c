@@ -86,17 +86,20 @@ struct JSDualArena {
     JSArena request;            /* buf/capacity double as the mspace backing */
     JSArenaMode mode;
     JSArenaOOM  oom;
-    mspace msp;                 /* NULL until freeze; recreated on reset */
-    size_t request_used;        /* live bytes (usable_size sums) in the mspace */
+    mspace msp;                 /* GC mode: mspace over buf+floor; NULL in bump mode */
+    size_t request_used;        /* GC mode: live bytes (usable_size sums) */
+    uint8_t req_mode;           /* JSArenaReqMode governing THIS request */
+    uint8_t req_mode_next;      /* applied at the next reset (and at freeze) */
 };
 
 /* Per-thread list of registered arena base ranges; see qjs-arena.h. */
 __thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
 __thread int                   js_arena_range_count = 0;
 
-/* Per-thread list of registered request (mspace) ranges; see qjs-arena.h. */
-__thread struct js_arena_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
-__thread int                   js_arena_req_range_count = 0;
+/* Per-thread list of registered request ranges (+ current-mode pointer
+   for usable_size dispatch); see qjs-arena.h. */
+__thread struct js_arena_req_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
+__thread int                       js_arena_req_range_count = 0;
 
 int js_arena_register_base(const uint8_t *lo, const uint8_t *hi)
 {
@@ -122,12 +125,14 @@ void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi)
     }
 }
 
-int js_arena_register_request(const uint8_t *lo, const uint8_t *hi)
+int js_arena_register_request(const uint8_t *lo, const uint8_t *hi,
+                              const uint8_t *mode)
 {
     if (js_arena_req_range_count >= JS_ARENA_RANGES_MAX)
         return -1;
     js_arena_req_ranges[js_arena_req_range_count].lo = lo;
     js_arena_req_ranges[js_arena_req_range_count].hi = hi;
+    js_arena_req_ranges[js_arena_req_range_count].mode = mode;
     js_arena_req_range_count++;
     return 0;
 }
@@ -140,6 +145,7 @@ void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi)
             js_arena_req_ranges[i] = js_arena_req_ranges[js_arena_req_range_count];
             js_arena_req_ranges[js_arena_req_range_count].lo = NULL;
             js_arena_req_ranges[js_arena_req_range_count].hi = NULL;
+            js_arena_req_ranges[js_arena_req_range_count].mode = NULL;
             return;
         }
     }
@@ -325,6 +331,8 @@ JSDualArena *js_dual_arena_new(size_t base_size, size_t request_size)
     }
     arena_set_cursor(&da->request, da->request.floor);
     da->mode = JS_ARENA_MODE_BASE;
+    da->req_mode = JS_ARENA_REQ_MODE_GC;
+    da->req_mode_next = JS_ARENA_REQ_MODE_GC;
     return da;
 }
 
@@ -354,33 +362,52 @@ void js_dual_arena_free(JSDualArena *da)
     free(da);
 }
 
+/* Apply the pending request mode: (re)establish the chosen allocator's
+   discipline over the buffer past the fixed state slot. */
+static void request_mode_apply(JSDualArena *da)
+{
+    da->req_mode = da->req_mode_next;
+    if (da->req_mode == JS_ARENA_REQ_MODE_GC) {
+        da->msp = create_mspace_with_base(
+            da->request.buf + da->request.floor,
+            da->request.capacity - da->request.floor, 0);
+        assert(da->msp); /* fails only if capacity is absurdly small */
+        da->request_used = 0;
+    } else {
+        da->msp = NULL;
+        arena_reset(&da->request); /* cursor -> floor */
+    }
+}
+
 void js_dual_arena_freeze(JSDualArena *da)
 {
     da->mode = JS_ARENA_MODE_REQUEST;
-    /* The request buffer becomes a dlmalloc mspace. The bump cursor that
-       arena_init wrote at offset 0 is dead from here on; the mspace
-       header overwrites it. */
-    da->msp = create_mspace_with_base(da->request.buf + da->request.floor,
-                                      da->request.capacity - da->request.floor,
-                                      0);
-    assert(da->msp); /* fails only if capacity is absurdly small */
-    da->request_used = 0;
+    request_mode_apply(da);
     js_arena_register_base(da->base.buf, da->base.buf + da->base.capacity);
     js_arena_register_request(da->request.buf,
-                              da->request.buf + da->request.capacity);
+                              da->request.buf + da->request.capacity,
+                              &da->req_mode);
+}
+
+void js_dual_arena_set_request_mode(JSDualArena *da, JSArenaReqMode mode)
+{
+    da->req_mode_next = (uint8_t)mode;
+}
+
+JSArenaReqMode js_dual_arena_request_mode(const JSDualArena *da)
+{
+    return (JSArenaReqMode)da->req_mode;
 }
 
 void js_dual_arena_reset_request(JSDualArena *da)
 {
-    if (da->msp) {
-        /* O(1) reset: stomp a fresh mspace header over the dirty buffer.
-           All allocator state lives inside the buffer, so this forgets
-           every allocation without freeing, purging, or unmapping —
-           the mspace analogue of the bump-cursor rewind. */
-        da->msp = create_mspace_with_base(da->request.buf + da->request.floor,
-                                          da->request.capacity - da->request.floor,
-                                          0);
-        da->request_used = 0;
+    if (da->mode == JS_ARENA_MODE_REQUEST) {
+        /* O(1) reset in either regime: stomp a fresh mspace header or
+           rewind the cursor to the floor. This is also the only moment
+           the request mode may change — every live request allocation
+           dies here, so the next request's pointers all match the next
+           request's mode. */
+        request_mode_apply(da);
     } else {
         arena_reset(&da->request); /* pre-freeze reset: still a bump region */
     }
@@ -399,11 +426,14 @@ static void note_oom(JSDualArena *da, size_t requested)
         return;
     da->oom.hit = 1;
     da->oom.requested = requested;
-    /* `used` is live bytes, not cumulative — with the reclaiming mspace a
-       refusal means the PEAK LIVE SET (plus fragmentation) hit capacity,
-       which is a genuine sizing signal rather than a churn artefact. */
-    da->oom.used = da->request_used;
-    da->oom.limit = da->request.capacity;
+    /* GC mode: `used` is LIVE bytes — a refusal means the peak live set
+       (plus fragmentation) hit capacity, a genuine sizing signal. Bump
+       mode: `used` is cumulative — the classic churn ceiling, and the
+       host's cue to retry the request under GC mode. */
+    da->oom.used = (da->req_mode == JS_ARENA_REQ_MODE_GC)
+        ? da->request_used
+        : arena_cursor(&da->request) - da->request.floor;
+    da->oom.limit = da->request.capacity - da->request.floor;
 }
 
 bool js_dual_arena_oom_hit(const JSDualArena *da)
@@ -455,9 +485,12 @@ size_t js_dual_arena_base_used(const JSDualArena *da)
 
 size_t js_dual_arena_request_used(const JSDualArena *da)
 {
-    /* Live bytes in the mspace (0 pre-freeze, matching the old cursor
-       math on an untouched request buffer). */
-    return da->request_used;
+    /* GC mode: live bytes in the mspace. Bump mode (and pre-freeze):
+       cursor offset past the floor — cumulative. */
+    if (da->mode == JS_ARENA_MODE_REQUEST
+        && da->req_mode == JS_ARENA_REQ_MODE_GC)
+        return da->request_used;
+    return arena_cursor(&da->request) - da->request.floor;
 }
 
 /* ----- JSMallocFunctions glue -----
@@ -486,6 +519,15 @@ static void *jda_calloc(void *opaque, size_t count, size_t size)
             memset(p, 0, total);
         return p;
     }
+    if (da->req_mode == JS_ARENA_REQ_MODE_BUMP) {
+        /* bump memory is reused dirty across requests: always memset */
+        void *p = arena_alloc(&da->request, total);
+        if (p)
+            memset(p, 0, total);
+        else
+            note_oom(da, total);
+        return p;
+    }
     /* mspace_calloc memsets explicitly (its chunks are never fresh mmap
        pages here), so reused dirty buffer memory can't leak a previous
        request's bytes into zero-initialized allocations. */
@@ -502,6 +544,12 @@ static void *jda_malloc(void *opaque, size_t size)
     JSDualArena *da = opaque;
     if (da->mode == JS_ARENA_MODE_BASE)
         return arena_alloc(&da->base, size);
+    if (da->req_mode == JS_ARENA_REQ_MODE_BUMP) {
+        void *p = arena_alloc(&da->request, size);
+        if (!p)
+            note_oom(da, size);
+        return p;
+    }
     void *p = mspace_malloc(da->msp, size);
     if (p)
         da->request_used += mspace_usable_size(p);
@@ -515,6 +563,8 @@ static void jda_free(void *opaque, void *ptr)
     JSDualArena *da = opaque;
     if (!ptr || da->mode == JS_ARENA_MODE_BASE)
         return;
+    if (da->req_mode == JS_ARENA_REQ_MODE_BUMP)
+        return; /* bump: free is a no-op; memory returns at reset */
     if (!arena_contains(&da->request, ptr))
         return; /* base pointer: immortal, not an mspace chunk */
     da->request_used -= mspace_usable_size(ptr);
@@ -526,6 +576,14 @@ static void *jda_realloc(void *opaque, void *ptr, size_t size)
     JSDualArena *da = opaque;
     if (da->mode == JS_ARENA_MODE_BASE) {
         return arena_realloc(&da->base, ptr, size);
+    }
+    if (da->req_mode == JS_ARENA_REQ_MODE_BUMP) {
+        /* arena_realloc reads bump headers, which base pointers also
+           carry, so cross-region growth copies correctly. */
+        void *p = arena_realloc(&da->request, ptr, size);
+        if (!p && size != 0)
+            note_oom(da, size);
+        return p;
     }
     if (!ptr)
         return jda_malloc(opaque, size);
@@ -563,11 +621,20 @@ static size_t jda_usable_size(const void *ptr)
 {
     if (!ptr)
         return 0;
-    /* No opaque on this hook — dispatch by pointer provenance. Request
-       (mspace) chunks carry dlmalloc headers; everything else (base
-       arena, all pre-freeze pointers) carries a bump header. */
-    if (js_arena_ptr_is_request(ptr))
-        return mspace_usable_size(ptr);
+    /* No opaque on this hook — dispatch by pointer provenance AND the
+       owning arena's current request mode: a request-range pointer is
+       an mspace chunk in GC mode and a bump-header allocation in bump
+       mode (all live request pointers match the current mode; the mode
+       only changes at reset, which kills them all). Everything else
+       (base arena, pre-freeze pointers) carries a bump header. */
+    const uint8_t *b = (const uint8_t *)ptr;
+    for (int i = 0; i < js_arena_req_range_count; i++) {
+        if (b >= js_arena_req_ranges[i].lo && b < js_arena_req_ranges[i].hi) {
+            if (*js_arena_req_ranges[i].mode == JS_ARENA_REQ_MODE_GC)
+                return mspace_usable_size(ptr);
+            return (size_t)arena_user_size(ptr);
+        }
+    }
     return (size_t)arena_user_size(ptr);
 }
 

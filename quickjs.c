@@ -313,6 +313,11 @@ typedef struct JSRequestState {
        request memory: zero base writes. */
     struct list_head gc_obj_list;
     struct list_head tmp_obj_list;
+    /* Cached js_dual_arena_request_mode() == GC for this request, set
+       at every JS_RelocateReqState. In bump mode the collector is off
+       (frees are no-ops; the live-byte trigger would read cumulative
+       bytes), and GC-object registry linkage is skipped for speed. */
+    bool gc_mode;
     /* Live-byte ceiling that arms the automatic cycle collection
        (js_trigger_gc). Compared against the mspace's live-byte counter:
        acyclic churn never advances that counter (frees are real), so
@@ -1725,6 +1730,8 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
     if (rt->is_arena) {
+        if (!rt->req->gc_mode)
+            return; /* bump mode: no reclaim, no trigger */
 #ifdef FORCE_GC_AT_MALLOC
         JS_RunGC(rt);
 #else
@@ -2298,6 +2305,8 @@ int JS_RelocateReqState(JSRuntime *rt)
        the per-request seed and the floor for the ratchet in
        js_trigger_gc. */
     new_req->gc_threshold = rt->malloc_gc_threshold;
+    new_req->gc_mode =
+        js_dual_arena_request_mode(JS_GetDualArena(rt)) == JS_ARENA_REQ_MODE_GC;
     new_req->error_back_trace_req = JS_UNDEFINED;
     new_req->date_now_pinned_req = -1;   /* unpinned until the host pins */
     new_req->time_origin_req = 0;
@@ -7639,8 +7648,13 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
            in the request-side list — exactly the collectible set the
            cycle collector will walk. Head and neighbors are always
            request memory (base objects are on the other list), so
-           linking and unlinking never writes base. */
-        list_add_tail(&h->link, &rt->req->gc_obj_list);
+           linking and unlinking never writes base. In bump mode the
+           collector never runs: self-loop instead (list_del stays
+           safe) and skip the registry's four stores per allocation. */
+        if (likely(rt->req->gc_mode))
+            list_add_tail(&h->link, &rt->req->gc_obj_list);
+        else
+            init_list_head(&h->link);
         return;
     }
     list_add_tail(&h->link, &rt->gc_obj_list);
@@ -7922,6 +7936,11 @@ static void gc_free_cycles(JSRuntime *rt)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    /* arena, bump mode: frees are no-ops and objects skipped registry
+       linkage — collecting would run finalizers without reclaiming a
+       byte. No-op, matching master's bump-only semantics. */
+    if (rt->is_arena && !rt->req->gc_mode)
+        return;
     /* arena: the collector runs against the request-side registry
        (rt->req->gc_obj_list) — exactly the post-freeze collectible
        set. Base objects are reachable only as children and the
