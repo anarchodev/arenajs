@@ -439,6 +439,22 @@ void arena_destroy(void)
     }
 }
 
+/* Select the request-allocator regime for SUBSEQUENT runs
+ * (qjs-arena.h JSArenaReqMode: 0 = GC mspace, 1 = bump). Records the
+ * choice on the dual arena; it binds at the next request-arena reset —
+ * which arena_run / arena_run_module perform at entry — so call this
+ * between runs, before the run it should govern. Replay embedders use
+ * it to re-run a request under the regime the live request completed
+ * under (a GC-completed churny request would OOM under bump). */
+ARENA_EXPORT
+void arena_set_request_mode(int mode)
+{
+    if (!g_rt) return;
+    JSDualArena *da = JS_GetDualArena(g_rt);
+    js_dual_arena_set_request_mode(
+        da, mode == 0 ? JS_ARENA_REQ_MODE_GC : JS_ARENA_REQ_MODE_BUMP);
+}
+
 /* Seed the per-request PRNG used by Math.random (and, via
  * JS_FillRandomBytes, by host crypto bindings). Splits a u64 into
  * two u32s so the WASM ABI doesn't need BigInt — the JS host calls
