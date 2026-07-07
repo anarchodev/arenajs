@@ -40,6 +40,25 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.0] - 2026-07-07
+
+The **request-side GC release**: the per-request region gains a second,
+default allocator regime — a dlmalloc mspace with real frees, refcount
+reclamation, and a cycle collector with an automatic live-byte trigger —
+so a handler's memory ceiling becomes its peak live set instead of its
+cumulative allocation. The original bump regime remains available
+per-reset (`js_dual_arena_set_request_mode`), enabling the
+try-fast/retry-under-GC host pattern. The inviolate-base invariant is
+now enforceable in production (`js_dual_arena_harden`: base goes
+PROT_READ; the full 46,020-test corpus runs under it), and the last
+known base-writers were closed on the way: prototype-chain shadow
+visibility, setPrototypeOf identity checks, deep-teardown recursion,
+snapshot Map/Set record locks, and the per-request determinism pins.
+Resets stay O(1) in both regimes; JSRequestState moved to a fixed head
+slot outside the allocators.
+
 ### Added
 
 - **⚠ Contract** (hybrid-gc branch) — per-reset request-allocator

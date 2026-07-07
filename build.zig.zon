@@ -1,6 +1,6 @@
 .{
     .name = .arenajs,
-    .version = "0.2.1",
+    .version = "0.3.0",
     .fingerprint = 0x63674e5469b18241,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{},
