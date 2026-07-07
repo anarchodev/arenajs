@@ -2218,24 +2218,26 @@ void *JS_GetMallocOpaque(JSRuntime *rt)
    arena instead of dirtying the JSRuntime page in base. */
 int JS_RelocateReqState(JSRuntime *rt)
 {
-    /* Allocates a fresh JSRequestState via js_mallocz_rt — lands in the
-       request arena (in arena mode). Called twice in the lifecycle:
-        - once at JS_FreezeRuntime (initial relocation; one base write
-          to set rt->req).
-        - on every JS_ResetRequestArena (re-init after cursor rewind;
-          allocation lands at the same address as the original because
-          the cursor was reset and JSRequestState is the first
-          post-reset allocation, so rt->req does not need to be
-          re-written — verified by assert below). */
-    JSRequestState *new_req = js_mallocz_rt(rt, sizeof(*new_req));
-    if (!new_req)
-        return -1;
-    /* On reset, new_req must equal rt->req (address-stable). On the
-       initial freeze, rt->req still points at the embedded req_state;
-       new_req is the first arena allocation, the assignment below
-       moves rt->req to it. */
-    if (rt->req != &rt->req_state && new_req != rt->req)
-        abort(); /* address shifted across reset; broken invariant */
+    /* Re-initializes the JSRequestState in the arena's fixed head
+       slot. Called once at JS_FreezeRuntime (sets rt->req — the one
+       base write) and on every JS_ResetRequestArena (in-place re-init;
+       rt->req unchanged). */
+    /* JSRequestState lives in the arena's fixed head slot — reserved
+       outside the allocator's territory, so its address is a constant
+       of the arena. rt->req is written once (freeze); resets re-init
+       the slot in place with zero base writes; and the address no
+       longer depends on the request allocator's first-allocation
+       behavior, which frees the allocator to change (or be selected
+       per reset) without re-pointing rt->req. */
+    if (sizeof(JSRequestState) > JS_ARENA_REQUEST_SLOT_SIZE) {
+        fprintf(stderr,
+                "JSRequestState (%zu B) exceeds JS_ARENA_REQUEST_SLOT_SIZE "
+                "(%d B) — raise the slot size in qjs-arena.h\n",
+                sizeof(JSRequestState), JS_ARENA_REQUEST_SLOT_SIZE);
+        abort();
+    }
+    JSRequestState *new_req =
+        js_dual_arena_request_slot(JS_GetDualArena(rt));
     *new_req = rt->req_state;
     new_req->atom_overlay_base = rt->atom_size;
     new_req->atom_overlay_free_index = 0;

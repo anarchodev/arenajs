@@ -98,6 +98,19 @@ static inline bool js_arena_ptr_is_base(const void *p)
 JS_EXTERN int  js_arena_register_base(const uint8_t *lo, const uint8_t *hi);
 JS_EXTERN void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi);
 
+/* Fixed per-request state slot. The first JS_ARENA_REQUEST_SLOT_SIZE
+ * bytes of the request region (after the 16-byte cursor prefix) are
+ * reserved OUTSIDE the allocator's territory: the bump cursor's floor
+ * sits past them and resets never reclaim them. JSRequestState lives
+ * here at an address that is fixed for the life of the arena — so
+ * rt->req is written exactly once (at freeze), resets re-initialize
+ * the slot in place, and the address no longer depends on the request
+ * allocator's behavior at all. That decoupling is what allows the
+ * request-side allocator to change (or, later, be chosen per reset)
+ * without a base write to re-point rt->req. */
+#define JS_ARENA_REQUEST_SLOT_SIZE 512
+JS_EXTERN void *js_dual_arena_request_slot(JSDualArena *da);
+
 /* JSMallocFunctions table; pass &js_dual_arena_malloc_funcs to JS_NewRuntime2
    together with a JSDualArena* as the opaque parameter. */
 extern const JSMallocFunctions js_dual_arena_malloc_funcs;

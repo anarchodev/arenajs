@@ -52,6 +52,9 @@
 typedef struct JSArena {
     uint8_t *buf;                /* owned, 16-byte aligned, capacity bytes */
     size_t capacity;
+    size_t floor;                /* cursor start/reset point; > PREFIX_LEN
+                                    when a head region is reserved (the
+                                    request arena's fixed state slot) */
     void *last_alloc_ptr;        /* in-place realloc fast path */
     size_t last_alloc_aligned;
 } JSArena;
@@ -154,9 +157,10 @@ static int arena_init(JSArena *a, size_t capacity)
 #endif
     a->buf = buf;
     a->capacity = capacity;
+    a->floor = ARENA_PREFIX_LEN;
     a->last_alloc_ptr = NULL;
     a->last_alloc_aligned = 0;
-    arena_set_cursor(a, ARENA_PREFIX_LEN);
+    arena_set_cursor(a, a->floor);
     return 0;
 }
 
@@ -178,7 +182,7 @@ static void arena_destroy(JSArena *a)
 
 static void arena_reset(JSArena *a)
 {
-    arena_set_cursor(a, ARENA_PREFIX_LEN);
+    arena_set_cursor(a, a->floor);
     a->last_alloc_ptr = NULL;
     a->last_alloc_aligned = 0;
 }
@@ -273,6 +277,17 @@ JSDualArena *js_dual_arena_new(size_t base_size, size_t request_size)
         free(da);
         return NULL;
     }
+    /* Reserve the fixed per-request state slot ahead of the
+       allocator's territory (see JS_ARENA_REQUEST_SLOT_SIZE). */
+    da->request.floor = ARENA_PREFIX_LEN + JS_ARENA_REQUEST_SLOT_SIZE;
+    if (da->request.floor + ARENA_HEADER_SIZE + ARENA_ALIGN
+            > da->request.capacity) {
+        arena_destroy(&da->base);
+        arena_destroy(&da->request);
+        free(da);
+        return NULL;
+    }
+    arena_set_cursor(&da->request, da->request.floor);
     da->mode = JS_ARENA_MODE_BASE;
     return da;
 }
@@ -323,8 +338,8 @@ static void note_oom(JSDualArena *da, size_t requested)
         return;
     da->oom.hit = 1;
     da->oom.requested = requested;
-    da->oom.used = arena_cursor(&da->request) - ARENA_PREFIX_LEN;
-    da->oom.limit = da->request.capacity - ARENA_PREFIX_LEN;
+    da->oom.used = arena_cursor(&da->request) - da->request.floor;
+    da->oom.limit = da->request.capacity - da->request.floor;
 }
 
 bool js_dual_arena_oom_hit(const JSDualArena *da)
@@ -345,6 +360,13 @@ size_t js_dual_arena_oom_used(const JSDualArena *da)
 size_t js_dual_arena_oom_limit(const JSDualArena *da)
 {
     return da->oom.limit;
+}
+
+void *js_dual_arena_request_slot(JSDualArena *da)
+{
+    /* Fixed for the life of the arena; never handed to the allocator,
+       never reclaimed by reset. */
+    return da->request.buf + ARENA_PREFIX_LEN;
 }
 
 bool js_dual_arena_is_frozen(const JSDualArena *da)
@@ -369,7 +391,7 @@ size_t js_dual_arena_base_used(const JSDualArena *da)
 
 size_t js_dual_arena_request_used(const JSDualArena *da)
 {
-    return arena_cursor(&da->request) - ARENA_PREFIX_LEN;
+    return arena_cursor(&da->request) - da->request.floor;
 }
 
 /* ----- JSMallocFunctions glue ----- */
@@ -478,12 +500,9 @@ void JS_FreezeRuntime(JSRuntime *rt)
 
 void JS_ResetRequestArena(JSRuntime *rt)
 {
-    /* Cursor → PREFIX_LEN, then re-allocate JSRequestState as the very
-       first post-reset allocation. Since the cursor is rewound, the
-       allocation lands at the same address it had after the initial
-       JS_RelocateReqState, so rt->req (a one-time base write at freeze)
-       remains valid without further base writes. JS_RelocateReqState
-       is the canonical re-init path; call it here too. */
+    /* Rewind the cursor to the floor (past the fixed JSRequestState
+       slot), then re-init the slot in place. rt->req (a one-time base
+       write at freeze) stays valid with zero further base writes. */
     js_dual_arena_reset_request(JS_GetDualArena(rt));
     JS_RelocateReqState(rt);
 }
