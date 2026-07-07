@@ -499,7 +499,7 @@ target_link_libraries(api-test PRIVATE qjs)
 # libqjs as api-test; they read test262 files at runtime relative to
 # the build's source dir for arena-test262.
 
-foreach(arena_target IN ITEMS arena-smoke arena-stress arena-bench arena-test262 arena-coexist arena-interrupt)
+foreach(arena_target IN ITEMS arena-smoke arena-stress arena-bench arena-test262 arena-coexist arena-interrupt arena-basemap)
     add_executable(${arena_target} ${arena_target}.c)
     target_compile_definitions(${arena_target} PRIVATE ${qjs_defines})
     target_link_libraries(${arena_target} PRIVATE qjs)
