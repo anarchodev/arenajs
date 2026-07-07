@@ -286,6 +286,14 @@ typedef struct JSRequestState {
     bool in_build_stack_trace;
     struct JSStackFrame *current_stack_frame;
     JSValueLink *parent_promise;
+    /* Per-request twins of ctx->date_now_pinned / ctx->time_origin
+       (both base-resident on JSContext). JS_SetDateNow /
+       JS_SetTimeOrigin write here in arena mode, so pinning the clock
+       per request is not a base write, and reset restores the defined
+       defaults (unpinned / origin 0) instead of leaking the previous
+       request's pin. Same pattern as random_state_req. */
+    int64_t date_now_pinned_req;
+    double time_origin_req;
     /* Request-side twin of rt->gc_zero_ref_count_list + rt->gc_phase
        (both base-resident on JSRuntime, so arena mode can't touch
        them). Refcount-zero request objects queue here and are drained
@@ -2252,24 +2260,26 @@ void *JS_GetMallocOpaque(JSRuntime *rt)
    arena instead of dirtying the JSRuntime page in base. */
 int JS_RelocateReqState(JSRuntime *rt)
 {
-    /* Allocates a fresh JSRequestState via js_mallocz_rt — lands in the
-       request arena (in arena mode). Called twice in the lifecycle:
-        - once at JS_FreezeRuntime (initial relocation; one base write
-          to set rt->req).
-        - on every JS_ResetRequestArena (re-init after cursor rewind;
-          allocation lands at the same address as the original because
-          the cursor was reset and JSRequestState is the first
-          post-reset allocation, so rt->req does not need to be
-          re-written — verified by assert below). */
-    JSRequestState *new_req = js_mallocz_rt(rt, sizeof(*new_req));
-    if (!new_req)
-        return -1;
-    /* On reset, new_req must equal rt->req (address-stable). On the
-       initial freeze, rt->req still points at the embedded req_state;
-       new_req is the first arena allocation, the assignment below
-       moves rt->req to it. */
-    if (rt->req != &rt->req_state && new_req != rt->req)
-        abort(); /* address shifted across reset; broken invariant */
+    /* Re-initializes the JSRequestState in the arena's fixed head
+       slot. Called once at JS_FreezeRuntime (sets rt->req — the one
+       base write) and on every JS_ResetRequestArena (in-place re-init;
+       rt->req unchanged). */
+    /* JSRequestState lives in the arena's fixed head slot — reserved
+       outside the allocator's territory, so its address is a constant
+       of the arena. rt->req is written once (freeze); resets re-init
+       the slot in place with zero base writes; and the address no
+       longer depends on the request allocator's first-allocation
+       behavior, which frees the allocator to change (or be selected
+       per reset) without re-pointing rt->req. */
+    if (sizeof(JSRequestState) > JS_ARENA_REQUEST_SLOT_SIZE) {
+        fprintf(stderr,
+                "JSRequestState (%zu B) exceeds JS_ARENA_REQUEST_SLOT_SIZE "
+                "(%d B) — raise the slot size in qjs-arena.h\n",
+                sizeof(JSRequestState), JS_ARENA_REQUEST_SLOT_SIZE);
+        abort();
+    }
+    JSRequestState *new_req =
+        js_dual_arena_request_slot(JS_GetDualArena(rt));
     *new_req = rt->req_state;
     new_req->atom_overlay_base = rt->atom_size;
     new_req->atom_overlay_free_index = 0;
@@ -2289,6 +2299,8 @@ int JS_RelocateReqState(JSRuntime *rt)
        js_trigger_gc. */
     new_req->gc_threshold = rt->malloc_gc_threshold;
     new_req->error_back_trace_req = JS_UNDEFINED;
+    new_req->date_now_pinned_req = -1;   /* unpinned until the host pins */
+    new_req->time_origin_req = 0;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
     /* Same-value store guard: on reset new_req == rt->req (asserted
@@ -52816,6 +52828,29 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
     js_free_rt(rt, wr);
 }
 
+/* arena: records of a base-resident (snapshot) Map/Set are immortal.
+   The iteration protocol's lock refcounts (ref_count++ while a record
+   is the iterator's current element / forEach's locked element, decref
+   after) exist so a record deleted mid-iteration outlives its zombie —
+   but snapshot collections are immutable post-freeze (the mutators
+   below throw), so a base record can never be deleted mid-iteration
+   and needs no lock. Skipping the lock keeps iteration of snapshot
+   collections at zero base writes. */
+static inline bool js_map_record_is_base(JSRuntime *rt, const JSMapRecord *mr)
+{
+    return rt->is_arena && js_arena_ptr_is_base(mr);
+}
+
+/* arena: mutating a snapshot collection would need shadow-on-write for
+   the record list and hash table; until an embedder needs that, throw.
+   Handlers that need a mutable copy: `new Map(snapshotMap)` (reads
+   only). */
+static bool js_map_is_immutable_base(JSContext *ctx, JSValueConst this_val)
+{
+    return ctx->rt->is_arena
+        && js_arena_ptr_is_base(JS_VALUE_GET_OBJ(this_val));
+}
+
 static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
 {
     if (mr->empty)
@@ -52841,6 +52876,8 @@ static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
 
 static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
 {
+    if (js_map_record_is_base(rt, mr))
+        return; /* immortal; never locked (see js_map_record_is_base) */
     if (--mr->ref_count == 0) {
         /* the record can be safely removed */
         assert(mr->empty);
@@ -52859,6 +52896,8 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     is_set = (magic & MAGIC_SET);
     key = map_normalize_key_const(ctx, argv[0]);
     if (s->is_weak && !is_valid_weakref_target(key))
@@ -52906,6 +52945,8 @@ static JSValue js_map_getOrInsert(JSContext *ctx, JSValueConst this_val,
     JSValueConst key;
     JSValue value;
 
+    if (s && js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     if (!s)
         return JS_EXCEPTION;
     if (computed && check_function(ctx, argv[1]))
@@ -52958,6 +52999,8 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     key = map_normalize_key_const(ctx, argv[0]);
     mr = map_find_record(ctx, s, key);
     if (!mr)
@@ -52975,6 +53018,8 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    if (js_map_is_immutable_base(ctx, this_val))
+        return JS_ThrowTypeError(ctx, "snapshot collection is immutable");
     list_for_each_safe(el, el1, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         map_delete_record(ctx->rt, s, mr);
@@ -53014,7 +53059,8 @@ static JSValue js_map_forEach(JSContext *ctx, JSValueConst this_val,
     while (el != &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         if (!mr->empty) {
-            mr->ref_count++;
+            if (!js_map_record_is_base(ctx->rt, mr))
+                mr->ref_count++;
             /* must duplicate in case the record is deleted */
             args[1] = js_dup(mr->key);
             if (magic)
@@ -53283,7 +53329,8 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     }
 
     /* lock the record so that it won't be freed */
-    mr->ref_count++;
+    if (!js_map_record_is_base(ctx->rt, mr))
+        mr->ref_count++;
     it->cur_record = mr;
     *pdone = false;
 
@@ -56211,6 +56258,25 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
     return js_new_string8_len(ctx, buf, pos);
 }
 
+/* arena: route the pinned clock and the performance timeOrigin
+   through the per-request shadow, same dispatch as
+   js_random_state_active — writing them per request must not dirty
+   the base ctx page, and a reset must restore the defined defaults
+   rather than leak the previous request's pin. */
+static inline int64_t *js_date_now_pinned_active(JSContext *ctx)
+{
+    if (ctx->rt->is_arena)
+        return &ctx->rt->req->date_now_pinned_req;
+    return &ctx->date_now_pinned;
+}
+
+static inline double *js_time_origin_active(JSContext *ctx)
+{
+    if (ctx->rt->is_arena)
+        return &ctx->rt->req->time_origin_req;
+    return &ctx->time_origin;
+}
+
 /* OS dependent: return the UTC time in ms since 1970.
    arena: when the context has a pinned value (set via
    JS_SetDateNow), return that instead — embedders use this to make
@@ -56219,8 +56285,8 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
    (e.g. helper functions called before context setup); we fall
    through to gettimeofday in that case. */
 static int64_t date_now(JSContext *ctx) {
-    if (ctx && ctx->date_now_pinned >= 0)
-        return ctx->date_now_pinned;
+    if (ctx && *js_date_now_pinned_active(ctx) >= 0)
+        return *js_date_now_pinned_active(ctx);
     return js__gettimeofday_us() / 1000;
 }
 
@@ -61380,7 +61446,7 @@ static double js__now_ms(void)
 
 static JSValue js_perf_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
-    return js_float64(js__now_ms() - ctx->time_origin);
+    return js_float64(js__now_ms() - *js_time_origin_active(ctx));
 }
 
 static JSValue js_perf_time_origin_get(JSContext *ctx, JSValueConst this_val)
@@ -61388,7 +61454,7 @@ static JSValue js_perf_time_origin_get(JSContext *ctx, JSValueConst this_val)
     /* arena: live getter rather than a stored value, so that
        JS_SetTimeOrigin updates both performance.timeOrigin and the
        performance.now() anchor through a single field write. */
-    return js_float64(ctx->time_origin);
+    return js_float64(*js_time_origin_active(ctx));
 }
 
 static const JSCFunctionListEntry js_perf_proto_funcs[] = {
@@ -61413,12 +61479,16 @@ int JS_AddPerformance(JSContext *ctx)
 
 void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms)
 {
-    ctx->time_origin = time_origin_ms;
+    /* arena: lands in JSRequestState — call AFTER the per-request
+       reset (reset restores origin 0). */
+    *js_time_origin_active(ctx) = time_origin_ms;
 }
 
 void JS_SetDateNow(JSContext *ctx, int64_t date_now_ms)
 {
-    ctx->date_now_pinned = date_now_ms;
+    /* arena: lands in JSRequestState — call AFTER the per-request
+       reset (reset restores the unpinned default). */
+    *js_date_now_pinned_active(ctx) = date_now_ms;
 }
 
 /* Equality comparisons and sameness */

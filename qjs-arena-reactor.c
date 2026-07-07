@@ -49,6 +49,27 @@ static int arena_oom_override(int rc, const char *where);
 static JSRuntime *g_rt;
 static JSContext *g_ctx;
 
+/* Pending determinism pins. The engine stores the live values in
+   JSRequestState, which every per-request reset re-initializes to
+   defaults (unpinned clock, zero PRNG state) — but this ABI's
+   documented order is "set, then run", and arena_run* resets FIRST
+   (results/trace must stay readable between runs). So the reactor
+   buffers the latest host-set values here (plain .bss — neither base
+   nor arena) and re-applies them right after each reset. Sticky until
+   overwritten, matching the pre-relocation behavior. */
+static bool     g_has_random_seed;
+static uint64_t g_random_seed;
+static bool     g_has_date_now;
+static int64_t  g_date_now_ms;
+
+static void arena_reapply_pins(void)
+{
+    if (g_has_random_seed)
+        JS_SetRandomSeed(g_ctx, g_random_seed);
+    if (g_has_date_now)
+        JS_SetDateNow(g_ctx, g_date_now_ms);
+}
+
 ARENA_EXPORT
 int arena_init(int base_kb, int request_kb)
 {
@@ -238,6 +259,7 @@ int arena_run(const char *src)
         return -1;
 
     JS_ResetRequestArena(g_rt);
+    arena_reapply_pins();
 
     JSValue v = JS_Eval(g_ctx, src, strlen(src), "<arena>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
@@ -318,6 +340,7 @@ int arena_run_module(const char *entry_name, const char *entry_src)
 
     g_entry_module = NULL;        /* previous run's def died with its arena */
     JS_ResetRequestArena(g_rt);   /* also clears the per-request OOM record */
+    arena_reapply_pins();
     arena_trace_reset();   /* clear name-table so host can dedupe by run */
 
     /* Compile-only first so the JSModuleDef is reachable for
@@ -428,6 +451,8 @@ void arena_set_random_seed(uint32_t seed_lo, uint32_t seed_hi)
 {
     if (!g_ctx) return;
     uint64_t seed = ((uint64_t)seed_hi << 32) | seed_lo;
+    g_random_seed = seed;
+    g_has_random_seed = true;
     JS_SetRandomSeed(g_ctx, seed);
 }
 
@@ -445,5 +470,7 @@ void arena_set_date_now(uint32_t lo, uint32_t hi)
 {
     if (!g_ctx) return;
     int64_t ms = (int64_t)(((uint64_t)hi << 32) | lo);
+    g_date_now_ms = ms;
+    g_has_date_now = true;
     JS_SetDateNow(g_ctx, ms);
 }

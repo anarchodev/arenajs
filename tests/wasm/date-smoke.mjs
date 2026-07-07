@@ -1,56 +1,61 @@
-// `new Date()` override smoke test.
+// Pinned-clock smoke test for Date.now() / no-arg `new Date()`.
 //
-// Verifies that the no-arg Date constructor (both `new Date()` and the
-// `Date()` non-new call) consume the same tape as `Date.now()`, while
-// passing through any explicit-args / explicit-ms construction. Also
-// asserts that `instanceof Date`, `Date.UTC`, and `Date.prototype`
-// methods survive the wrapper installation.
+// Contract (see arena_set_date_now in qjs-arena-reactor.c): the host
+// pins Date.now() to a fixed UTC-ms value per request via
+// arena_set_date_now(lo, hi); within that request every Date.now()
+// and no-arg `new Date()` (and the non-new `Date()` call) reads the
+// pinned value — there is no per-read tape and no exhaustion. The pin
+// persists until the host sets a new one; explicit-args construction,
+// Date statics, instanceof, and prototype methods are unaffected.
+//
+// (This file predates the seed-not-draws change and used to assert a
+// `date` tape with one entry consumed per read. That model is gone —
+// replay determinism for clocks comes from the single pinned value.)
 
 import getArenaJs from "../../build-wasm/qjs_arena_wasm.js";
 
 const M = await getArenaJs();
 const init    = M.cwrap("arena_init", "number", ["number","number"]);
 const runmod  = M.cwrap("arena_run_module", "number", ["string","string"]);
+const setdate = M.cwrap("arena_set_date_now", null, ["number","number"]);
 const destroy = M.cwrap("arena_destroy", null, []);
 if (init(8192, 8192) !== 0) throw new Error("arena_init failed");
 
 M.tapes = {}; M.module_sources = {};
 let passed = 0, total = 0;
 function check(label, ok) { total++; if (ok) passed++; else console.log(`!! ${label}`); }
-function fresh(tapes) {
-    for (const k of Object.keys(tapes)) tapes[k]._cursor = 0;
-    M.tapes = tapes;
+function pin(ms) {
+    setdate(ms >>> 0, Math.floor(ms / 4294967296));
 }
 
-// ── `new Date()` (no args) pulls from tape, mixed with Date.now() ────
-//
-// Tape order matches call order: handler does Date.now(), new Date(),
-// new Date() — three consecutive entries. The wrapper for new Date()
-// internally calls Date.now() (our tape-bound one), so each `new Date()`
-// consumes exactly one entry.
-fresh({ date: [{ ms: 1000 }, { ms: 2000 }, { ms: 3000 }] });
-check("no-arg new Date + Date.now share tape", runmod("e1.js", `
+// ── unpinned: Date.now() reads the real clock ────────────────────────
+check("unpinned reads real clock", runmod("d0.js", `
+    const t = Date.now();
+    if (!(t > 1700000000000)) throw new Error("expected wall clock, got " + t);
+`) === 0);
+
+// ── pinned: Date.now() and no-arg new Date() agree, repeatedly ───────
+pin(1000);
+check("Date.now / new Date pinned and stable", runmod("d1.js", `
     const a = Date.now();
     const b = new Date();
     const c = new Date();
     if (a !== 1000) throw new Error("Date.now: " + a);
-    if (b.getTime() !== 2000) throw new Error("new Date #1: " + b.getTime());
-    if (c.getTime() !== 3000) throw new Error("new Date #2: " + c.getTime());
+    if (b.getTime() !== 1000) throw new Error("new Date #1: " + b.getTime());
+    if (c.getTime() !== 1000) throw new Error("new Date #2: " + c.getTime());
+    if (Date.now() !== 1000) throw new Error("re-read drifted");
 `) === 0);
 
-// ── explicit-args new Date() passes through, no tape consumed ────────
-fresh({ date: [{ ms: 9999 }] });
-check("explicit ms passes through", runmod("e2.js", `
+// ── explicit-args construction ignores the pin ───────────────────────
+pin(9999);
+check("explicit ms passes through", runmod("d2.js", `
     const d = new Date(500);
     if (d.getTime() !== 500) throw new Error("explicit ms: " + d.getTime());
-    // Tape still has its first entry — consume to prove cursor didn't move.
-    const x = Date.now();
-    if (x !== 9999) throw new Error("tape advanced unexpectedly: " + x);
+    if (Date.now() !== 9999) throw new Error("pin lost: " + Date.now());
 `) === 0);
 
 // ── multi-arg constructor passes through ─────────────────────────────
-fresh({ date: [] });
-check("multi-arg constructor", runmod("e3.js", `
+check("multi-arg constructor", runmod("d3.js", `
     // (2024, 5, 15, 12, 30, 0) → June 15 2024 12:30:00 local time
     const d = new Date(2024, 5, 15, 12, 30, 0);
     if (d.getFullYear() !== 2024) throw new Error("year: " + d.getFullYear());
@@ -58,38 +63,38 @@ check("multi-arg constructor", runmod("e3.js", `
     if (d.getDate()    !== 15)   throw new Error("date: " + d.getDate());
 `) === 0);
 
-// ── instanceof Date still works ──────────────────────────────────────
-fresh({ date: [{ ms: 42 }] });
-check("instanceof Date", runmod("e4.js", `
+// ── instanceof Date on a pinned-clock Date ───────────────────────────
+pin(42);
+check("instanceof Date", runmod("d4.js", `
     const d = new Date();
     if (!(d instanceof Date)) throw new Error("instanceof failed");
     if (d.getTime() !== 42) throw new Error("ms: " + d.getTime());
 `) === 0);
 
 // ── Date.UTC and other statics preserved ─────────────────────────────
-fresh({ date: [] });
-check("static methods (Date.UTC, Date.parse)", runmod("e5.js", `
+check("static methods (Date.UTC, Date.parse)", runmod("d5.js", `
     const ms = Date.UTC(2024, 0, 1);                   // Jan 1 2024 00:00 UTC
     if (ms !== 1704067200000) throw new Error("Date.UTC: " + ms);
     const p = Date.parse("2024-01-01T00:00:00.000Z");
     if (p !== 1704067200000) throw new Error("Date.parse: " + p);
 `) === 0);
 
-// ── prototype methods (toISOString etc.) work on tape-built Date ─────
-fresh({ date: [{ ms: 1704067200000 }] });  // 2024-01-01T00:00:00.000Z
-check("prototype methods on tape Date", runmod("e6.js", `
+// ── prototype methods on a pinned-clock Date ─────────────────────────
+pin(1704067200000);  // 2024-01-01T00:00:00.000Z
+check("prototype methods on pinned Date", runmod("d6.js", `
     const d = new Date();
     const iso = d.toISOString();
     if (iso !== "2024-01-01T00:00:00.000Z") throw new Error("toISOString: " + iso);
 `) === 0);
 
-// ── divergence: tape exhausted while wrapper still being called ──────
-fresh({ date: [{ ms: 100 }] });
-check("tape exhausted on second new Date()", runmod("e7.js", `
-    let _ = new Date();
-    let threw = false;
-    try { _ = new Date(); } catch (e) { threw = true; }
-    if (!threw) throw new Error("expected exhaustion throw");
+// ── re-pin between requests: each run sees its own clock ─────────────
+pin(2000);
+check("request A sees its pin", runmod("d7a.js", `
+    if (Date.now() !== 2000) throw new Error("pin A: " + Date.now());
+`) === 0);
+pin(3000);
+check("request B sees the new pin", runmod("d7b.js", `
+    if (Date.now() !== 3000) throw new Error("pin B: " + Date.now());
 `) === 0);
 
 destroy();

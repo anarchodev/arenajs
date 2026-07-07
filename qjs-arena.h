@@ -124,6 +124,19 @@ static inline bool js_arena_ptr_is_request(const void *p)
 JS_EXTERN int  js_arena_register_request(const uint8_t *lo, const uint8_t *hi);
 JS_EXTERN void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi);
 
+/* Fixed per-request state slot. The first JS_ARENA_REQUEST_SLOT_SIZE
+ * bytes of the request region (after the 16-byte cursor prefix) are
+ * reserved OUTSIDE the allocator's territory: the bump cursor's floor
+ * sits past them and resets never reclaim them. JSRequestState lives
+ * here at an address that is fixed for the life of the arena — so
+ * rt->req is written exactly once (at freeze), resets re-initialize
+ * the slot in place, and the address no longer depends on the request
+ * allocator's behavior at all. That decoupling is what allows the
+ * request-side allocator to change (or, later, be chosen per reset)
+ * without a base write to re-point rt->req. */
+#define JS_ARENA_REQUEST_SLOT_SIZE 512
+JS_EXTERN void *js_dual_arena_request_slot(JSDualArena *da);
+
 /* JSMallocFunctions table; pass &js_dual_arena_malloc_funcs to JS_NewRuntime2
    together with a JSDualArena* as the opaque parameter. */
 extern const JSMallocFunctions js_dual_arena_malloc_funcs;
@@ -158,6 +171,38 @@ JS_EXTERN int JS_ForceAllAutoinit(JSRuntime *rt);
    first user code to use it as `__proto__` doesn't trigger a same-value
    write into base. Called by JS_FreezeRuntime; returns count marked. */
 JS_EXTERN int JS_MarkAllPrototypes(JSRuntime *rt);
+
+/* Hard enforcement of the inviolate-base invariant ("hard mprotect").
+ * After freeze, js_dual_arena_harden() maps the base buffer PROT_READ
+ * and installs a SIGSEGV handler that, for any write into a hardened
+ * base range, prints the base offset (plus a backtrace on glibc) to
+ * stderr and re-raises the default action (core dump). Where the
+ * thermometer is a measuring instrument that FORGIVES base writes in
+ * order to count them, this is a production tripwire: the MMU enforces
+ * what the thermometer only measures.
+ *
+ * Mutually exclusive with the thermometer on the same arena — both own
+ * the page protections. harden returns -1 if the thermometer is
+ * enabled for this base range, and thermometer enable refuses a
+ * hardened range.
+ *
+ * Teardown: js_dual_arena_free works while hardened (munmap ignores
+ * page protections; it also deregisters the range). A refcount-walking
+ * teardown (JS_FreeContext / JS_FreeRuntime) writes base and will trip
+ * the handler — call js_dual_arena_unharden() first, or skip refcount
+ * teardown and free the arena wholesale (the arena-smoke pattern).
+ *
+ * Host discipline under harden: configuration APIs that write base
+ * (JS_SetInterruptHandler, JS_SetMaxStackSize, JS_SetGCThreshold,
+ * JS_SetRuntimeOpaque, module-loader setters, ...) are pre-freeze
+ * only. Per-request state (JS_SetDateNow / JS_SetTimeOrigin /
+ * JS_SetRandomSeed) lands in JSRequestState and stays legal.
+ *
+ * Not available on WASM or ARENA_NO_THERM builds (no mprotect):
+ * returns -1. */
+JS_EXTERN int  js_dual_arena_harden(JSDualArena *da);
+JS_EXTERN int  js_dual_arena_unharden(JSDualArena *da);
+JS_EXTERN bool js_dual_arena_is_hardened(const JSDualArena *da);
 
 /* Page-fault-based base-arena write detector — the "CoW thermometer" in
  * ARENA_PLAN.md. After enabling, the base arena buffer is mprotect'd
