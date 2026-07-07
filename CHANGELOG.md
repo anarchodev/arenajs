@@ -58,8 +58,63 @@ safe consumer pattern spelled out.
   50 alternating hardened requests). Enabled by the fixed
   JSRequestState head slot, which makes rt->req independent of either
   allocator's layout.
+- **`js_dual_arena_harden(da)` / `js_dual_arena_unharden(da)` /
+  `js_dual_arena_is_hardened(da)`** — production enforcement of the
+  inviolate-base invariant. After freeze, harden maps the base buffer
+  `PROT_READ`; any write into it — engine bug, host misuse, anything —
+  prints `[arena-harden] write to frozen base at base+<offset>` plus a
+  backtrace (glibc) and dies with the default SIGSEGV action instead
+  of silently drifting the snapshot. Where the thermometer measures
+  and forgives, this is the MMU enforcing the invariant on every
+  request. Mutually exclusive with the thermometer per arena.
+  Discipline under harden: config APIs that write base
+  (`JS_SetInterruptHandler`, `JS_SetGCThreshold`, ...) are pre-freeze
+  only; per-request pins already land in `JSRequestState`; teardown is
+  wholesale `js_dual_arena_free` (works while hardened) or unharden
+  first. WASM / `ARENA_NO_THERM` builds return -1 (no mprotect).
+  arena-smoke runs a full request hardened (base reads, shadowed
+  writes, snapshot-collection iteration, pinned clock) and proves
+  enforcement with a forked child whose raw base write dies by
+  SIGSEGV.
+### Changed
+
+- **⚠ Contract** — the determinism pins (`JS_SetDateNow`,
+  `JS_SetTimeOrigin`) now store per-request state in `JSRequestState`
+  instead of the base-resident `JSContext`, completing the
+  `random_state`/`interrupt_counter` relocation pattern. Two
+  consequences for native embedders: pinning is no longer a base write
+  (a per-request `arena_set_date_now` used to dirty the ctx page every
+  request — poison for the shared-base/CoW future), and pins no longer
+  leak across requests — `JS_ResetRequestArena` restores defined
+  defaults (clock unpinned, origin 0, PRNG state zero). Call the
+  setters AFTER the reset, before eval. The WASM reactor ABI is
+  unchanged: `arena_set_random_seed` / `arena_set_date_now` remain
+  sticky "set, then run" — the reactor buffers the latest values and
+  re-applies them after its internal reset.
 
 ### Fixed
+
+- **⚠ Contract** — closed the last known inviolate-base hole:
+  iterating a Map/Set that lives in the snapshot wrote the iteration
+  lock refcounts into base-resident map records (invisible to test262,
+  which only builds request-side collections). Snapshot collections
+  are now **readable and iterable forever, immutable after freeze**:
+  the record-lock refcounts are skipped for base records (sound —
+  immutability means no mid-iteration deletion to protect against),
+  and every mutator (`set`/`add`/`delete`/`clear`/`getOrInsert`, all
+  four collection classes) throws
+  `TypeError: snapshot collection is immutable` on a base receiver.
+  Handlers needing a mutable copy: `new Map(snapshotMap)` (reads
+  only). arena-smoke asserts iteration + reads + copy at zero base
+  pages and all mutators throwing.
+
+- The WASM reactor ran **unseeded** after a host `arena_set_random_seed`:
+  the seed landed in `JSRequestState` (relocated there for Math.random
+  base-cleanliness), but `arena_run` / `arena_run_module` reset the
+  request state FIRST, zeroing the PRNG before eval. The buffered
+  re-apply above fixes it; the Date pin never hit this only because it
+  still lived (wrongly) in base. arena-smoke now asserts the whole pin
+  set dirties zero base pages.
 
 - **⚠ Contract** — post-freeze modifications of base (snapshot)
   objects were invisible to any lookup that reached the object through
