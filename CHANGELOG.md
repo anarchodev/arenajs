@@ -42,6 +42,15 @@ safe consumer pattern spelled out.
 
 _Nothing yet._
 
+## [0.3.1] - 2026-07-07
+
+Packaging fix: the 0.3.0 zig package omitted the GC-mode allocator
+sources (`qjs-dlmalloc.c`, `qjs-dlmalloc.h`, `dlmalloc.c`) from
+`build.zig.zon`'s `.paths` — `build.zig` compiled them but the fetched
+package tarball didn't ship them, so downstream `zig fetch` consumers
+of 0.3.0 fail with FileNotFound. No code changes; CMake/meson/artifact
+consumers were unaffected.
+
 ## [0.3.0] - 2026-07-07
 
 The **request-side GC release**: the per-request region gains a second,
