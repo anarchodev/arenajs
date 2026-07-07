@@ -133,6 +133,38 @@ JS_EXTERN int JS_ForceAllAutoinit(JSRuntime *rt);
    write into base. Called by JS_FreezeRuntime; returns count marked. */
 JS_EXTERN int JS_MarkAllPrototypes(JSRuntime *rt);
 
+/* Hard enforcement of the inviolate-base invariant ("hard mprotect").
+ * After freeze, js_dual_arena_harden() maps the base buffer PROT_READ
+ * and installs a SIGSEGV handler that, for any write into a hardened
+ * base range, prints the base offset (plus a backtrace on glibc) to
+ * stderr and re-raises the default action (core dump). Where the
+ * thermometer is a measuring instrument that FORGIVES base writes in
+ * order to count them, this is a production tripwire: the MMU enforces
+ * what the thermometer only measures.
+ *
+ * Mutually exclusive with the thermometer on the same arena — both own
+ * the page protections. harden returns -1 if the thermometer is
+ * enabled for this base range, and thermometer enable refuses a
+ * hardened range.
+ *
+ * Teardown: js_dual_arena_free works while hardened (munmap ignores
+ * page protections; it also deregisters the range). A refcount-walking
+ * teardown (JS_FreeContext / JS_FreeRuntime) writes base and will trip
+ * the handler — call js_dual_arena_unharden() first, or skip refcount
+ * teardown and free the arena wholesale (the arena-smoke pattern).
+ *
+ * Host discipline under harden: configuration APIs that write base
+ * (JS_SetInterruptHandler, JS_SetMaxStackSize, JS_SetGCThreshold,
+ * JS_SetRuntimeOpaque, module-loader setters, ...) are pre-freeze
+ * only. Per-request state (JS_SetDateNow / JS_SetTimeOrigin /
+ * JS_SetRandomSeed) lands in JSRequestState and stays legal.
+ *
+ * Not available on WASM or ARENA_NO_THERM builds (no mprotect):
+ * returns -1. */
+JS_EXTERN int  js_dual_arena_harden(JSDualArena *da);
+JS_EXTERN int  js_dual_arena_unharden(JSDualArena *da);
+JS_EXTERN bool js_dual_arena_is_hardened(const JSDualArena *da);
+
 /* Page-fault-based base-arena write detector — the "CoW thermometer" in
  * ARENA_PLAN.md. After enabling, the base arena buffer is mprotect'd
  * read-only and a SIGSEGV handler counts every write that touches it.

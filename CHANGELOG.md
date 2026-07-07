@@ -40,6 +40,32 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+### Added
+
+- **`js_dual_arena_harden(da)` / `js_dual_arena_unharden(da)` /
+  `js_dual_arena_is_hardened(da)`** — production enforcement of the
+  inviolate-base invariant. After freeze, harden maps the base buffer
+  `PROT_READ`; any write into it — engine bug, host misuse, anything —
+  prints `[arena-harden] write to frozen base at base+<offset>` plus a
+  backtrace (glibc) and dies with the default SIGSEGV action instead
+  of silently drifting the snapshot. Where the thermometer measures
+  and forgives, this is the MMU enforcing the invariant on every
+  request. Mutually exclusive with the thermometer per arena.
+  Discipline under harden: config APIs that write base
+  (`JS_SetInterruptHandler`, `JS_SetGCThreshold`, ...) are pre-freeze
+  only; per-request pins already land in `JSRequestState`; teardown is
+  wholesale `js_dual_arena_free` (works while hardened) or unharden
+  first. WASM / `ARENA_NO_THERM` builds return -1 (no mprotect).
+  arena-smoke runs a full request hardened (base reads, shadowed
+  writes, snapshot-collection iteration, pinned clock) and proves
+  enforcement with a forked child whose raw base write dies by
+  SIGSEGV.
+- `JS_RunGC` is now a no-op on arena runtimes (master): the vanilla
+  collector walks the base-resident gc_obj_list and writes frozen
+  refcounts — corruption before, a hard fault under harden.
+  (`JS_FreeRuntime` funnels through it at teardown.) The hybrid-gc
+  branch replaces this guard with its request-side collector.
+
 ### Changed
 
 - **⚠ Contract** — the determinism pins (`JS_SetDateNow`,

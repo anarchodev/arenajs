@@ -7787,6 +7787,15 @@ static void gc_free_cycles(JSRuntime *rt)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    /* arena: the collector walks rt->gc_obj_list — which still holds
+       the immortal pre-freeze base set — and writes ref_counts
+       directly, bypassing the base guards. Running it would corrupt
+       frozen base refcounts (and fault under js_dual_arena_harden).
+       The hybrid-gc branch replaces this guard with a request-side
+       collector; until that merges, GC on arena runtimes is a no-op
+       (JS_FreeRuntime also funnels here at teardown). */
+    if (rt->is_arena)
+        return;
     /* decrement the reference of the children of each object. mark =
        1 after this pass. */
     gc_decref(rt);

@@ -287,6 +287,10 @@ void js_dual_arena_free(JSDualArena *da)
        tearing down — otherwise the SIGSEGV handler stays installed pointing
        into munmap'd memory. */
     js_arena_thermometer_disable_range(lo, hi);
+    /* Hardened arenas can be freed directly (munmap ignores page
+       protections) but the tripwire range must not outlive the
+       mapping. */
+    js_dual_arena_unharden(da);
     /* Drop this arena's range from the per-thread list so a stale
        check after teardown doesn't read freed memory. */
     js_arena_unregister_base(lo, hi);
@@ -504,6 +508,22 @@ void JS_ResetRequestArena(JSRuntime *rt)
 
 #if !defined(__wasm__) && !defined(ARENA_NO_THERM)
 
+/* ----- hard mprotect (inviolate-base enforcement) ----- */
+
+#define HARD_MAX 8
+static struct { const uint8_t *lo, *hi; } hard_ranges[HARD_MAX];
+static int hard_range_count = 0;
+static volatile sig_atomic_t hard_handler_installed = 0;
+static struct sigaction hard_prev_sa;
+
+static int hard_find(const uint8_t *lo)
+{
+    for (int i = 0; i < hard_range_count; i++)
+        if (hard_ranges[i].lo == lo)
+            return i;
+    return -1;
+}
+
 struct therm_state {
     const uint8_t *lo;
     const uint8_t *hi;
@@ -626,6 +646,8 @@ int js_arena_thermometer_enable_range(const uint8_t *lo, const uint8_t *hi)
         return -1;
     if (therm_find_by_lo(lo))
         return 0; /* already enabled for this range */
+    if (hard_find(lo) >= 0)
+        return -1; /* hardened: the tripwire owns the protections */
     if (therm_state_count >= THERM_MAX)
         return -1;
 
@@ -844,6 +866,114 @@ size_t js_arena_thermometer_changed_byte_offsets(
     return found;
 }
 
+/* ----- hard mprotect implementation -----
+ *
+ * SIGSEGV handler: faults inside a hardened base range get a
+ * diagnostic (base offset + backtrace on glibc) and then the DEFAULT
+ * action — we restore SIG_DFL and return, the faulting instruction
+ * re-executes, and the process dies with an accurate core dump.
+ * Foreign faults chain to whatever handler was installed before us
+ * (ASan, the thermometer, the embedder's). */
+static void hard_sigsegv(int sig, siginfo_t *info, void *ctx)
+{
+    uintptr_t addr = (uintptr_t)info->si_addr;
+    for (int i = 0; i < hard_range_count; i++) {
+        if (addr >= (uintptr_t)hard_ranges[i].lo
+         && addr <  (uintptr_t)hard_ranges[i].hi) {
+            char msg[128];
+            int len = snprintf(msg, sizeof(msg),
+                "[arena-harden] write to frozen base at base+%zu — aborting\n",
+                addr - (uintptr_t)hard_ranges[i].lo);
+            if (len > 0)
+                write(2, msg, (size_t)len);
+#if defined(__GLIBC__)
+            void *frames[32];
+            int nframes = backtrace(frames, 32);
+            backtrace_symbols_fd(frames, nframes, 2);
+#endif
+            struct sigaction dfl;
+            memset(&dfl, 0, sizeof(dfl));
+            dfl.sa_handler = SIG_DFL;
+            sigemptyset(&dfl.sa_mask);
+            sigaction(SIGSEGV, &dfl, NULL);
+            return; /* re-executes the faulting store under SIG_DFL */
+        }
+    }
+    /* not ours: previous handler */
+    if (hard_prev_sa.sa_flags & SA_SIGINFO) {
+        if (hard_prev_sa.sa_sigaction)
+            hard_prev_sa.sa_sigaction(sig, info, ctx);
+    } else if (hard_prev_sa.sa_handler == SIG_DFL) {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(sig, &dfl, NULL);
+        raise(sig);
+    } else if (hard_prev_sa.sa_handler != SIG_IGN
+            && hard_prev_sa.sa_handler != NULL) {
+        hard_prev_sa.sa_handler(sig);
+    }
+}
+
+int js_dual_arena_harden(JSDualArena *da)
+{
+    if (!da || da->mode != JS_ARENA_MODE_REQUEST)
+        return -1; /* freeze first: the base range must be final */
+    if (therm_find_by_lo(da->base.buf))
+        return -1; /* thermometer owns the protections for this range */
+    if (hard_find(da->base.buf) >= 0)
+        return 0;  /* already hardened */
+    if (hard_range_count >= HARD_MAX)
+        return -1;
+    if (!hard_handler_installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_flags = SA_SIGINFO;
+        sa.sa_sigaction = hard_sigsegv;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, &hard_prev_sa) < 0)
+            return -1;
+        hard_handler_installed = 1;
+    }
+    if (mprotect(da->base.buf, da->base.capacity, PROT_READ) < 0) {
+        if (hard_range_count == 0) {
+            sigaction(SIGSEGV, &hard_prev_sa, NULL);
+            hard_handler_installed = 0;
+        }
+        return -1;
+    }
+    hard_ranges[hard_range_count].lo = da->base.buf;
+    hard_ranges[hard_range_count].hi = da->base.buf + da->base.capacity;
+    hard_range_count++;
+    return 0;
+}
+
+int js_dual_arena_unharden(JSDualArena *da)
+{
+    if (!da)
+        return -1;
+    int idx = hard_find(da->base.buf);
+    if (idx < 0)
+        return -1;
+    mprotect(da->base.buf, da->base.capacity, PROT_READ | PROT_WRITE);
+    hard_range_count--;
+    if (idx != hard_range_count)
+        hard_ranges[idx] = hard_ranges[hard_range_count];
+    hard_ranges[hard_range_count].lo = NULL;
+    hard_ranges[hard_range_count].hi = NULL;
+    if (hard_range_count == 0 && hard_handler_installed) {
+        sigaction(SIGSEGV, &hard_prev_sa, NULL);
+        hard_handler_installed = 0;
+    }
+    return 0;
+}
+
+bool js_dual_arena_is_hardened(const JSDualArena *da)
+{
+    return da && hard_find(da->base.buf) >= 0;
+}
+
 #else /* defined(__wasm__) — thermometer stubs */
 
 int  js_arena_thermometer_enable(void)                    { return -1; }
@@ -865,5 +995,8 @@ size_t js_arena_thermometer_changed_byte_offsets(size_t off, size_t *out, size_t
 const void *js_arena_thermometer_baseline_at(size_t off)  { (void)off; return NULL; }
 void js_arena_thermometer_trace_range(size_t lo, size_t hi)
                                                           { (void)lo; (void)hi; }
+int  js_dual_arena_harden(JSDualArena *da)                { (void)da; return -1; }
+int  js_dual_arena_unharden(JSDualArena *da)              { (void)da; return -1; }
+bool js_dual_arena_is_hardened(const JSDualArena *da)     { (void)da; return false; }
 
 #endif /* !defined(__wasm__) */

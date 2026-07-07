@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "quickjs.h"
 #include "qjs-arena.h"
 
@@ -216,6 +218,39 @@ int main(void)
         if (pin_pages != 0) return 1;
     }
     js_arena_thermometer_disable();
+
+    /* --- hard mprotect: the MMU enforces inviolate-base --- */
+    if (js_dual_arena_harden(da) != 0) {
+        fprintf(stderr, "harden failed\n"); return 1;
+    }
+    /* A full request runs under enforcement: base reads, shadowed
+       base-prototype writes, snapshot-collection iteration, pinned
+       clock — every write lands request-side or the process dies. */
+    JS_ResetRequestArena(rt);
+    JS_SetDateNow(ctx, 777);
+    if (eval_print(ctx,
+        "globalThis.h1 = 'x'; Map.prototype.hardened = 1;"
+        "[...BASE_MAP.keys()].join('') + ':' + Date.now()",
+        "hardened-request")) return 1;
+    /* And a genuine base write must die by SIGSEGV — prove it in a
+       forked child (expect one [arena-harden] diagnostic below). */
+    {
+        pid_t pid = fork();
+        if (pid == 0) {
+            volatile uint8_t *pb = (volatile uint8_t *)rt; /* rt is base */
+            *pb = *pb;      /* same-value write: the MMU faults anyway */
+            _exit(0);       /* reached only if enforcement failed */
+        }
+        int st = 0;
+        waitpid(pid, &st, 0);
+        int killed = WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV;
+        printf("hardened base write in child: %s\n",
+               killed ? "SIGSEGV as expected" : "NOT ENFORCED");
+        if (!killed) return 1;
+    }
+    if (js_dual_arena_unharden(da) != 0) {
+        fprintf(stderr, "unharden failed\n"); return 1;
+    }
 
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
        (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
