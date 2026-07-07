@@ -268,7 +268,16 @@ int main(int argc, char **argv)
     if (eval_file_into_base(ctx, HARNESS_DIR "/compareArray.js")) return 1;
 
     JS_FreezeRuntime(rt);
-    if (js_arena_thermometer_enable() < 0) {
+    if (getenv("ARENA_HARDEN")) {
+        /* MMU-enforced mode: base goes PROT_READ and any base write
+           kills the walker with an [arena-harden] diagnostic. Replaces
+           the thermometer (mutually exclusive); the per-test dirty
+           counters read 0 and SURVIVAL is the assertion. */
+        if (js_dual_arena_harden(JS_GetDualArena(rt)) != 0) {
+            fprintf(stderr, "harden failed\n"); return 1;
+        }
+        fprintf(stderr, "base HARDENED (PROT_READ): survival == zero base writes\n");
+    } else if (js_arena_thermometer_enable() < 0) {
         fprintf(stderr, "thermometer enable failed\n"); return 1;
     }
 
