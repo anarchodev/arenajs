@@ -40,19 +40,59 @@ struct JSFunctionBytecode;
 
 #if ARENA_TRACE_ENABLED
 
-/* Trace mode global, read by the interpreter hooks. Set via
-   arena_trace_set_mode(). Default 0 so when tracing is built in but
-   not enabled at runtime, every hook is one predictable-not-taken
-   branch on this global and nothing else. */
-extern int arena_trace_mode;
+/* ── per-instance trace state ──────────────────────────────────────────
+ * All mutable emitter state is per-instance, owned by the ArenaReactor
+ * that created the runtime and bound to it via js_arena_trace_set_state
+ * (a dedicated JSRuntime slot — NOT the user opaque, which belongs to
+ * the embedder). Interpreter hooks resolve it from ctx → rt; a runtime
+ * with no bound state (NULL slot) traces nothing. This is what makes
+ * multiple reactors on one thread — including a run nested inside
+ * another instance's run via a native callback — correct by
+ * construction: each run only ever touches its own state.
+ *
+ * Fields are private to qjs-arena-trace.c except `mode`, which the
+ * reactor reads/writes directly and the interpreter patch sites load
+ * (see arena_trace_mode_of in quickjs.c).
+ *
+ * NOTE for hosts consuming events from more than one instance: JSAtom
+ * ids are per-JSRuntime, and each instance interns NAME events
+ * independently — scope your atom→string map per run (or per
+ * instance), never globally across instances. */
+#define ARENA_TRACE_NAME_CAP    1024
+#define ARENA_TRACE_SCRATCH_CAP 4096
+
+typedef struct ArenaTraceState {
+    int mode;                    /* ARENA_TRACE_OFF/SCAN/DRILL */
+    int bail_armed;              /* stop sentinel raised this run */
+    /* live trace-event context, valid only while a host callback is
+       dispatching (arena_trace_snapshot_here reads these) */
+    JSContext *active_ctx;
+    struct JSFunctionBytecode *active_b;
+    const uint8_t *active_pc;
+    /* per-run "last line emitted" tracker (DRILL dedup) */
+    int      last_line_emitted;
+    uint32_t last_file_atom;
+    /* bounded NAME intern table — atoms already announced to the host */
+    int      name_count;
+    uint32_t name_table[ARENA_TRACE_NAME_CAP];
+    /* payload assembly buffer; borrowed by the host only for the
+       duration of the callback, per the host contract */
+    uint8_t  scratch[ARENA_TRACE_SCRATCH_CAP];
+} ArenaTraceState;
+
+/* Bind/read the per-runtime state slot (defined in quickjs.c, which
+   owns the JSRuntime layout). Binding is a base-memory write: do it
+   pre-freeze, once, and never rewrite it. */
+void js_arena_trace_set_state(JSRuntime *rt, struct ArenaTraceState *st);
+struct ArenaTraceState *js_arena_trace_get_state(JSRuntime *rt);
 
 /* Sentinel exception message used to signal a clean host-requested
    stop. arena_run_module compares the thrown error's message against
    this string and returns 0 if it matches. */
 extern const char ARENA_TRACE_STOP_MSG[];
 
-void arena_trace_set_mode(int mode);
-void arena_trace_reset(void);             /* clear name-table between runs */
+void arena_trace_state_init(ArenaTraceState *st);  /* fresh instance, mode OFF */
+void arena_trace_reset(ArenaTraceState *st);       /* between runs; keeps mode */
 
 #ifndef __EMSCRIPTEN__
 /* ── native trace sink ─────────────────────────────────────────────────
@@ -107,7 +147,7 @@ int arena_trace_snapshot_here(void);
    truthy and we tried to throw the sentinel. arena_run_module checks
    this so it can distinguish "stop sentinel was requested but its
    allocation OOM-d" (treat as clean stop) from "unrelated exception". */
-int arena_trace_stop_armed(void);
+int arena_trace_stop_armed(const ArenaTraceState *st);
 
 void arena_trace_func_enter(JSContext *ctx, struct JSFunctionBytecode *b);
 void arena_trace_func_exit(JSContext *ctx);
@@ -158,11 +198,13 @@ JSValueConst js_arena_trace_frame_closure_value(struct JSStackFrame *sf,
 
 #else  /* !ARENA_TRACE_ENABLED — native worker build path */
 
-/* Compile-time constant 0. Every `if (arena_trace_mode != ARENA_TRACE_OFF)`
-   in quickjs.c folds to a constant-false branch the compiler removes
-   at any optimization level, so the per-opcode dispatch hook is
-   physically not emitted. */
-#define arena_trace_mode 0
+/* Compile-time constant 0. Every `if (arena_trace_mode_of(ctx) !=
+   ARENA_TRACE_OFF)` in quickjs.c folds to a constant-false branch the
+   compiler removes at any optimization level, so the per-opcode
+   dispatch hook is physically not emitted. (The trace-enabled variant
+   of this macro lives in quickjs.c, next to the JSRuntime layout it
+   reads.) */
+#define arena_trace_mode_of(ctx) 0
 
 /* Empty inline stubs so unfolded calls (if any) compile to no-ops
    without needing a linker symbol. Belt and braces — the macro above

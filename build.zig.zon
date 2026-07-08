@@ -34,6 +34,7 @@
         "libunicode-table.h",
         "libunicode.h",
         "list.h",
+        "qjs-arena-reactor.h",
         "qjs-arena-replay-bindings.h",
         "qjs-arena-trace.h",
         "qjs-arena.h",

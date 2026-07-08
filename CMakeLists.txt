@@ -592,6 +592,17 @@ if(QJS_BUILD_EXAMPLES)
         target_include_directories(arena_replay_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_definitions(arena_replay_native PRIVATE ${qjs_defines} ARENA_TRACE_ENABLED=1)
         target_link_libraries(arena_replay_native PRIVATE ${qjs_libs})
+
+        # Multi-instance contract test: two reactors on one thread,
+        # runs nested across them (qjs-arena-reactor.h). Exits nonzero
+        # on any isolation failure.
+        add_executable(arena_multi_reactor
+            ${arena_native_host_sources}
+            examples/arena_multi_reactor.c
+        )
+        target_include_directories(arena_multi_reactor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(arena_multi_reactor PRIVATE ${qjs_defines} ARENA_TRACE_ENABLED=1)
+        target_link_libraries(arena_multi_reactor PRIVATE ${qjs_libs})
     endif()
 
     add_library(fib MODULE examples/fib.c)

@@ -40,7 +40,50 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Instance-based reactor API** (`qjs-arena-reactor.h`, NEW header —
+  the first header to declare the reactor surface; previously
+  embedders hand-wrote `extern`s). `arena_reactor_new(base_kb,
+  request_kb)` / `arena_reactor_free` create independent reactors, and
+  `_r`-suffixed instance variants of the run/configure surface take
+  native-width arguments (`arena_run_r`, `arena_run_module_r`,
+  `arena_set_trace_mode_r`, `arena_set_request_mode_r`,
+  `arena_set_random_seed_r(uint64_t)`, `arena_set_date_now_r(int64_t)`,
+  `arena_oom_{hit,requested,used,limit}_r`). The existing singleton
+  exports are unchanged in name, signature, and behavior — they are now
+  thin wrappers over a default instance, and the WASM export list is
+  byte-identical.
+- **⚠ Contract — multiple reactors on one thread is now a stated,
+  supported configuration** (harness + resettable sim), including runs
+  *nested* across instances (a native callback fired during one
+  instance's run may synchronously run modules on another). Trace
+  state, determinism pins, OOM records, request-allocator regime, and
+  entry-module resolution are all per-instance. What remains
+  process-global, deliberately: `arena_trace_set_host` /
+  `arena_replay_set_host` registrations are shared by all instances —
+  a multi-instance host multiplexes in its callbacks (runs are
+  synchronous, so it always knows whose run is active). Concurrent
+  runs on different *threads* remain unsupported. Safe consumer
+  pattern for trace events: scope the atom→string NAME map per
+  run/instance — JSAtom ids are per-runtime, so a global map would
+  silently mix instances.
+
+### Changed
+
+- Trace-emitter state (mode, NAME intern table, stop flag, active-event
+  context) moved from process globals into per-instance state resolved
+  through the traced runtime. Wire format and event semantics are
+  untouched. Native embedders that linked the internal trace-module
+  functions directly (`arena_trace_set_mode`, `arena_trace_reset`,
+  `arena_trace_stop_armed` — not part of the exported reactor ABI) must
+  switch to the reactor surface or pass the new `ArenaTraceState *`.
+- PATCH-level behavioral note: the singleton's determinism pins
+  (`arena_set_random_seed` / `arena_set_date_now`) no longer survive an
+  `arena_destroy` → `arena_init` cycle; they now live in the instance
+  and die with it. Pins are set per-request by every known driver, so
+  this only affects a re-init that relied on inheriting stale pins.
+  (`arena_set_trace_mode` before `arena_init` still works.)
 
 ## [0.3.1] - 2026-07-07
 

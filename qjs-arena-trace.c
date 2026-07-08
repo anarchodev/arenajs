@@ -21,15 +21,17 @@
  *   THROW      (kind=4)
  *     [u32 file_atom][u32 line][u16 msg_len][msg_bytes ...]
  *
- * The atom values are JSAtoms — stable u32 ids within the runtime. We
+ * The atom values are JSAtoms — stable u32 ids within ONE runtime. We
  * pass them through as-is; the host doesn't need to interpret atoms,
  * just dedupe by their numeric value and resolve via NAME events.
  *
- * Name-table state lives in this module and is reset between runs by
- * the reactor's arena_run_module entry point. The host's mirror table
- * should be reset in lockstep — it can do that simply by emptying its
- * map when it sees the cursor reset (or just key by atom and accept
- * duplicate NAME emits across runs, which is harmless).
+ * All mutable emitter state lives in a per-instance ArenaTraceState
+ * (see qjs-arena-trace.h), bound to the runtime it traces and reset
+ * between runs by the reactor's arena_run_module entry point. The
+ * host's mirror atom→string table must be scoped per run: atom ids are
+ * per-runtime, so with more than one reactor instance the same numeric
+ * id can name different strings on different instances — a global map
+ * keyed by bare atom id would silently mix them.
  */
 #include "qjs-arena-trace.h"
 
@@ -47,39 +49,37 @@
 #define EM_JS(ret, name, args, body) static ret name args { return (ret)0; }
 #endif
 
-int arena_trace_mode = ARENA_TRACE_OFF;
 const char ARENA_TRACE_STOP_MSG[] = "_arena_trace_stop_";
 
-/* Bounded name-intern table. 1024 entries is overkill for any 10 ms
-   handler — typical traces touch <100 distinct names. */
-#define NAME_TABLE_CAP 1024
-static uint32_t name_table[NAME_TABLE_CAP];
-static int      name_table_count = 0;
+/* The ONE remaining file-static: the state whose host callback is
+   dispatching right now. It models the C call stack (hook → host
+   callback), not instance uniqueness — arena_trace_snapshot_here() is
+   a no-arg export (WASM ABI), so it needs a way to find "the event
+   currently being delivered". Hooks save/restore it around the
+   dispatch, so a nested run started from inside a host callback (a
+   supported configuration) leaves the outer dispatch resolvable after
+   the nested run returns. Single-threaded by contract. */
+static ArenaTraceState *s_in_hook = NULL;
 
-/* Per-run "last line emitted" tracker. Reset on FUNC_ENTER/EXIT so
-   line transitions across call boundaries always emit (the FUNC_*
-   event itself carries the line of the boundary). */
-static int  last_line_emitted = -1;
-static uint32_t last_file_atom = 0;
-
-/* Once a host_trace callback returns truthy, we set this flag and
-   raise the stop-sentinel exception. All subsequent emits become
-   no-ops so the host doesn't see a flurry of FUNC_EXIT events as the
-   stack unwinds — clean "stopped at event N" semantics. */
-static int s_bail_armed = 0;
-
-/* Live trace-event context, stashed by each hook just before invoking
-   _arena_host_trace and cleared on return. arena_trace_snapshot_here()
-   reads these so a JS host_trace callback can synchronously request a
-   stack snapshot without raising the stop sentinel. */
-static JSContext *s_active_ctx = NULL;
-static struct JSFunctionBytecode *s_active_b = NULL;
-static const uint8_t *s_active_pc = NULL;
-
-/* Scratch buffer for binary payloads. Static because emit is sync and
-   single-threaded — the host copies bytes before our next emit. */
-#define SCRATCH_CAP 4096
-static uint8_t scratch[SCRATCH_CAP];
+/* Field semantics (all per-instance, in ArenaTraceState):
+   - name_table/name_count: bounded intern table. 1024 entries is
+     overkill for any 10 ms handler — typical traces touch <100
+     distinct names.
+   - last_line_emitted/last_file_atom: DRILL dedup. Reset on
+     FUNC_ENTER/EXIT so line transitions across call boundaries always
+     emit (the FUNC_* event itself carries the line of the boundary).
+   - bail_armed: once a host_trace callback returns truthy, we set this
+     and raise the stop-sentinel exception. All subsequent emits on
+     this instance become no-ops so the host doesn't see a flurry of
+     FUNC_EXIT events as the stack unwinds — clean "stopped at event N"
+     semantics.
+   - active_ctx/b/pc: live trace-event context, stashed by each hook
+     just before invoking _arena_host_trace and restored on return.
+     arena_trace_snapshot_here() reads these (via s_in_hook) so a host
+     callback can synchronously request a stack snapshot without
+     raising the stop sentinel.
+   - scratch: payload assembly. Per-instance so a nested run can't
+     clobber an outer event's payload bytes mid-dispatch. */
 
 /* ── host import ───────────────────────────────────────────────────── */
 
@@ -147,45 +147,45 @@ static void _arena_host_state(const uint8_t *payload, int payload_len)
 
 /* ── name-table interning ──────────────────────────────────────────── */
 
-static bool name_seen(uint32_t atom)
+static bool name_seen(const ArenaTraceState *st, uint32_t atom)
 {
-    for (int i = 0; i < name_table_count; i++)
-        if (name_table[i] == atom) return true;
+    for (int i = 0; i < st->name_count; i++)
+        if (st->name_table[i] == atom) return true;
     return false;
 }
 
-static void name_remember(uint32_t atom)
+static void name_remember(ArenaTraceState *st, uint32_t atom)
 {
-    if (name_table_count >= NAME_TABLE_CAP) return;  /* silently drop */
-    name_table[name_table_count++] = atom;
+    if (st->name_count >= ARENA_TRACE_NAME_CAP) return;  /* silently drop */
+    st->name_table[st->name_count++] = atom;
 }
 
 /* Encode + emit a NAME event for a given atom. Looks up the atom's
    string form via JS_AtomToCString. Caller must have checked name_seen
    first. */
-static int emit_name(JSContext *ctx, uint32_t atom)
+static int emit_name(ArenaTraceState *st, JSContext *ctx, uint32_t atom)
 {
-    name_remember(atom);
+    name_remember(st, atom);
     const char *s = JS_AtomToCString(ctx, (JSAtom)atom);
     if (!s) return 0;  /* atom doesn't resolve — skip, host will see id with no NAME */
     size_t slen = strlen(s);
     if (slen > 0xffff) slen = 0xffff;     /* clamp; truncated name is fine */
-    if (slen + 6 > SCRATCH_CAP) slen = SCRATCH_CAP - 6;
-    memcpy(scratch + 0, &atom, 4);
+    if (slen + 6 > ARENA_TRACE_SCRATCH_CAP) slen = ARENA_TRACE_SCRATCH_CAP - 6;
+    memcpy(st->scratch + 0, &atom, 4);
     uint16_t slen16 = (uint16_t)slen;
-    memcpy(scratch + 4, &slen16, 2);
-    memcpy(scratch + 6, s, slen);
+    memcpy(st->scratch + 4, &slen16, 2);
+    memcpy(st->scratch + 6, s, slen);
     JS_FreeCString(ctx, s);
-    return _arena_host_trace(0, scratch, (int)(6 + slen));
+    return _arena_host_trace(0, st->scratch, (int)(6 + slen));
 }
 
 /* Guarantee NAME has been emitted for this atom before emitting an
    event that references it. Returns nonzero if the host signalled
    stop. */
-static int ensure_name(JSContext *ctx, uint32_t atom)
+static int ensure_name(ArenaTraceState *st, JSContext *ctx, uint32_t atom)
 {
-    if (name_seen(atom)) return 0;
-    return emit_name(ctx, atom);
+    if (name_seen(st, atom)) return 0;
+    return emit_name(st, ctx, atom);
 }
 
 /* ── stack-state emit (kind=2 inspection) ──────────────────────────── */
@@ -376,11 +376,11 @@ static void jb_value(JSContext *ctx, jbuf *j, JSValueConst v)
     JS_FreeValue(ctx, js);
 }
 
-static void emit_state(JSContext *ctx,
+static void emit_state(ArenaTraceState *st, JSContext *ctx,
                        struct JSFunctionBytecode *top_b,
                        const uint8_t *top_pc)
 {
-    if (s_bail_armed) return;
+    if (st->bail_armed) return;
 
     jbuf j = { 0 };
     jb_ch(&j, '[');
@@ -477,52 +477,55 @@ static void emit_state(JSContext *ctx,
 
 /* ── stop handling ─────────────────────────────────────────────────── */
 
-static void raise_stop(JSContext *ctx)
+static void raise_stop(ArenaTraceState *st, JSContext *ctx)
 {
-    if (s_bail_armed) return;
+    if (st->bail_armed) return;
     JS_ThrowInternalError(ctx, "%s", ARENA_TRACE_STOP_MSG);
-    s_bail_armed = 1;
+    st->bail_armed = 1;
 }
 
 /* Dispatch on host_trace return code. When the host returns 2, we
    emit the stack state before raising the stop sentinel so the host
    has the snapshot in hand by the time arena_run_module returns. */
-static void handle_stop_code(JSContext *ctx, int code,
+static void handle_stop_code(ArenaTraceState *st, JSContext *ctx, int code,
                              struct JSFunctionBytecode *b,
                              const uint8_t *pc)
 {
-    if (code == 2) emit_state(ctx, b, pc);
-    if (code) raise_stop(ctx);
+    if (code == 2) emit_state(st, ctx, b, pc);
+    if (code) raise_stop(st, ctx);
 }
 
 /* ── lifecycle ─────────────────────────────────────────────────────── */
 
-void arena_trace_set_mode(int mode)
+void arena_trace_state_init(ArenaTraceState *st)
 {
-    arena_trace_mode = mode;
+    memset(st, 0, sizeof *st);
+    st->mode = ARENA_TRACE_OFF;
+    st->last_line_emitted = -1;
 }
 
-void arena_trace_reset(void)
+void arena_trace_reset(ArenaTraceState *st)
 {
-    name_table_count = 0;
-    last_line_emitted = -1;
-    last_file_atom = 0;
-    s_bail_armed = 0;
-    s_active_ctx = NULL;
-    s_active_b = NULL;
-    s_active_pc = NULL;
+    st->name_count = 0;
+    st->last_line_emitted = -1;
+    st->last_file_atom = 0;
+    st->bail_armed = 0;
+    st->active_ctx = NULL;
+    st->active_b = NULL;
+    st->active_pc = NULL;
 }
 
 int arena_trace_snapshot_here(void)
 {
-    if (!s_active_ctx || s_bail_armed) return -1;
-    emit_state(s_active_ctx, s_active_b, s_active_pc);
+    ArenaTraceState *st = s_in_hook;
+    if (!st || !st->active_ctx || st->bail_armed) return -1;
+    emit_state(st, st->active_ctx, st->active_b, st->active_pc);
     return 0;
 }
 
-int arena_trace_stop_armed(void)
+int arena_trace_stop_armed(const ArenaTraceState *st)
 {
-    return s_bail_armed;
+    return st ? st->bail_armed : 0;
 }
 
 /* ── hook implementations ──────────────────────────────────────────── */
@@ -538,66 +541,86 @@ static int merge_stop(int a, int b)
     return 0;
 }
 
+/* Resolve the trace state bound to ctx's runtime. NULL (no reactor
+   bound one, or a foreign runtime) disables tracing for that runtime. */
+static ArenaTraceState *hook_state(JSContext *ctx)
+{
+    return js_arena_trace_get_state(JS_GetRuntime(ctx));
+}
+
 void arena_trace_func_enter(JSContext *ctx, struct JSFunctionBytecode *b)
 {
-    if (arena_trace_mode == ARENA_TRACE_OFF || s_bail_armed) return;
+    ArenaTraceState *st = hook_state(ctx);
+    if (!st || st->mode == ARENA_TRACE_OFF || st->bail_armed) return;
     uint32_t name_atom = (uint32_t)js_arena_trace_bc_func_name(b);
     uint32_t file_atom = (uint32_t)js_arena_trace_bc_filename(b);
     int line = js_arena_trace_bc_resolve_line(ctx, b, NULL);
     if (line < 0) line = 0;
 
-    s_active_ctx = ctx; s_active_b = b; s_active_pc = NULL;
+    ArenaTraceState *prev = s_in_hook;
+    st->active_ctx = ctx; st->active_b = b; st->active_pc = NULL;
+    s_in_hook = st;
     int stop = 0;
-    stop = merge_stop(stop, ensure_name(ctx, name_atom));
-    stop = merge_stop(stop, ensure_name(ctx, file_atom));
+    stop = merge_stop(stop, ensure_name(st, ctx, name_atom));
+    stop = merge_stop(stop, ensure_name(st, ctx, file_atom));
 
-    memcpy(scratch + 0, &name_atom, 4);
-    memcpy(scratch + 4, &file_atom, 4);
+    memcpy(st->scratch + 0, &name_atom, 4);
+    memcpy(st->scratch + 4, &file_atom, 4);
     uint32_t line32 = (uint32_t)line;
-    memcpy(scratch + 8, &line32, 4);
-    stop = merge_stop(stop, _arena_host_trace(1, scratch, 12));
-    s_active_ctx = NULL; s_active_b = NULL; s_active_pc = NULL;
+    memcpy(st->scratch + 8, &line32, 4);
+    stop = merge_stop(stop, _arena_host_trace(1, st->scratch, 12));
+    s_in_hook = prev;
+    st->active_ctx = NULL; st->active_b = NULL; st->active_pc = NULL;
 
     /* New frame — reset line tracker so first LINE event in this frame
        (or first event after the matching exit) fires unconditionally. */
-    last_line_emitted = -1;
-    last_file_atom = 0;
+    st->last_line_emitted = -1;
+    st->last_file_atom = 0;
 
-    handle_stop_code(ctx, stop, b, NULL);
+    handle_stop_code(st, ctx, stop, b, NULL);
 }
 
 void arena_trace_func_exit(JSContext *ctx)
 {
-    if (arena_trace_mode == ARENA_TRACE_OFF || s_bail_armed) return;
-    s_active_ctx = ctx; s_active_b = NULL; s_active_pc = NULL;
-    int stop = _arena_host_trace(2, scratch, 0);
-    s_active_ctx = NULL;
-    last_line_emitted = -1;
-    last_file_atom = 0;
-    handle_stop_code(ctx, stop, NULL, NULL);
+    ArenaTraceState *st = hook_state(ctx);
+    if (!st || st->mode == ARENA_TRACE_OFF || st->bail_armed) return;
+    ArenaTraceState *prev = s_in_hook;
+    st->active_ctx = ctx; st->active_b = NULL; st->active_pc = NULL;
+    s_in_hook = st;
+    int stop = _arena_host_trace(2, st->scratch, 0);
+    s_in_hook = prev;
+    st->active_ctx = NULL;
+    st->last_line_emitted = -1;
+    st->last_file_atom = 0;
+    handle_stop_code(st, ctx, stop, NULL, NULL);
 }
 
 void arena_trace_check_line(JSContext *ctx,
                             struct JSFunctionBytecode *b,
                             const uint8_t *pc)
 {
-    if (arena_trace_mode < ARENA_TRACE_DRILL || s_bail_armed) return;
+    ArenaTraceState *st = hook_state(ctx);
+    if (!st || st->mode < ARENA_TRACE_DRILL || st->bail_armed) return;
     int line = js_arena_trace_bc_resolve_line(ctx, b, pc);
     if (line < 0) return;
     uint32_t file_atom = (uint32_t)js_arena_trace_bc_filename(b);
-    if ((uint32_t)line == (uint32_t)last_line_emitted && file_atom == last_file_atom)
+    if ((uint32_t)line == (uint32_t)st->last_line_emitted
+            && file_atom == st->last_file_atom)
         return;
-    last_line_emitted = line;
-    last_file_atom = file_atom;
+    st->last_line_emitted = line;
+    st->last_file_atom = file_atom;
 
-    s_active_ctx = ctx; s_active_b = b; s_active_pc = pc;
-    int stop = ensure_name(ctx, file_atom);
-    memcpy(scratch + 0, &file_atom, 4);
+    ArenaTraceState *prev = s_in_hook;
+    st->active_ctx = ctx; st->active_b = b; st->active_pc = pc;
+    s_in_hook = st;
+    int stop = ensure_name(st, ctx, file_atom);
+    memcpy(st->scratch + 0, &file_atom, 4);
     uint32_t line32 = (uint32_t)line;
-    memcpy(scratch + 4, &line32, 4);
-    stop = merge_stop(stop, _arena_host_trace(3, scratch, 8));
-    s_active_ctx = NULL; s_active_b = NULL; s_active_pc = NULL;
-    handle_stop_code(ctx, stop, b, pc);
+    memcpy(st->scratch + 4, &line32, 4);
+    stop = merge_stop(stop, _arena_host_trace(3, st->scratch, 8));
+    s_in_hook = prev;
+    st->active_ctx = NULL; st->active_b = NULL; st->active_pc = NULL;
+    handle_stop_code(st, ctx, stop, b, pc);
 }
 
 void arena_trace_op_throw(JSContext *ctx,
@@ -605,30 +628,34 @@ void arena_trace_op_throw(JSContext *ctx,
                           const uint8_t *pc,
                           JSValueConst thrown)
 {
-    if (arena_trace_mode == ARENA_TRACE_OFF || s_bail_armed) return;
+    ArenaTraceState *st = hook_state(ctx);
+    if (!st || st->mode == ARENA_TRACE_OFF || st->bail_armed) return;
     int line = js_arena_trace_bc_resolve_line(ctx, b, pc);
     if (line < 0) line = 0;
     uint32_t file_atom = (uint32_t)js_arena_trace_bc_filename(b);
-    s_active_ctx = ctx; s_active_b = b; s_active_pc = pc;
-    int stop = ensure_name(ctx, file_atom);
+    ArenaTraceState *prev = s_in_hook;
+    st->active_ctx = ctx; st->active_b = b; st->active_pc = pc;
+    s_in_hook = st;
+    int stop = ensure_name(st, ctx, file_atom);
 
     /* Best-effort message via toString. If it throws or returns NULL,
        emit empty message — host can still anchor to file:line. */
     const char *msg = JS_ToCString(ctx, thrown);
     size_t mlen = msg ? strlen(msg) : 0;
     if (mlen > 0xffff) mlen = 0xffff;
-    if (mlen + 10 > SCRATCH_CAP) mlen = SCRATCH_CAP - 10;
+    if (mlen + 10 > ARENA_TRACE_SCRATCH_CAP) mlen = ARENA_TRACE_SCRATCH_CAP - 10;
 
-    memcpy(scratch + 0, &file_atom, 4);
+    memcpy(st->scratch + 0, &file_atom, 4);
     uint32_t line32 = (uint32_t)line;
-    memcpy(scratch + 4, &line32, 4);
+    memcpy(st->scratch + 4, &line32, 4);
     uint16_t mlen16 = (uint16_t)mlen;
-    memcpy(scratch + 8, &mlen16, 2);
-    if (msg) memcpy(scratch + 10, msg, mlen);
+    memcpy(st->scratch + 8, &mlen16, 2);
+    if (msg) memcpy(st->scratch + 10, msg, mlen);
     if (msg) JS_FreeCString(ctx, msg);
-    stop = merge_stop(stop, _arena_host_trace(4, scratch, (int)(10 + mlen)));
-    s_active_ctx = NULL; s_active_b = NULL; s_active_pc = NULL;
-    handle_stop_code(ctx, stop, b, pc);
+    stop = merge_stop(stop, _arena_host_trace(4, st->scratch, (int)(10 + mlen)));
+    s_in_hook = prev;
+    st->active_ctx = NULL; st->active_b = NULL; st->active_pc = NULL;
+    handle_stop_code(st, ctx, stop, b, pc);
 }
 
 #endif /* ARENA_TRACE_ENABLED */

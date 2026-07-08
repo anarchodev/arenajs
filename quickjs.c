@@ -472,8 +472,25 @@ struct JSRuntime {
     JSShape **shape_hash;
     void *user_opaque;
     void *libc_opaque;
+#if ARENA_TRACE_ENABLED
+    /* Per-runtime trace-emitter state (ArenaTraceState, owned by the
+       reactor instance that created this runtime; NULL for runtimes
+       with no trace consumer). Deliberately NOT user_opaque: that slot
+       belongs to the embedder, and trace hooks fire for every runtime
+       in a trace-enabled build. */
+    void *arena_trace_state;
+#endif
     JSRuntimeFinalizerState *finalizers;
 };
+
+#if ARENA_TRACE_ENABLED
+/* Patch-site check: trace state resolved per-runtime. NULL slot (no
+   trace consumer bound) reads as OFF, so hooks stay a single
+   predictable-not-taken branch for untraced runtimes. */
+#define arena_trace_mode_of(ctx) \
+    (likely(!(ctx)->rt->arena_trace_state) ? ARENA_TRACE_OFF : \
+     ((ArenaTraceState *)(ctx)->rt->arena_trace_state)->mode)
+#endif
 
 struct JSClass {
     uint32_t class_id; /* 0 means free entry */
@@ -8592,6 +8609,19 @@ fail:
 }
 
 #if ARENA_TRACE_ENABLED
+/* Per-runtime trace-state slot. The reactor binds its instance's
+   ArenaTraceState here at build time — pre-freeze, since rt lives in
+   base memory and the pointer is never rewritten afterwards (the
+   pointed-to state is plain C heap and stays mutable). */
+void js_arena_trace_set_state(JSRuntime *rt, struct ArenaTraceState *st)
+{
+    rt->arena_trace_state = st;
+}
+struct ArenaTraceState *js_arena_trace_get_state(JSRuntime *rt)
+{
+    return rt->arena_trace_state;
+}
+
 /* Trace-emitter callbacks: tiny accessors so qjs-arena-trace.c (which
    doesn't see JSFunctionBytecode internals) can fish out fields it needs
    to populate FUNC_ENTER / LINE / THROW payloads. Compiled out when
@@ -18828,7 +18858,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                balanced 1:1 with FUNC_EXIT. The user sees a separate
                ENTER/EXIT pair for each physical suspend/resume cycle —
                that's accurate to how the engine actually executes. */
-            if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+            if (unlikely(arena_trace_mode_of(ctx) != ARENA_TRACE_OFF))
                 arena_trace_func_enter(ctx, b);
             if (s->throw_flag)
                 goto exception;
@@ -18904,7 +18934,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         print_func_name(b);
 #endif
 
-    if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+    if (unlikely(arena_trace_mode_of(ctx) != ARENA_TRACE_OFF))
         arena_trace_func_enter(ctx, b);
 
  restart:
@@ -18912,7 +18942,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         int call_argc;
         JSValue *call_argv;
 
-        if (unlikely(arena_trace_mode != ARENA_TRACE_OFF)) {
+        if (unlikely(arena_trace_mode_of(ctx) != ARENA_TRACE_OFF)) {
             /* If a trace hook raised a stop-sentinel (or any other
                exception fired between opcodes for that matter), unwind
                immediately rather than continuing to execute user code
@@ -18920,7 +18950,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                on so the non-tracing hot path stays unchanged. */
             if (JS_HasException(ctx))
                 goto exception;
-            if (arena_trace_mode >= ARENA_TRACE_DRILL)
+            if (arena_trace_mode_of(ctx) >= ARENA_TRACE_DRILL)
                 arena_trace_check_line(ctx, b, pc);
         }
 
@@ -19431,7 +19461,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_throw):
-            if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+            if (unlikely(arena_trace_mode_of(ctx) != ARENA_TRACE_OFF))
                 arena_trace_op_throw(ctx, b, pc, sp[-1]);
             JS_Throw(ctx, *--sp);
             goto exception;
@@ -21526,7 +21556,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->req->current_stack_frame = sf->prev_frame;
-    if (unlikely(arena_trace_mode != ARENA_TRACE_OFF))
+    if (unlikely(arena_trace_mode_of(ctx) != ARENA_TRACE_OFF))
         arena_trace_func_exit(ctx);
     return ret_val;
 }
