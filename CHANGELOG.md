@@ -40,6 +40,18 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.3] - 2026-07-08
+
+The **multi-instance release**: the reactor becomes instance-based
+(`ArenaReactor*`), with the singleton exports preserved verbatim as
+wrappers over a default instance. MINOR, not MAJOR: every covered
+export keeps its name, signature, return codes, and wire formats, and
+the WASM export list is unchanged. The breaking changes below are
+confined to trace-module internals that were never part of the covered
+contract — see "Backward incompatibilities".
+
 ### Added
 
 - **Instance-based reactor API** (`qjs-arena-reactor.h`, NEW header —
@@ -72,18 +84,54 @@ safe consumer pattern spelled out.
 ### Changed
 
 - Trace-emitter state (mode, NAME intern table, stop flag, active-event
-  context) moved from process globals into per-instance state resolved
-  through the traced runtime. Wire format and event semantics are
-  untouched. Native embedders that linked the internal trace-module
-  functions directly (`arena_trace_set_mode`, `arena_trace_reset`,
-  `arena_trace_stop_armed` — not part of the exported reactor ABI) must
-  switch to the reactor surface or pass the new `ArenaTraceState *`.
-- PATCH-level behavioral note: the singleton's determinism pins
-  (`arena_set_random_seed` / `arena_set_date_now`) no longer survive an
-  `arena_destroy` → `arena_init` cycle; they now live in the instance
-  and die with it. Pins are set per-request by every known driver, so
-  this only affects a re-init that relied on inheriting stale pins.
+  context, payload scratch) moved from process globals into a
+  per-instance `ArenaTraceState`, bound to the traced runtime and
+  resolved ctx→rt in each hook. Wire format and event semantics are
+  untouched; nested runs across instances become correct by
+  construction.
+
+### Backward incompatibilities
+
+None in the covered contract (exported `arena_*` functions, return
+codes, build flags, wire formats — all identical; a rebuilt WASM
+module has a byte-identical export list). The following break only
+embedders that reached past the exported ABI into shipped-header
+internals, in `ARENA_TRACE_ENABLED=1` builds:
+
+- `arena_trace_set_mode(int)` and the `extern int arena_trace_mode`
+  global are **gone** (there is no process-wide mode anymore). Use the
+  exported `arena_set_trace_mode` / `arena_set_trace_mode_r`.
+- `arena_trace_reset(void)` → `arena_trace_reset(ArenaTraceState *)`;
+  `arena_trace_stop_armed(void)` →
+  `arena_trace_stop_armed(const ArenaTraceState *)`. Both are reactor
+  plumbing; embedders should not call them directly.
+- `arena_entry_module(void)` → `arena_entry_module(JSContext *)` —
+  previously an undeclared cross-TU extern consumed only by the replay
+  bindings; now declared in `qjs-arena-reactor.h`.
+- Behavioral, singleton path: determinism pins (`arena_set_random_seed`
+  / `arena_set_date_now`) no longer survive an `arena_destroy` →
+  `arena_init` cycle; they live in the instance and die with it. Pins
+  are set per-request by every known driver, so this only affects a
+  re-init that relied on inheriting stale pins.
   (`arena_set_trace_mode` before `arena_init` still works.)
+- Behavioral, multi-instance hosts only: trace NAME atom ids are
+  per-runtime — scope the atom→string map per run/instance. Existing
+  single-instance hosts are unaffected.
+
+## [0.3.2] - 2026-07-07
+
+_Entry added retroactively in 0.3.3: v0.3.2 was tagged (at
+`adc7356`) without a changelog cut — VERSION and build.zig.zon still
+said 0.3.1 in that tree._
+
+### Added
+
+- `arena_set_request_mode(int mode)` reactor export (0 = GC mspace,
+  1 = bump), also added to the WASM export list. Selects the
+  request-allocator regime for subsequent runs; binds at the next
+  request-arena reset, so call it between runs. Replay embedders use
+  it to re-run a request under the regime the live request completed
+  under (a GC-completed churny request would OOM under bump).
 
 ## [0.3.1] - 2026-07-07
 
