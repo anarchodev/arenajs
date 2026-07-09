@@ -44,6 +44,12 @@ _Nothing yet._
 
 ## [0.3.4] - 2026-07-08
 
+The **base-surface release**: two additions that let an embedder (rove's
+replay/sim engine) give the reactor base the same handler-global surface the
+worker has — deferred-freeze construction so a `_system` prelude can be evaluated
+into unfrozen base memory, plus native SHA-256/HMAC in the replay bindings.
+MINOR: every existing export keeps its name, signature, and return codes.
+
 - **MINOR: deferred-freeze reactor construction.** New exports
   `arena_reactor_new_open` (build without freezing), `arena_reactor_eval_base`
   (eval a classic script into the unfrozen base — for an embedder to install a
