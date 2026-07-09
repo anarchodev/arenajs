@@ -69,6 +69,11 @@ struct ArenaReactor {
        exists for it, and both static and dynamic self-imports route
        through the host loader, diverging from the module tape). */
     JSModuleDef *entry_module;
+
+    /* Freeze latch. arena_reactor_new freezes eagerly; arena_reactor_new_open
+       leaves the base writable so an embedder can install extra
+       natives/globals, and arena_reactor_freeze (idempotent) seals it. */
+    bool frozen;
 };
 
 static void arena_reapply_pins(ArenaReactor *r)
@@ -80,7 +85,16 @@ static void arena_reapply_pins(ArenaReactor *r)
 }
 
 ARENA_API
-ArenaReactor *arena_reactor_new(int base_kb, int request_kb)
+/* Defined below (the exception diagnostic dump); forward-declared so
+   arena_reactor_eval_base can use it. */
+static void diagnose_exception(JSContext *ctx, JSValueConst exc, const char *where);
+
+/* Build a reactor but leave the base UNFROZEN — the embedder may install
+   additional natives / eval globals via arena_reactor_eval_base, then must
+   call arena_reactor_freeze before the first run. Identical to
+   arena_reactor_new through the pre-freeze installs; only the final freeze is
+   deferred. */
+ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb)
 {
     ArenaReactor *r = calloc(1, sizeof *r);
     if (!r)
@@ -127,9 +141,66 @@ ArenaReactor *arena_reactor_new(int base_kb, int request_kb)
     JS_SetRuntimeOpaque(r->rt, r);
     js_arena_trace_set_state(r->rt, &r->trace);
 
-    /* Freeze: from here on, per-request allocations land in the request
-       arena. Base holds the runtime + default context + replay bindings. */
+    /* NOT frozen yet — the caller (arena_reactor_new, or an embedder that
+       wants to add more base globals) seals it with arena_reactor_freeze. */
+    return r;
+}
+
+/* Eval `src` as a classic script into the UNFROZEN base — for an embedder to
+   install extra globals (e.g. a `_system` prelude + composed shims) that must
+   live in base memory and survive per-request resets. Pre-freeze, all
+   allocations land in base; pending jobs drain before returning. Returns
+   ARENA_RC_*. Refuses (ARENA_RC_ERROR) once frozen — base may be PROT_READ. */
+ARENA_API
+int arena_reactor_eval_base(ArenaReactor *r, const char *src)
+{
+    if (!r || !r->rt || !r->ctx || !src || r->frozen)
+        return ARENA_RC_ERROR;
+
+    JSValue v = JS_Eval(r->ctx, src, strlen(src), "<arena-base>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(v)) {
+        JSValue exc = JS_GetException(r->ctx);
+        diagnose_exception(r->ctx, exc, "arena_reactor_eval_base");
+        JS_FreeValue(r->ctx, exc);
+        JS_FreeValue(r->ctx, v);
+        return ARENA_RC_ERROR;
+    }
+    JS_FreeValue(r->ctx, v);
+
+    /* Drain any microtasks the install queued (IIFE shims shouldn't, but be
+       safe — same discipline as arena_run_module). */
+    JSContext *cx;
+    int rc;
+    while ((rc = JS_ExecutePendingJob(r->rt, &cx)) != 0) {
+        if (rc < 0) {
+            JSValue exc = JS_GetException(cx);
+            diagnose_exception(cx, exc, "arena_reactor_eval_base(job)");
+            JS_FreeValue(cx, exc);
+            return ARENA_RC_ERROR;
+        }
+    }
+    return ARENA_RC_OK;
+}
+
+/* Freeze the base: from here on, per-request allocations land in the request
+   arena. Idempotent — a second call is a no-op. Required before the first run
+   of an arena_reactor_new_open reactor (arena_reactor_new does it for you). */
+void arena_reactor_freeze(ArenaReactor *r)
+{
+    if (!r || r->frozen)
+        return;
     JS_FreezeRuntime(r->rt);
+    r->frozen = true;
+}
+
+/* Build a reactor and freeze immediately — the original one-shot constructor.
+   Base holds the runtime + default context + replay bindings. */
+ArenaReactor *arena_reactor_new(int base_kb, int request_kb)
+{
+    ArenaReactor *r = arena_reactor_new_open(base_kb, request_kb);
+    if (!r)
+        return NULL;
+    arena_reactor_freeze(r);
     return r;
 }
 

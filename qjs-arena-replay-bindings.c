@@ -340,6 +340,166 @@ static JSValue jsb_crypto_randomUUID(JSContext *ctx, JSValueConst this_val,
     return JS_NewStringLen(ctx, out, 36);
 }
 
+/* ── SHA-256 + HMAC-SHA256 ───────────────────────────────────────────────
+ * Embedded (public-domain SHA-256) so the replay/sim base provides the
+ * hashing the worker's `_system.crypto` does — `globals/crypto.js` composes
+ * `crypto.sha256`/`hmacSha256` (lowercase-hex over a string or Uint8Array)
+ * into magic-link / session / webhook-idempotency machinery. No OpenSSL, so
+ * this stays in the portable `arenajs-replay` the `rewind` CLI cross-compiles.
+ * (Streaming sha256Init/Update/Final + RSA/ECDSA are NOT here yet.) */
+#define ARENA_ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+typedef struct { uint32_t s[8]; uint64_t n; uint8_t buf[64]; size_t len; } arena_sha256;
+
+static void arena_sha256_init(arena_sha256 *c)
+{
+    static const uint32_t iv[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372,
+        0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+    memcpy(c->s, iv, sizeof iv);
+    c->n = 0;
+    c->len = 0;
+}
+
+static void arena_sha256_block(arena_sha256 *c, const uint8_t *p)
+{
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i*4] << 24) | ((uint32_t)p[i*4+1] << 16) |
+               ((uint32_t)p[i*4+2] << 8) | (uint32_t)p[i*4+3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ARENA_ROR(w[i-15], 7) ^ ARENA_ROR(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = ARENA_ROR(w[i-2], 17) ^ ARENA_ROR(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=c->s[0],b=c->s[1],cc=c->s[2],d=c->s[3],e=c->s[4],f=c->s[5],g=c->s[6],h=c->s[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ARENA_ROR(e,6) ^ ARENA_ROR(e,11) ^ ARENA_ROR(e,25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + K[i] + w[i];
+        uint32_t S0 = ARENA_ROR(a,2) ^ ARENA_ROR(a,13) ^ ARENA_ROR(a,22);
+        uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+        uint32_t t2 = S0 + maj;
+        h=g; g=f; f=e; e=d+t1; d=cc; cc=b; b=a; a=t1+t2;
+    }
+    c->s[0]+=a; c->s[1]+=b; c->s[2]+=cc; c->s[3]+=d; c->s[4]+=e; c->s[5]+=f; c->s[6]+=g; c->s[7]+=h;
+}
+
+static void arena_sha256_update(arena_sha256 *c, const uint8_t *p, size_t n)
+{
+    c->n += n;
+    while (n) {
+        size_t take = 64 - c->len;
+        if (take > n) take = n;
+        memcpy(c->buf + c->len, p, take);
+        c->len += take; p += take; n -= take;
+        if (c->len == 64) { arena_sha256_block(c, c->buf); c->len = 0; }
+    }
+}
+
+static void arena_sha256_final(arena_sha256 *c, uint8_t out[32])
+{
+    uint64_t bits = c->n * 8;
+    uint8_t pad = 0x80, z = 0;
+    arena_sha256_update(c, &pad, 1);
+    while (c->len != 56) arena_sha256_update(c, &z, 1);
+    uint8_t lb[8];
+    for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bits >> (56 - i*8));
+    arena_sha256_update(c, lb, 8);
+    for (int i = 0; i < 8; i++) {
+        out[i*4]   = (uint8_t)(c->s[i] >> 24);
+        out[i*4+1] = (uint8_t)(c->s[i] >> 16);
+        out[i*4+2] = (uint8_t)(c->s[i] >> 8);
+        out[i*4+3] = (uint8_t)(c->s[i]);
+    }
+}
+
+static void arena_hmac_sha256(const uint8_t *key, size_t kl,
+                              const uint8_t *msg, size_t ml, uint8_t out[32])
+{
+    uint8_t k[64] = {0};
+    if (kl > 64) { arena_sha256 c; arena_sha256_init(&c); arena_sha256_update(&c, key, kl); arena_sha256_final(&c, k); }
+    else memcpy(k, key, kl);
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    uint8_t ih[32];
+    arena_sha256 c;
+    arena_sha256_init(&c); arena_sha256_update(&c, ipad, 64); arena_sha256_update(&c, msg, ml); arena_sha256_final(&c, ih);
+    arena_sha256_init(&c); arena_sha256_update(&c, opad, 64); arena_sha256_update(&c, ih, 32); arena_sha256_final(&c, out);
+}
+
+/* Extract a string (UTF-8) or Uint8Array arg into a malloc'd byte buffer. */
+static uint8_t *arena_crypto_arg_bytes(JSContext *ctx, JSValueConst v, size_t *out_len)
+{
+    if (JS_IsString(v)) {
+        size_t l;
+        const char *s = JS_ToCStringLen(ctx, &l, v);
+        if (!s) return NULL;
+        uint8_t *b = malloc(l ? l : 1);
+        if (b) memcpy(b, s, l);
+        JS_FreeCString(ctx, s);
+        *out_len = l;
+        return b;
+    }
+    size_t off = 0, len = 0, bpe = 0;
+    JSValue buf = JS_GetTypedArrayBuffer(ctx, v, &off, &len, &bpe);
+    if (JS_IsException(buf)) return NULL;
+    size_t ab = 0;
+    uint8_t *ap = JS_GetArrayBuffer(ctx, &ab, buf);
+    JS_FreeValue(ctx, buf);
+    if (!ap) return NULL;
+    uint8_t *b = malloc(len ? len : 1);
+    if (b) memcpy(b, ap + off, len);
+    *out_len = len;
+    return b;
+}
+
+static JSValue arena_hex32(JSContext *ctx, const uint8_t d[32])
+{
+    static const char h[] = "0123456789abcdef";
+    char o[64];
+    for (int i = 0; i < 32; i++) { o[i*2] = h[d[i] >> 4]; o[i*2+1] = h[d[i] & 0xf]; }
+    return JS_NewStringLen(ctx, o, 64);
+}
+
+static JSValue jsb_crypto_sha256(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "crypto.sha256 requires 1 argument");
+    size_t l = 0;
+    uint8_t *b = arena_crypto_arg_bytes(ctx, argv[0], &l);
+    if (!b) return JS_EXCEPTION;
+    arena_sha256 c;
+    uint8_t d[32];
+    arena_sha256_init(&c); arena_sha256_update(&c, b, l); arena_sha256_final(&c, d);
+    free(b);
+    return arena_hex32(ctx, d);
+}
+
+static JSValue jsb_crypto_hmacSha256(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "crypto.hmacSha256 requires (key, data)");
+    size_t kl = 0, dl = 0;
+    uint8_t *k = arena_crypto_arg_bytes(ctx, argv[0], &kl);
+    if (!k) return JS_EXCEPTION;
+    uint8_t *dt = arena_crypto_arg_bytes(ctx, argv[1], &dl);
+    if (!dt) { free(k); return JS_EXCEPTION; }
+    uint8_t d[32];
+    arena_hmac_sha256(k, kl, dt, dl, d);
+    free(k); free(dt);
+    return arena_hex32(ctx, d);
+}
+
 /* kv.get(key) — returns the recorded string value, null for not_found,
    throws for err (so handler error-handling under replay matches prod). */
 static JSValue jsb_kv_get(JSContext *ctx, JSValueConst this_val,
@@ -554,6 +714,10 @@ int arena_install_replay_bindings(JSContext *ctx)
         JS_NewCFunction(ctx, jsb_crypto_randomBytes, "randomBytes", 1));
     JS_SetPropertyStr(ctx, crypto, "randomUUID",
         JS_NewCFunction(ctx, jsb_crypto_randomUUID, "randomUUID", 0));
+    JS_SetPropertyStr(ctx, crypto, "sha256",
+        JS_NewCFunction(ctx, jsb_crypto_sha256, "sha256", 1));
+    JS_SetPropertyStr(ctx, crypto, "hmacSha256",
+        JS_NewCFunction(ctx, jsb_crypto_hmacSha256, "hmacSha256", 2));
     JS_SetPropertyStr(ctx, global, "crypto", crypto);
 
     /* kv namespace */

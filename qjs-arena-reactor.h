@@ -90,6 +90,23 @@ typedef struct ArenaReactor ArenaReactor;
    the 4 MiB default. Returns NULL on failure. */
 ArenaReactor *arena_reactor_new(int base_kb, int request_kb);
 
+/* Like arena_reactor_new but leaves the base UNFROZEN so the embedder can add
+   more base globals (arena_reactor_eval_base) before sealing it with
+   arena_reactor_freeze. Required call order: new_open → [eval_base…] → freeze
+   → run. Returns NULL on failure. */
+ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb);
+
+/* Eval `src` as a classic script into the UNFROZEN base (all allocations land
+   in base pre-freeze, so the globals survive per-request resets). Pending jobs
+   drain before returning. Returns ARENA_RC_*; ARENA_RC_ERROR if already frozen
+   or on a JS exception. */
+int arena_reactor_eval_base(ArenaReactor *r, const char *src);
+
+/* Freeze the base — subsequent allocations are request-scoped. Idempotent.
+   Required before the first run of an arena_reactor_new_open reactor
+   (arena_reactor_new does it internally). */
+void arena_reactor_freeze(ArenaReactor *r);
+
 /* Tear down the instance. NULL is a no-op. See the header comment:
    never call this from inside a run. */
 void arena_reactor_free(ArenaReactor *r);

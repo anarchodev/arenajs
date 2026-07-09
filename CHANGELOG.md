@@ -42,6 +42,20 @@ safe consumer pattern spelled out.
 
 _Nothing yet._
 
+## [0.3.4] - 2026-07-08
+
+- **MINOR: deferred-freeze reactor construction.** New exports
+  `arena_reactor_new_open` (build without freezing), `arena_reactor_eval_base`
+  (eval a classic script into the unfrozen base — for an embedder to install a
+  `_system` prelude + composed shims that must live in base memory), and
+  `arena_reactor_freeze` (idempotent seal). `arena_reactor_new` is unchanged
+  (now = new_open + freeze). Lets rove's replay/sim engine give its base the
+  same handler-global surface the worker has.
+- **MINOR: native `crypto.sha256` / `crypto.hmacSha256`** in the replay
+  bindings (embedded public-domain SHA-256, lowercase-hex over string/Uint8Array
+  — matches the worker's `_system.crypto`). No OpenSSL, so `arenajs-replay` stays
+  cross-compilable. Streaming sha256 + RSA/ECDSA remain out.
+
 ## [0.3.3] - 2026-07-08
 
 The **multi-instance release**: the reactor becomes instance-based
