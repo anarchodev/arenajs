@@ -89,12 +89,27 @@ ARENA_API
    arena_reactor_eval_base can use it. */
 static void diagnose_exception(JSContext *ctx, JSValueConst exc, const char *where);
 
+/* The default base-setup: the replay host surface (kv/crypto + the tape
+   module loader). arena_reactor_new / arena_reactor_new_open install this,
+   so existing embedders (the native sim, the WASM singleton) are unchanged
+   by the parameterization. */
+static int default_replay_setup(JSContext *ctx, JSRuntime *rt, void *user)
+{
+    (void)user;
+    if (arena_install_replay_bindings(ctx) < 0)
+        return -1;
+    arena_install_replay_module_loader(rt);
+    return 0;
+}
+
 /* Build a reactor but leave the base UNFROZEN — the embedder may install
    additional natives / eval globals via arena_reactor_eval_base, then must
-   call arena_reactor_freeze before the first run. Identical to
-   arena_reactor_new through the pre-freeze installs; only the final freeze is
-   deferred. */
-ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb)
+   call arena_reactor_freeze before the first run. The `setup` hook installs
+   the embedder's base surface (bindings + module loader + any runtime hooks)
+   on the fresh (ctx, rt) pre-freeze — see the header. Only the final freeze
+   is deferred. */
+ArenaReactor *arena_reactor_new_open_with(int base_kb, int request_kb,
+                                          arena_base_setup_fn setup, void *user)
 {
     ArenaReactor *r = calloc(1, sizeof *r);
     if (!r)
@@ -117,19 +132,17 @@ ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb)
         return NULL;
     }
 
-    /* Install replay-tape bindings BEFORE freeze so the binding objects
-       and their native function references land in base memory and
-       survive per-request resets. */
-    if (arena_install_replay_bindings(r->ctx) < 0) {
+    /* Embedder installs its base surface (native bindings + module loader +
+       any runtime hooks) on the fresh (ctx, rt) BEFORE freeze, so the
+       binding objects and their function-pointer references land in base
+       memory and survive per-request resets. A miss tears the half-built
+       reactor down. A NULL setup builds a bare runtime (intrinsics only). */
+    if (setup && setup(r->ctx, r->rt, user) < 0) {
         JS_FreeContext(r->ctx);
         JS_FreeRuntime(r->rt);
         free(r);
         return NULL;
     }
-
-    /* Module loader is set on the runtime; the function-pointer fields
-       it stores need to be in base memory, so install pre-freeze too. */
-    arena_install_replay_module_loader(r->rt);
 
     /* Bind instance state to the runtime — BOTH are base-memory writes
        and must stay above JS_FreezeRuntime (harden discipline: rt lives
@@ -144,6 +157,15 @@ ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb)
     /* NOT frozen yet — the caller (arena_reactor_new, or an embedder that
        wants to add more base globals) seals it with arena_reactor_freeze. */
     return r;
+}
+
+/* Unfrozen reactor with the default replay base-setup. Kept for existing
+   embedders (native sim, WASM singleton) that want the replay host surface;
+   new embedders wanting their own surface use arena_reactor_new_open_with. */
+ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb)
+{
+    return arena_reactor_new_open_with(base_kb, request_kb,
+                                       default_replay_setup, NULL);
 }
 
 /* Eval `src` as a classic script into the UNFROZEN base — for an embedder to

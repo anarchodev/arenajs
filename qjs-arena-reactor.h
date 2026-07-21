@@ -93,8 +93,30 @@ ArenaReactor *arena_reactor_new(int base_kb, int request_kb);
 /* Like arena_reactor_new but leaves the base UNFROZEN so the embedder can add
    more base globals (arena_reactor_eval_base) before sealing it with
    arena_reactor_freeze. Required call order: new_open → [eval_base…] → freeze
-   → run. Returns NULL on failure. */
+   → run. Installs the default replay base-setup (see _with). Returns NULL on
+   failure. */
 ArenaReactor *arena_reactor_new_open(int base_kb, int request_kb);
+
+/* Base-setup hook: install the embedder's native bindings + module loader
+   (and any other runtime hooks — an interrupt handler, a promise-rejection
+   tracker) on the fresh (ctx, rt) BEFORE the base is frozen, so the object /
+   function-pointer references land in base memory and survive per-request
+   resets. Return < 0 to abort construction (the half-built reactor is torn
+   down and NULL returned), 0 on success.
+
+   This is the seam that keeps the reactor embedder-agnostic: the run loop +
+   determinism discipline is generic; WHICH host surface a runtime exposes is
+   the embedder's choice. The native simulator installs the replay kv/crypto
+   host + tape loader; a production embedder installs its own surface + a
+   package-resolving module loader + a CPU-budget interrupt handler. */
+typedef int (*arena_base_setup_fn)(JSContext *ctx, JSRuntime *rt, void *user);
+
+/* Like arena_reactor_new_open, but the embedder supplies the pre-freeze
+   base-setup. arena_reactor_new_open is exactly this with default_replay_setup
+   (the replay kv/crypto bindings + tape module loader). A NULL setup builds a
+   bare runtime (standard intrinsics only). Returns NULL on failure. */
+ArenaReactor *arena_reactor_new_open_with(int base_kb, int request_kb,
+                                          arena_base_setup_fn setup, void *user);
 
 /* Eval `src` as a classic script into the UNFROZEN base (all allocations land
    in base pre-freeze, so the globals survive per-request resets). Pending jobs
