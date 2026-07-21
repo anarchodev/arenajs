@@ -145,24 +145,6 @@ size_t arena_oom_requested_r(ArenaReactor *r);
 size_t arena_oom_used_r(ArenaReactor *r);
 size_t arena_oom_limit_r(ArenaReactor *r);
 
-/* ── raw runtime access (native escape hatch) ──────────────────────────
- * The JSRuntime / JSContext the reactor owns, so a native embedder can
- * call the full quickjs C API directly (JS_SetModuleLoaderFunc2,
- * JS_SetInterruptHandler, JS_SetHostPromiseRejectionTracker, custom class
- * registration, …) instead of the reactor re-exporting each capability as
- * its own arena_*_r wrapper. Runtime-level hooks installed this way (e.g.
- * the module loader / interrupt handler) live on the JSRuntime and persist
- * across the per-request arena reset, so install once after construction.
- *
- * With ownership comes responsibility: values the interpreter must reach
- * across runs belong in the base arena (install pre-freeze, or outside the
- * arenas entirely); a callback's opaque must outlive every run. Mutually
- * exclusive with the reactor's built-in replay module loader — a consumer
- * that installs its own JS_SetModuleLoaderFunc2 takes over module loading.
- * NULL if r is NULL. */
-JSRuntime *arena_reactor_runtime(ArenaReactor *r);
-JSContext *arena_reactor_context(ArenaReactor *r);
-
 /* ── singleton wrappers (frozen WASM/CLI ABI over a default instance) */
 
 int  arena_init(int base_kb, int request_kb);   /* -1 if already live */

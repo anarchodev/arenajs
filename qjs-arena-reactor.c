@@ -216,19 +216,6 @@ void arena_reactor_free(ArenaReactor *r)
     free(r);
 }
 
-/* Raw runtime access — the native escape hatch (see the header). Lets an
-   embedder drive the full quickjs C API on the reactor's runtime instead
-   of adding a bespoke arena_*_r wrapper per capability. */
-JSRuntime *arena_reactor_runtime(ArenaReactor *r)
-{
-    return r ? r->rt : NULL;
-}
-
-JSContext *arena_reactor_context(ArenaReactor *r)
-{
-    return r ? r->ctx : NULL;
-}
-
 /* Diagnostic dump for any exception arena_run_module unexpectedly
    surfaces. The original "just call JS_ToCString(exc)" path was
    useless under arena pressure: when the arena is full the cstring
