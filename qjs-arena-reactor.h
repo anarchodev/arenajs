@@ -160,6 +160,15 @@ void arena_set_request_mode_r(ArenaReactor *r, int mode);
 void arena_set_random_seed_r(ArenaReactor *r, uint64_t seed);
 void arena_set_date_now_r(ArenaReactor *r, int64_t ms);
 
+/* Install a QuickJS interrupt handler on this instance's runtime. The VM
+   calls `cb(rt, opaque)` periodically (every ~N bytecode ops) while a script
+   runs; returning non-zero throws an uncatchable InternalError into the
+   running script — the mechanism a host uses to enforce a CPU / wall-clock
+   budget on a runaway handler. `opaque` is passed through unchanged. Pass
+   cb = NULL to clear. Sticky (set on the runtime, survives request-arena
+   resets); the host typically refreshes its per-run deadline via `opaque`. */
+void arena_set_interrupt_r(ArenaReactor *r, JSInterruptHandler *cb, void *opaque);
+
 /* Per-instance OOM record of the most recent run (reset at each run's
    entry). _hit is 1 if any request-mode allocation was refused. */
 int    arena_oom_hit_r(ArenaReactor *r);

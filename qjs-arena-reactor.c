@@ -564,6 +564,12 @@ void arena_set_date_now_r(ArenaReactor *r, int64_t ms)
     JS_SetDateNow(r->ctx, ms);
 }
 
+void arena_set_interrupt_r(ArenaReactor *r, JSInterruptHandler *cb, void *opaque)
+{
+    if (!r || !r->rt) return;
+    JS_SetInterruptHandler(r->rt, cb, opaque);
+}
+
 ARENA_API
 int arena_oom_hit_r(ArenaReactor *r)
 {
