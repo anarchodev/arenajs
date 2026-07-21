@@ -671,6 +671,21 @@ int arena_install_replay_module_loader(JSRuntime *rt)
     return 0;
 }
 
+/* Same tape-backed loader, but with a caller-supplied normalizer + opaque.
+   Lets an embedder resolve bare specifiers (e.g. `@scope/pkg` package imports)
+   before the loader pulls source, while keeping the proven source-serving
+   loader unchanged. `normalize` must fully resolve — including ./ and ../ —
+   since it replaces the default normalizer; `opaque` is passed to `normalize`
+   (the loader itself uses the process-global replay host). Must be called
+   pre-freeze. Returns 0. */
+int arena_install_replay_module_loader_normalize(JSRuntime *rt,
+                                                 JSModuleNormalizeFunc *normalize,
+                                                 void *opaque)
+{
+    JS_SetModuleLoaderFunc(rt, normalize, jsb_module_loader, opaque);
+    return 0;
+}
+
 /* ───────────── entry-module namespace ───────────── */
 
 /* `__arena_entry_ns()` — the namespace object of the entry module of

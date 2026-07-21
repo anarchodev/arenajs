@@ -98,6 +98,15 @@ int arena_install_replay_bindings(JSContext *ctx);
    Must be called pre-freeze. Returns 0 on success. */
 int arena_install_replay_module_loader(JSRuntime *rt);
 
+/* Like arena_install_replay_module_loader, but with a caller-supplied module
+   normalizer (`opaque` passed to it) so an embedder can resolve bare specifiers
+   — e.g. `@scope/pkg` package imports — to a concrete key before the tape
+   loader serves source. `normalize` fully replaces the default normalizer, so
+   it must also handle ./ and ../. Must be called pre-freeze. Returns 0. */
+int arena_install_replay_module_loader_normalize(JSRuntime *rt,
+                                                 JSModuleNormalizeFunc *normalize,
+                                                 void *opaque);
+
 #ifdef __cplusplus
 }
 #endif
