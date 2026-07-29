@@ -391,7 +391,7 @@ if(EMSCRIPTEN)
         # HEAPU8/HEAPU16/HEAPU32 exposed so the host can decode binary
         # trace payloads written by the WASM into linear memory.
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU16,HEAPU32
-        "-sEXPORTED_FUNCTIONS=_arena_init,_arena_run,_arena_run_module,_arena_set_trace_mode,_arena_set_request_mode,_arena_snapshot_here,_arena_set_random_seed,_arena_set_date_now,_arena_oom_hit,_arena_oom_requested,_arena_oom_used,_arena_oom_limit,_arena_destroy,_malloc,_free"
+        "-sEXPORTED_FUNCTIONS=_arena_init,_arena_init_open,_arena_eval_base,_arena_freeze,_arena_run,_arena_run_module,_arena_set_trace_mode,_arena_set_request_mode,_arena_snapshot_here,_arena_set_random_seed,_arena_set_date_now,_arena_oom_hit,_arena_oom_requested,_arena_oom_used,_arena_oom_limit,_arena_destroy,_malloc,_free"
     )
     # Turn on the trace emitter for this target. Default 0 means the
     # native qjs library (used by the rove worker) has zero trace

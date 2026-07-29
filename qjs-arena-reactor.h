@@ -179,6 +179,14 @@ size_t arena_oom_limit_r(ArenaReactor *r);
 /* ── singleton wrappers (frozen WASM/CLI ABI over a default instance) */
 
 int  arena_init(int base_kb, int request_kb);   /* -1 if already live */
+/* Open-base variant of arena_init: the default instance is built but NOT
+   frozen, so the embedder can install extra base globals with
+   arena_eval_base (e.g. an engine-shim prelude that must survive
+   per-request resets), then seal with arena_freeze before the first run.
+   Same call-order contract as arena_reactor_new_open. */
+int  arena_init_open(int base_kb, int request_kb); /* -1 if already live */
+int  arena_eval_base(const char *src);  /* ARENA_RC_ERROR once frozen */
+void arena_freeze(void);
 int  arena_run(const char *src);
 int  arena_run_module(const char *entry_name, const char *entry_src);
 void arena_set_trace_mode(int mode);

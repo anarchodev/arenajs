@@ -617,6 +617,30 @@ int arena_init(int base_kb, int request_kb)
 }
 
 ARENA_EXPORT
+int arena_init_open(int base_kb, int request_kb)
+{
+    if (g_default)
+        return -1; /* already initialized */
+    g_default = arena_reactor_new_open(base_kb, request_kb);
+    if (!g_default)
+        return -1;
+    arena_set_trace_mode_r(g_default, g_pending_trace_mode);
+    return 0;
+}
+
+ARENA_EXPORT
+int arena_eval_base(const char *src)
+{
+    return arena_reactor_eval_base(g_default, src);
+}
+
+ARENA_EXPORT
+void arena_freeze(void)
+{
+    arena_reactor_freeze(g_default);
+}
+
+ARENA_EXPORT
 int arena_run(const char *src)
 {
     return arena_run_r(g_default, src);
