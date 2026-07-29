@@ -582,6 +582,14 @@ JS_EXTERN void JS_SetTimeOrigin(JSContext *ctx, double time_origin_ms);
  * customer log lines all share one wall-clock instant within a
  * request. See docs/primitive-gaps.md §9 fold-in in rove. */
 JS_EXTERN void JS_SetDateNow(JSContext *ctx, int64_t date_now_ms);
+/* Pin local time to UTC process-wide: getTimezoneOffset() returns 0 and
+ * every local-time Date method renders in UTC. Replay/simulation
+ * embedders set this so a capture recorded on a UTC server reproduces
+ * identically regardless of the host's (or the browser viewer's) zone —
+ * arena_reactor_new_open_with does it for you. Note TZ=UTC + tzset() is
+ * NOT sufficient under emscripten, where localtime_r delegates to the
+ * host JavaScript Date. */
+JS_EXTERN void JS_SetTimezoneUTC(bool utc);
 JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);
 

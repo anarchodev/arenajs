@@ -48534,9 +48534,27 @@ static const JSCFunctionListEntry js_math_obj[] = {
 
 /* Date */
 
+/* arena: when set, local time IS UTC — every local-time Date method
+   (getHours, getTimezoneOffset, toString, the local-time parse/format
+   paths) resolves with a zero offset instead of asking the host.
+   Process-global rather than per-context because it describes the
+   embedder, not a request: a reactor re-runs code recorded on a UTC
+   server, so the host's zone is never the right answer. Set once,
+   pre-freeze, by arena_reactor_new_open_with. Unlike TZ=UTC + tzset()
+   this also holds under emscripten, where libc's localtime_r delegates
+   to the host JavaScript Date and ignores the environment entirely. */
+static bool arena_tz_utc_pinned;
+
+void JS_SetTimezoneUTC(bool utc)
+{
+    arena_tz_utc_pinned = utc;
+}
+
 /* OS dependent. d = argv[0] is in ms from 1970. Return the difference
    between UTC time and local time 'd' in minutes */
 static int getTimezoneOffset(int64_t time) {
+    if (arena_tz_utc_pinned)
+        return 0;
 #if defined(_WIN32)
     DWORD r;
     TIME_ZONE_INFORMATION t;

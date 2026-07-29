@@ -102,6 +102,19 @@ static int default_replay_setup(JSContext *ctx, JSRuntime *rt, void *user)
     return 0;
 }
 
+/* Pin local time to UTC for every reactor. A reactor exists to re-run
+   recorded code faithfully, and that code was recorded on a UTC server,
+   so the host's zone is never the right answer — without this, the same
+   capture renders one timeline for a viewer in UTC-4 and a different one
+   in UTC+9, silently (no throw, just wrong hours). Goes through the
+   engine rather than TZ=UTC + tzset(): under emscripten libc's
+   localtime_r delegates to the host JavaScript Date and ignores the
+   environment, so the env route fixes native embedders only. */
+static void pin_utc_timezone(void)
+{
+    JS_SetTimezoneUTC(true);
+}
+
 /* Build a reactor but leave the base UNFROZEN — the embedder may install
    additional natives / eval globals via arena_reactor_eval_base, then must
    call arena_reactor_freeze before the first run. The `setup` hook installs
@@ -111,6 +124,8 @@ static int default_replay_setup(JSContext *ctx, JSRuntime *rt, void *user)
 ArenaReactor *arena_reactor_new_open_with(int base_kb, int request_kb,
                                           arena_base_setup_fn setup, void *user)
 {
+    pin_utc_timezone();
+
     ArenaReactor *r = calloc(1, sizeof *r);
     if (!r)
         return NULL;

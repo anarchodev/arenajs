@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "qjs-arena-reactor.h"
 #include "qjs-arena-trace.h"
@@ -193,7 +194,11 @@ static const char *ENTRY_A =
     "kv.set('date_after_nest', String(Date.now()));\n"
     "kv.set('stop_rc', String(kv.get('nest_stop')));\n" /* stopped B run */
     "f();\n"                     /* A's hooks must still fire after B's stop */
-    "kv.set('rand', String(Math.random()));\n";
+    "kv.set('rand', String(Math.random()));\n"
+    /* Local time must BE UTC regardless of the host's zone — main()
+       deliberately sets a non-UTC TZ before building the reactors. */
+    "kv.set('tz_offset', String(new Date().getTimezoneOffset()));\n"
+    "kv.set('local_eq_utc', String(new Date().getHours() === new Date().getUTCHours()));\n";
 
 /* Allocation churn: peak live set is one small object, cumulative
    allocation far beyond B's request region. GC regime reclaims and
@@ -205,6 +210,14 @@ static const char *CHURN_SRC =
 
 int main(void)
 {
+    /* A reactor re-runs code recorded on a UTC server, so it pins local
+       time to UTC no matter where the host sits. Sit somewhere else on
+       purpose: without the pin, the local-time Date reads in ENTRY_A
+       render in THIS zone, and a replay silently disagrees with its
+       capture (and with every viewer in another zone). */
+    setenv("TZ", "America/New_York", 1);
+    tzset();
+
     /* B gets a deliberately small request region so bump mode OOMs. */
     g_A = arena_reactor_new(4096, 2048);
     g_B = arena_reactor_new(4096, 512);
@@ -239,6 +252,10 @@ int main(void)
     expect_str("A Date.now pin after nest", captured("A:date_after_nest"), "1111111");
     expect_int("A/B Math.random differ",
                strcmp(captured("A:rand"), captured("B:sim_rand")) != 0, 1);
+    expect_str("local time pinned to UTC under a non-UTC host TZ",
+               captured("A:tz_offset"), "0");
+    expect_str("local-time getters equal their UTC twins",
+               captured("A:local_eq_utc"), "true");
 
     /* Module body enters twice (once more through the async-resume path
        QJS-ng routes module evaluation through for top-level await) plus
