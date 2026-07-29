@@ -595,23 +595,23 @@ static JSValue jsb_kv_prefix(JSContext *ctx, JSValueConst this_val,
     const char *cursor_arg = "";     /* what to ship to the host */
     size_t cursor_len = 0;
     int32_t limit = 0;
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        JSValue cv = JS_GetPropertyStr(ctx, argv[1], "cursor");
-        if (!JS_IsUndefined(cv) && !JS_IsNull(cv)) {
-            cursor_buf = JS_ToCStringLen(ctx, &cursor_len, cv);
-            if (!cursor_buf) {
-                JS_FreeValue(ctx, cv);
-                JS_FreeCString(ctx, prefix);
-                return JS_EXCEPTION;
-            }
-            cursor_arg = cursor_buf;
+    /* POSITIONAL (prefix, cursor, limit) — the shape the embedder's live
+       binding uses (rove src/js/globals_kv.zig jsKvPrefix, argc=3), so a
+       handler or shim that pages kv issues the identical call live and on
+       replay. An options-bag spelling here would silently read limit=0
+       from a positional caller, which a strict tape then rejects as a
+       divergence at the paging call — invisible against a map-backed
+       host, fatal against a recording. */
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        cursor_buf = JS_ToCStringLen(ctx, &cursor_len, argv[1]);
+        if (!cursor_buf) {
+            JS_FreeCString(ctx, prefix);
+            return JS_EXCEPTION;
         }
-        JS_FreeValue(ctx, cv);
-        JSValue lv = JS_GetPropertyStr(ctx, argv[1], "limit");
-        if (!JS_IsUndefined(lv))
-            JS_ToInt32(ctx, &limit, lv);
-        JS_FreeValue(ctx, lv);
+        cursor_arg = cursor_buf;
     }
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2]))
+        JS_ToInt32(ctx, &limit, argv[2]);
 
     int outcome = 0, json_len = 0;
     uint8_t *json = NULL;
