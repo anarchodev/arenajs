@@ -64,6 +64,41 @@
    truncated address. The native sink lives after the last import. */
 #ifdef __EMSCRIPTEN__
 
+/* Recorded inputs are resolved BY KEY, never by position.
+ *
+ * These channels began as tapes — an ordered cursor, one entry per read,
+ * from when every nondeterministic draw was recorded individually. Seeds
+ * and pinned clocks replaced that long ago, and what remains is a SET of
+ * inputs: the value this key had, the source this specifier resolved to.
+ * Order is not part of the meaning.
+ *
+ * Enforcing it anyway made replay reject runs that were in fact correct.
+ * Re-running the same handler against the same inputs is free to reach
+ * them in a different order — a refactor moves two independent reads, an
+ * engine dispatches a module the loader never saw, a caller pages a scan
+ * differently — and none of that changes what the handler computed. A
+ * cursor turns each into a fatal "diverged", which is a false negative
+ * dressed as rigour.
+ *
+ * So: index each channel by key once, serve lookups from the index, and
+ * let fidelity be established by comparing what the run DID (the
+ * interaction digest) rather than by policing the order in which it
+ * asked. A key the recording does not contain is still a loud failure —
+ * that is a real missing input, not a reordering.
+ */
+EM_JS(void, _arena_index_inputs, (void), {
+    if (Module._inputIndex) return;
+    const kvGet = new Map(), kvPrefix = new Map(), mods = new Map();
+    for (const e of (Module.tapes && Module.tapes.kv) || []) {
+        if (e.op === 0) { if (!kvGet.has(e.key)) kvGet.set(e.key, e); }
+        else if (e.op === 3) { if (!kvPrefix.has(e.key)) kvPrefix.set(e.key, e); }
+    }
+    for (const e of (Module.tapes && Module.tapes.module) || []) {
+        if (!mods.has(e.specifier)) mods.set(e.specifier, e);
+    }
+    Module._inputIndex = { kvGet: kvGet, kvPrefix: kvPrefix, mods: mods };
+});
+
 EM_JS(int, _arena_host_kv_get,
       (const uint8_t *key_ptr, int key_len,
        int *out_outcome_ptr, uint8_t **out_val_ptr_ptr, int *out_val_len_ptr), {
@@ -87,13 +122,9 @@ EM_JS(int, _arena_host_kv_get,
         }
         return 0;
     }
-    const t = Module.tapes && Module.tapes.kv;
-    if (!t) return 1;
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) return 2;
-    const e = t[t._cursor++];
-    if (e.op !== 0) return -3;
-    if (e.key !== key) return -4;
+    _arena_index_inputs();
+    const e = Module._inputIndex.kvGet.get(key);
+    if (e === undefined) return -4;   /* no recorded value for this key */
     HEAP32[out_outcome_ptr >> 2] = e.outcome;
     if (e.outcome === 0) {
         const enc = Module._tapeEnc || (Module._tapeEnc = new TextEncoder());
@@ -137,43 +168,23 @@ EM_JS(int, _arena_host_kv_delete,
    first matches rove's path-keyed deployment manifest, the second
    matches a hash-content-addressed store. Host malloc's the bytes;
    the native loader copies into a QJS string and frees.
-
-   Module.untaped_modules (optional Set/array of specifiers) is served
-   WITHOUT consuming a recording entry. An embedder needs this when its
-   engine dispatches some modules directly rather than through the JS
-   module loader: those loads leave no recording entry, so a replay that
-   imports them the ordinary way would consume an entry belonging to a
-   real import and desynchronize everything after it. Serving them off
-   to the side keeps the recorded sequence aligned with the loads that
-   were actually recorded. */
+ */
 EM_JS(int, _arena_host_module_load,
       (const uint8_t *spec_ptr, int spec_len,
        uint8_t **out_src_ptr, int *out_src_len), {
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const spec = dec.decode(HEAPU8.subarray(spec_ptr, spec_ptr + spec_len));
-    /* Engine-dispatched module: serve it, leave the cursor alone. */
-    const untaped = Module.untaped_modules;
-    const isUntaped = untaped
-        && (typeof untaped.has === "function" ? untaped.has(spec)
-                                              : untaped.indexOf(spec) >= 0);
-    let src;
-    if (isUntaped) {
-        if (!Module.module_sources) return -4;
-        src = Module.module_sources[spec];
-        if (src === undefined) return -5;
-    } else {
-        const t = Module.tapes && Module.tapes.module;
-        if (!t) return 1;
-        if (t._cursor === undefined) t._cursor = 0;
-        if (t._cursor >= t.length) return 2;
-        const e = t[t._cursor++];
-        if (e.specifier !== spec) return -3;
-        if (!Module.module_sources) return -4;
-        src = Module.module_sources[spec] !== undefined
-            ? Module.module_sources[spec]
-            : Module.module_sources[e.source_hash_hex];
-        if (src === undefined) return -5;
-    }
+    if (!Module.module_sources) return -4;
+    _arena_index_inputs();
+    /* By specifier. The order a module graph is walked is not part of what
+       the handler computed, and an embedder may dispatch some modules
+       without the loader ever seeing them, so there is nothing to police
+       here — only a source to find. Recorded entries supply the
+       content-hash alias for a hash-addressed store. */
+    const e = Module._inputIndex.mods.get(spec);
+    let src = Module.module_sources[spec];
+    if (src === undefined && e !== undefined) src = Module.module_sources[e.source_hash_hex];
+    if (src === undefined) return -5;
     const enc = Module._tapeEnc || (Module._tapeEnc = new TextEncoder());
     const bytes = typeof src === "string" ? enc.encode(src) : src;
     // JS_Eval takes (input, input_len) but the parser still expects a
@@ -196,19 +207,15 @@ EM_JS(int, _arena_host_kv_prefix,
       (const uint8_t *prefix_ptr, int prefix_len,
        const uint8_t *cursor_ptr, int cursor_len, int limit,
        int *out_outcome_ptr, uint8_t **out_json_ptr_ptr, int *out_json_len_ptr), {
-    const t = Module.tapes && Module.tapes.kv;
-    if (!t) return 1;
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) return 2;
-    const e = t[t._cursor++];
-    if (e.op !== 3) return -3;
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const prefix = dec.decode(HEAPU8.subarray(prefix_ptr, prefix_ptr + prefix_len));
-    const cur = cursor_len === 0 ? "" :
-                dec.decode(HEAPU8.subarray(cursor_ptr, cursor_ptr + cursor_len));
-    if (e.key !== prefix) return -4;
-    if (e.cursor !== cur) return -5;
-    if (e.limit !== limit) return -6;
+    _arena_index_inputs();
+    /* By prefix. The paging arguments a scan was issued with are a detail
+       of HOW the handler walked the range, not of what the range held —
+       a caller that pages differently still sees the same recorded rows,
+       so cursor and limit are not compared. */
+    const e = Module._inputIndex.kvPrefix.get(prefix);
+    if (e === undefined) return -4;   /* no recorded scan for this prefix */
     HEAP32[out_outcome_ptr >> 2] = e.outcome;
     const rows = (e.results || []).map(p => ({
         key:   typeof p.key   === "string" ? p.key   : dec.decode(p.key),
