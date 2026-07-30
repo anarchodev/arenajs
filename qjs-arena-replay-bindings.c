@@ -294,13 +294,24 @@ static int _arena_host_module_load(const uint8_t *spec, int spec_len,
 
 /* ───────────── native QJS bindings (JS → C → host) ───────────── */
 
-static JSValue throw_tape_error(JSContext *ctx, const char *channel, int rc)
+/* Recorded inputs are a SET, resolved by key — there is no cursor to run
+   off the end of and no sequence to diverge from, so the old
+   "tape exhausted" / "tape diverged" wording described a mechanism that
+   no longer exists and pointed the reader at ordering. What can actually
+   go wrong is narrower: the recording was not installed, or it has no
+   entry for the key being asked for. Say that instead — a missing input
+   is a real gap, and naming the key is what a reader needs. */
+static JSValue throw_input_error(JSContext *ctx, const char *channel, int rc)
 {
     if (rc == 1)
-        return JS_ThrowReferenceError(ctx, "%s tape not installed", channel);
-    if (rc == 2)
-        return JS_ThrowInternalError(ctx, "%s tape exhausted", channel);
-    return JS_ThrowInternalError(ctx, "%s tape diverged (rc=%d)", channel, rc);
+        return JS_ThrowReferenceError(
+            ctx, "no recorded %s inputs installed for this run", channel);
+    if (rc == -5)
+        return JS_ThrowInternalError(
+            ctx, "%s: no source available for the requested module", channel);
+    return JS_ThrowInternalError(
+        ctx, "%s: the recording has no entry for the requested key (rc=%d)",
+        channel, rc);
 }
 
 /* §9 fold-in: Date.now / new Date() are handled by arenajs natively
@@ -546,7 +557,7 @@ static JSValue jsb_kv_get(JSContext *ctx, JSValueConst this_val,
                                  &outcome, &val, &val_len);
     JS_FreeCString(ctx, key);
     if (rc != 0)
-        return throw_tape_error(ctx, "kv", rc);
+        return throw_input_error(ctx, "kv", rc);
     if (outcome == 1) {  /* not_found */
         free(val);
         return JS_NULL;
@@ -578,7 +589,7 @@ static JSValue jsb_kv_set(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, key);
     JS_FreeCString(ctx, val);
     if (rc != 0)
-        return throw_tape_error(ctx, "kv", rc);
+        return throw_input_error(ctx, "kv", rc);
     if (outcome == 2)
         return JS_ThrowInternalError(ctx, "kv.set: recorded failure");
     return JS_UNDEFINED;
@@ -600,7 +611,7 @@ static JSValue jsb_kv_delete(JSContext *ctx, JSValueConst this_val,
     int rc = _arena_host_kv_delete((const uint8_t *)key, (int)key_len, &outcome);
     JS_FreeCString(ctx, key);
     if (rc != 0)
-        return throw_tape_error(ctx, "kv", rc);
+        return throw_input_error(ctx, "kv", rc);
     if (outcome == 2)
         return JS_ThrowInternalError(ctx, "kv.delete: recorded failure");
     return JS_UNDEFINED;
@@ -650,7 +661,7 @@ static JSValue jsb_kv_prefix(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, prefix);
     if (cursor_buf) JS_FreeCString(ctx, cursor_buf);
     if (rc != 0)
-        return throw_tape_error(ctx, "kv", rc);
+        return throw_input_error(ctx, "kv", rc);
     if (outcome == 2) {
         free(json);
         return JS_ThrowInternalError(ctx, "kv.prefix: recorded failure");
@@ -673,7 +684,7 @@ static JSModuleDef *jsb_module_loader(JSContext *ctx, const char *module_name,
         (const uint8_t *)module_name, (int)strlen(module_name),
         &src, &src_len);
     if (rc != 0) {
-        throw_tape_error(ctx, "module", rc);
+        throw_input_error(ctx, "module", rc);
         return NULL;
     }
     JSValue compiled = JS_Eval(ctx, (const char *)src,
