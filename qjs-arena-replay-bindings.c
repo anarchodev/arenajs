@@ -136,23 +136,44 @@ EM_JS(int, _arena_host_kv_delete,
    Module.module_sources[source_hash_hex] — either keying works, the
    first matches rove's path-keyed deployment manifest, the second
    matches a hash-content-addressed store. Host malloc's the bytes;
-   the native loader copies into a QJS string and frees. */
+   the native loader copies into a QJS string and frees.
+
+   Module.untaped_modules (optional Set/array of specifiers) is served
+   WITHOUT consuming a recording entry. An embedder needs this when its
+   engine dispatches some modules directly rather than through the JS
+   module loader: those loads leave no recording entry, so a replay that
+   imports them the ordinary way would consume an entry belonging to a
+   real import and desynchronize everything after it. Serving them off
+   to the side keeps the recorded sequence aligned with the loads that
+   were actually recorded. */
 EM_JS(int, _arena_host_module_load,
       (const uint8_t *spec_ptr, int spec_len,
        uint8_t **out_src_ptr, int *out_src_len), {
-    const t = Module.tapes && Module.tapes.module;
-    if (!t) return 1;
-    if (t._cursor === undefined) t._cursor = 0;
-    if (t._cursor >= t.length) return 2;
-    const e = t[t._cursor++];
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const spec = dec.decode(HEAPU8.subarray(spec_ptr, spec_ptr + spec_len));
-    if (e.specifier !== spec) return -3;
-    if (!Module.module_sources) return -4;
-    const src = Module.module_sources[spec] !== undefined
-        ? Module.module_sources[spec]
-        : Module.module_sources[e.source_hash_hex];
-    if (src === undefined) return -5;
+    /* Engine-dispatched module: serve it, leave the cursor alone. */
+    const untaped = Module.untaped_modules;
+    const isUntaped = untaped
+        && (typeof untaped.has === "function" ? untaped.has(spec)
+                                              : untaped.indexOf(spec) >= 0);
+    let src;
+    if (isUntaped) {
+        if (!Module.module_sources) return -4;
+        src = Module.module_sources[spec];
+        if (src === undefined) return -5;
+    } else {
+        const t = Module.tapes && Module.tapes.module;
+        if (!t) return 1;
+        if (t._cursor === undefined) t._cursor = 0;
+        if (t._cursor >= t.length) return 2;
+        const e = t[t._cursor++];
+        if (e.specifier !== spec) return -3;
+        if (!Module.module_sources) return -4;
+        src = Module.module_sources[spec] !== undefined
+            ? Module.module_sources[spec]
+            : Module.module_sources[e.source_hash_hex];
+        if (src === undefined) return -5;
+    }
     const enc = Module._tapeEnc || (Module._tapeEnc = new TextEncoder());
     const bytes = typeof src === "string" ? enc.encode(src) : src;
     // JS_Eval takes (input, input_len) but the parser still expects a
