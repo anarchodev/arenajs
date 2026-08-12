@@ -21,6 +21,11 @@ function setTapes(tapes) {
     // Reset cursors on every run so each test starts fresh.
     for (const k of Object.keys(tapes)) tapes[k]._cursor = 0;
     Module.tapes = tapes;
+    // The kv/module channels resolve BY KEY through a lazily-built index
+    // (_arena_index_inputs), built once per Module. Real embedders boot a
+    // fresh Module per record; this harness reuses one, so the index must
+    // be invalidated or every setTapes after the first is invisible.
+    Module._inputIndex = null;
 }
 
 function run(label, src, expectFail = false) {
@@ -120,6 +125,46 @@ check("kv.prefix",
         "const rows = kv.prefix('score/', { limit: 100 }); " +
         "if (rows.length !== 3 || rows[0].key !== 'score/alice' || rows[2].value !== '13') " +
         "  throw new Error('mismatch:' + JSON.stringify(rows)); 'ok'"));
+
+// ── kv.prefix merges the write overlay (read-your-writes) ───────────
+// The page is reconstructed like the embedder's native host: recorded
+// rows ∪ same-run writes, tombstones removed, sorted. A scan that
+// ignored the overlay would show a handler its pre-write world — the
+// exact class of engine divergence the embedder's conformance suite
+// compares for (rove#517).
+Module._kvOverlay = new Map();
+setTapes({
+    kv: [{
+        op: PREFIX, outcome: OK,
+        key: "score/", cursor: "", limit: 100,
+        results: [
+            { key: "score/alice", value: "10" },
+            { key: "score/bob",   value: "7"  },
+        ],
+    }],
+});
+check("kv.prefix merges same-run writes",
+    run("kv.prefix overlay",
+        "kv.set('score/zed', '1'); kv.delete('score/alice'); kv.set('score/bob', '9'); " +
+        "const rows = kv.prefix('score/', null, 100); " +
+        "if (rows.length !== 2 || rows[0].key !== 'score/bob' || rows[0].value !== '9' " +
+        "    || rows[1].key !== 'score/zed') " +
+        "  throw new Error('mismatch:' + JSON.stringify(rows)); 'ok'"));
+
+// ── kv.prefix with no recorded scan ──────────────────────────────────
+// An authored world seeds the overlay directly and has no tape; an
+// empty match is a legitimate answer, never a divergence — the native
+// host never holes a prefix scan.
+Module._kvOverlay = new Map([["s/a", "1"], ["s/b", "2"], ["t/x", "9"]]);
+setTapes({ kv: [] });
+check("kv.prefix untaped scans the overlay",
+    run("kv.prefix authored",
+        "const rows = kv.prefix('s/', null, 100); " +
+        "const none = kv.prefix('none/', null, 100); " +
+        "if (rows.length !== 2 || rows[0].key !== 's/a' || rows[1].value !== '2' " +
+        "    || none.length !== 0) " +
+        "  throw new Error('mismatch:' + JSON.stringify({rows, none})); 'ok'"));
+Module._kvOverlay = new Map();
 
 // ── divergence detection: wrong key ──────────────────────────────────
 setTapes({

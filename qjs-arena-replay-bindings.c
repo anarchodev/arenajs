@@ -202,25 +202,66 @@ EM_JS(int, _arena_host_module_load,
 /* kv.prefix returns an array of {key, value}. To avoid designing a
    per-row ABI, the host returns a JSON-encoded array which the native
    binding parses via JS_ParseJSON. Result rows fit comfortably in
-   memory for any realistic capture (prefix scan is capped by .limit). */
+   memory for any realistic capture (prefix scan is capped by .limit).
+
+   The page is RECONSTRUCTED, not replayed verbatim — the same scan
+   semantics as the embedder's native host (rove src/replay/host.zig
+   kvPrefix): recorded rows merged with the write overlay under the
+   prefix (a null overlay value is a delete tombstone), sorted, strictly
+   after `cursor`, with the live binding's page bounds (omitted or
+   non-positive limit → 100, any request capped at 1000). This is what
+   makes a scan see the activation's own writes — kv_get consults the
+   overlay first for exactly the same reason — and what lets an authored
+   world (seeded straight into the overlay, no tape) scan at all. An
+   empty match is a legitimate answer, never a divergence: the native
+   host never holes a prefix scan, and the engines must agree on that.
+
+   Caveat shared with every JS-side string comparison here: sort and
+   cursor ordering are UTF-16 code-unit order, the native host's are
+   UTF-8 byte order. They agree except for keys mixing astral and
+   U+E000..U+FFFF code points. */
 EM_JS(int, _arena_host_kv_prefix,
       (const uint8_t *prefix_ptr, int prefix_len,
        const uint8_t *cursor_ptr, int cursor_len, int limit,
        int *out_outcome_ptr, uint8_t **out_json_ptr_ptr, int *out_json_len_ptr), {
     const dec = Module._tapeDec || (Module._tapeDec = new TextDecoder());
     const prefix = dec.decode(HEAPU8.subarray(prefix_ptr, prefix_ptr + prefix_len));
+    const cursor = cursor_len > 0
+        ? dec.decode(HEAPU8.subarray(cursor_ptr, cursor_ptr + cursor_len)) : "";
     _arena_index_inputs();
     /* By prefix. The paging arguments a scan was issued with are a detail
        of HOW the handler walked the range, not of what the range held —
        a caller that pages differently still sees the same recorded rows,
-       so cursor and limit are not compared. */
+       so cursor and limit select from them rather than being compared. */
     const e = Module._inputIndex.kvPrefix.get(prefix);
-    if (e === undefined) return -4;   /* no recorded scan for this prefix */
-    HEAP32[out_outcome_ptr >> 2] = e.outcome;
-    const rows = (e.results || []).map(p => ({
-        key:   typeof p.key   === "string" ? p.key   : dec.decode(p.key),
-        value: typeof p.value === "string" ? p.value : dec.decode(p.value),
-    }));
+    if (e !== undefined && e.outcome !== 0) {
+        /* A recorded failure replays as the failure; there are no rows. */
+        HEAP32[out_outcome_ptr >> 2] = e.outcome;
+        const ebytes = (Module._tapeEnc || (Module._tapeEnc = new TextEncoder())).encode("[]");
+        const eptr = Module._malloc(ebytes.length + 1);
+        HEAPU8.set(ebytes, eptr);
+        HEAPU8[eptr + ebytes.length] = 0;
+        HEAP32[out_json_ptr_ptr >> 2] = eptr;
+        HEAP32[out_json_len_ptr >> 2] = ebytes.length;
+        return 0;
+    }
+    const merged = new Map();
+    if (e !== undefined) for (const p of (e.results || [])) {
+        merged.set(typeof p.key   === "string" ? p.key   : dec.decode(p.key),
+                   typeof p.value === "string" ? p.value : dec.decode(p.value));
+    }
+    const overlay = Module._kvOverlay || (Module._kvOverlay = new Map());
+    for (const [k, v] of overlay) {
+        if (!k.startsWith(prefix)) continue;
+        if (v === null) merged.delete(k); else merged.set(k, v);
+    }
+    let keys = [];
+    for (const k of merged.keys()) if (cursor === "" || k > cursor) keys.push(k);
+    keys.sort();
+    const cap = limit > 0 ? Math.min(limit, 1000) : 100;
+    keys = keys.slice(0, cap);
+    const rows = keys.map(k => ({ key: k, value: merged.get(k) }));
+    HEAP32[out_outcome_ptr >> 2] = 0;
     const enc = Module._tapeEnc || (Module._tapeEnc = new TextEncoder());
     const bytes = enc.encode(JSON.stringify(rows));
     // Same NUL-terminator requirement as the module-load buffer:
