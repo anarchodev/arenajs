@@ -416,6 +416,15 @@ endif()
 # QuickJS bytecode compiler
 #
 
+# ── dev-tree-only targets ──
+#
+# Everything below references sources the PACKAGED tree (the embedder's
+# fetched copy, build.zig.zon .paths) does not ship: the CLI, tests,
+# generators, examples. An embedder building qjs_arena_wasm from the package
+# sets QJS_ARENA_WASM_ONLY=1 (rove's build_wasm_arena.sh does) and gets the
+# libraries + wasm targets alone.
+if(NOT DEFINED ENV{QJS_ARENA_WASM_ONLY})
+
 add_executable(qjsc
     qjsc.c
 )
@@ -677,3 +686,5 @@ if (QJS_ENABLE_INSTALL)
     install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
     install(DIRECTORY examples DESTINATION ${CMAKE_INSTALL_DOCDIR})
 endif()
+
+endif() # QJS_ARENA_WASM_ONLY
