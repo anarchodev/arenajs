@@ -93,11 +93,35 @@ static void diagnose_exception(JSContext *ctx, JSValueConst exc, const char *whe
    module loader). arena_reactor_new / arena_reactor_new_open install this,
    so existing embedders (the native sim, the WASM singleton) are unchanged
    by the parameterization. */
+#ifdef ROVE_ARENA
+/* The embedder's compiled surface (rove: the common JS↔Zig binding — guards,
+   kv/tag registration, the poison + park natives), linked in as a wasm
+   archive. Installed AFTER the replay bindings so it can override the kv
+   object the same way the embedder's native engines do (rove
+   mod_loader.simSetup). The interrupt shim polls the embedder's verdict
+   (poison / CPU budget) — an uncatchable unwind, the same brake the
+   embedder's native reactors wire via arena_set_interrupt_r; run_begin
+   resets the embedder's per-run state at every entry. */
+extern int rove_arena_install(JSContext *ctx);
+extern int rove_arena_interrupted(void);
+extern void rove_arena_run_begin(void);
+
+static int rove_arena_interrupt_shim(JSRuntime *rt, void *opaque)
+{
+    (void)rt; (void)opaque;
+    return rove_arena_interrupted();
+}
+#endif
+
 static int default_replay_setup(JSContext *ctx, JSRuntime *rt, void *user)
 {
     (void)user;
     if (arena_install_replay_bindings(ctx) < 0)
         return -1;
+#ifdef ROVE_ARENA
+    if (rove_arena_install(ctx) < 0)
+        return -1;
+#endif
     arena_install_replay_module_loader(rt);
     return 0;
 }
@@ -141,6 +165,9 @@ ArenaReactor *arena_reactor_new_open_with(int base_kb, int request_kb,
     }
 
     r->ctx = JS_NewContext(r->rt);
+#ifdef ROVE_ARENA
+    JS_SetInterruptHandler(r->rt, rove_arena_interrupt_shim, NULL);
+#endif
     if (!r->ctx) {
         JS_FreeRuntime(r->rt);
         free(r);
@@ -428,6 +455,9 @@ int arena_run_r(ArenaReactor *r, const char *src)
 
     JS_ResetRequestArena(r->rt);
     arena_reapply_pins(r);
+#ifdef ROVE_ARENA
+    rove_arena_run_begin();
+#endif
 
     JSValue v = JS_Eval(r->ctx, src, strlen(src), "<arena>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(v)) {
@@ -477,6 +507,9 @@ int arena_run_module_r(ArenaReactor *r, const char *entry_name,
     r->entry_module = NULL;       /* previous run's def died with its arena */
     JS_ResetRequestArena(r->rt);  /* also clears the per-request OOM record */
     arena_reapply_pins(r);
+#ifdef ROVE_ARENA
+    rove_arena_run_begin();
+#endif
     arena_trace_reset(&r->trace); /* clear name-table so host can dedupe by run */
 
     /* Compile-only first so the JSModuleDef is reachable for
