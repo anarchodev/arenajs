@@ -166,13 +166,25 @@ check("kv.prefix untaped scans the overlay",
         "  throw new Error('mismatch:' + JSON.stringify({rows, none})); 'ok'"));
 Module._kvOverlay = new Map();
 
-// ── divergence detection: wrong key ──────────────────────────────────
+// ── divergence: the poison model (rove#510) ──────────────────────────
+// An off-tape read is ABSENT, never a throw — nothing a handler can
+// catch. Authored mode: plain absent. Captured mode: absent + a
+// host-side verdict (module memory, unreachable from VM JS) that the
+// interrupt BRAKES on — proven with an infinite loop that must die.
 setTapes({
     kv: [{ op: GET, outcome: OK, key: "expected", value: "x" }],
 });
-check("divergence on wrong key",
-    run("kv.get wrong-key",
-        "kv.get('unexpected'); 'should-not-reach'", true));
+Module._kvOverlay = new Map();
+check("authored off-tape read is absent (no throw)",
+    run("kv.get wrong-key authored",
+        "if (kv.get('unexpected') !== null) throw new Error('not absent'); 'ok'"));
+check("captured off-tape read poisons + the brake fires",
+    run("kv.get wrong-key captured",
+        "globalThis.__rove_captured = true; " +
+        "if (kv.get('unexpected') !== null) throw new Error('not absent'); " +
+        "const d = __rove_divergence(); " +
+        "if (!d || d.indexOf('unexpected') < 0) throw new Error('no verdict: ' + d); " +
+        "for(;;){}", true));
 
 // ── exhausted tape ───────────────────────────────────────────────────
 setTapes({ math_random: [{ value: 0.5 }] });
