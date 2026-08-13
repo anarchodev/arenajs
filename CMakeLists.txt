@@ -342,7 +342,9 @@ if(WIN32)
     )
 endif()
 
-if(NOT QJS_BUILD_LIBC)
+if(NOT QJS_BUILD_LIBC AND NOT DEFINED ENV{QJS_ARENA_WASM_ONLY})
+    # Dev-tree-only: quickjs-libc.c is not in the package (nothing the wasm
+    # target links needs it).
     add_library(qjs-libc STATIC quickjs-libc.c)
     target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
     target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs)
