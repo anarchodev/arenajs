@@ -7,6 +7,10 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        // The wasm build's driver: the embedder (rove) builds qjs_arena_wasm
+        // IN ITS OWN TREE from this fetched package (the ROVE_ARENA seam),
+        // so the CMake entry ships with it.
+        "CMakeLists.txt",
         // Runtime translation units compiled into the static lib.
         "quickjs.c",
         "qjs-arena.c",
