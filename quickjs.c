@@ -29692,6 +29692,19 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
+    /* Every statement anchors a source position at its first token —
+       not only the throw-capable expressions below. pc2line otherwise
+       records positions only where an exception could need one (calls,
+       binary operators, throw, expression statements), which leaves
+       statements that compile to pure loads/stores — `return v;`,
+       `let x = 0;`, `const y = a;` — attributed to the previous line.
+       Anything stepping or profiling by line (the replay trace's LINE
+       events resolve through find_line_num) then cannot see them at
+       all. Duplicate or op-less emissions are collapsed later:
+       add_pc2line_info dedups same-position entries and the rewrite
+       pass carries locs as running state. */
+    emit_source_loc(s);
+
     switch(tok = s->token.val) {
     case '{':
         if (js_parse_block(s))
