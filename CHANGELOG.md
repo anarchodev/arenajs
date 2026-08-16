@@ -42,6 +42,21 @@ safe consumer pattern spelled out.
 
 _Nothing yet._
 
+## [0.3.5] - 2026-08-16
+
+**Per-statement source positions.** The compiler now anchors a source
+position at every statement's first token, not only where an exception
+could need one (calls, binary operators, `throw`, expression
+statements). Previously a statement compiling to pure loads/stores —
+`return v;`, `let x = 0;`, `const y = a;` — contributed no pc2line
+entry, so anything resolving lines by pc (error attribution at those
+pcs, and the trace's LINE events via `find_line_num`) attributed it to
+the previous line; a replay scrubber could never step onto a bare-local
+`return`. PATCH: no export, return-code, or wire-format change — trace
+consumers simply see LINE events for statements that were invisible
+before, and pc2line tables grow by the deduplicated per-statement
+entries.
+
 ## [0.3.4] - 2026-07-08
 
 The **base-surface release**: two additions that let an embedder (rove's
