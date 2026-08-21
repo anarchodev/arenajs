@@ -357,6 +357,14 @@ typedef struct JSRequestState {
     struct JSObjectShadow *shadow_tab;
     uint32_t shadow_tab_size;    /* power of two; 0 = not allocated */
     uint32_t shadow_tab_count;
+    /* Same structure for base JSVarRefs — closure cells. A snapshot
+       closure's captured variables live in base, so assigning one wrote
+       the snapshot and the value carried into the next request. Keyed
+       on the base JSVarRef; every closure sharing that cell must resolve
+       to the SAME shadow or they stop seeing each other's writes. */
+    struct JSVarRefShadow *varref_tab;
+    uint32_t varref_tab_size;
+    uint32_t varref_tab_count;
     /* Per-request override for ctx->std_array_prototype: once a request
        does anything that would have set ctx->std_array_prototype = false
        on a non-arena runtime, we set this flag instead. Reads of
@@ -637,6 +645,12 @@ typedef struct JSObjectShadow {
     JSObject *base;
     JSObject *shadow;
 } JSObjectShadow;
+
+/* Same, for closure cells. */
+typedef struct JSVarRefShadow {
+    JSVarRef *base;
+    JSVarRef *shadow;
+} JSVarRefShadow;
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
@@ -2333,6 +2347,9 @@ int JS_RelocateReqState(JSRuntime *rt)
     new_req->shadow_tab = NULL;
     new_req->shadow_tab_size = 0;
     new_req->shadow_tab_count = 0;
+    new_req->varref_tab = NULL;
+    new_req->varref_tab_size = 0;
+    new_req->varref_tab_count = 0;
     /* rt->malloc_gc_threshold is read-only post-freeze (the vanilla GC
        ratchet that mutates it is off in arena mode), so it doubles as
        the per-request seed and the floor for the ratchet in
@@ -3511,7 +3528,7 @@ static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
 /* Fibonacci hashing on the pointer. Objects are >=16-byte aligned, so
    the low bits carry no information — shift them out first, then take
    the high bits of the multiply, which mix all input bits. */
-static inline uint32_t js_shadow_hash(const JSObject *p, uint32_t mask)
+static inline uint32_t js_shadow_hash(const void *p, uint32_t mask)
 {
     uint64_t v = (uint64_t)(uintptr_t)p >> 4;
     v *= 0x9E3779B97F4A7C15ull;
@@ -3632,6 +3649,115 @@ static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
                       ctx->rt->req->shadow_tab_size - 1, p, shadow);
     ctx->rt->req->shadow_tab_count++;
     return shadow;
+}
+
+/* ---- arena: closure-cell (JSVarRef) shadows ----
+ *
+ * A snapshot closure's captured variables live in base. Assigning one
+ * wrote the snapshot, so the value carried into the next request:
+ *
+ *   globalThis.c = (function(){ let n=0; return ()=>++n; })();
+ *   request 0 -> 1,  request 1 -> 2,  request 2 -> 3
+ *
+ * which on a multi-tenant embedder is a cross-request channel in the
+ * most ordinary shape there is — a counter or a memo cache in an IIFE.
+ *
+ * Copy-on-write, keyed on the BASE cell rather than on the closure that
+ * reached it: several closures commonly share one cell (`inc` and `get`
+ * over the same `n`), and they must all resolve to the same shadow or
+ * they stop observing each other's writes within a request.
+ *
+ * The class matrix in arena-baseclass cannot see any of this — a
+ * JSVarRef is not a JSClass — which is why it stayed hidden through two
+ * rounds of that audit.
+ */
+#define JS_VARREF_TAB_INITIAL 16
+
+static JSVarRef *js_var_ref_shadow_lookup(JSRuntime *rt, JSVarRef *vr)
+{
+    JSVarRefShadow *tab = rt->req->varref_tab;
+    if (!tab)
+        return NULL;
+    uint32_t mask = rt->req->varref_tab_size - 1;
+    uint32_t i = js_shadow_hash(vr, mask);
+    for (;;) {
+        JSVarRef *b = tab[i].base;
+        if (!b)
+            return NULL;
+        if (b == vr)
+            return tab[i].shadow;
+        i = (i + 1) & mask;
+    }
+}
+
+static void js_varref_tab_put(JSVarRefShadow *tab, uint32_t mask,
+                              JSVarRef *base, JSVarRef *shadow)
+{
+    uint32_t i = js_shadow_hash(base, mask);
+    while (tab[i].base)
+        i = (i + 1) & mask;
+    tab[i].base = base;
+    tab[i].shadow = shadow;
+}
+
+static int js_varref_tab_reserve(JSContext *ctx)
+{
+    JSRequestState *req = ctx->rt->req;
+    if (req->varref_tab && (req->varref_tab_count + 1) * 2 <= req->varref_tab_size)
+        return 0;
+    uint32_t new_size = req->varref_tab_size ? req->varref_tab_size * 2
+                                             : JS_VARREF_TAB_INITIAL;
+    JSVarRefShadow *nt = js_mallocz_rt(ctx->rt, sizeof(*nt) * new_size);
+    if (!nt)
+        return -1;
+    uint32_t new_mask = new_size - 1;
+    for (uint32_t i = 0; i < req->varref_tab_size; i++)
+        if (req->varref_tab[i].base)
+            js_varref_tab_put(nt, new_mask, req->varref_tab[i].base,
+                              req->varref_tab[i].shadow);
+    js_free_rt(ctx->rt, req->varref_tab);
+    req->varref_tab = nt;
+    req->varref_tab_size = new_size;
+    return 0;
+}
+
+/* Read path: the shadow if this base cell has one, else the cell. */
+static inline JSVarRef *js_var_ref_active(JSRuntime *rt, JSVarRef *vr)
+{
+    if (likely(!rt->is_arena))
+        return vr;
+    if (likely(!js_arena_ptr_is_base(vr)))
+        return vr;
+    JSVarRef *s = js_var_ref_shadow_lookup(rt, vr);
+    return s ? s : vr;
+}
+
+/* Write path: shadow the cell on first write, seeded from the snapshot
+   value. Returns NULL with an exception pending on OOM — callers must
+   not fall back to the base cell, which is the write we are preventing. */
+static JSVarRef *js_var_ref_for_write(JSContext *ctx, JSVarRef *vr)
+{
+    JSRuntime *rt = ctx->rt;
+    if (likely(!rt->is_arena))
+        return vr;
+    if (likely(!js_arena_ptr_is_base(vr)))
+        return vr;
+    JSVarRef *s = js_var_ref_shadow_lookup(rt, vr);
+    if (s)
+        return s;
+    if (js_varref_tab_reserve(ctx) < 0)
+        return NULL;
+    s = js_create_var_ref(ctx, true);
+    if (!s)
+        return NULL;
+    /* Seed from the snapshot. Base values are immortal, so js_dup is a
+       no-op for them and correct for anything else. */
+    s->value = js_dup(*vr->pvalue);
+    s->pvalue = &s->value;
+    js_varref_tab_put(ctx->rt->req->varref_tab,
+                      ctx->rt->req->varref_tab_size - 1, vr, s);
+    ctx->rt->req->varref_tab_count++;
+    return s;
 }
 
 /* arena: return the effective std_array_prototype flag — base value AND
@@ -10916,7 +11042,11 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
         return true;
     case JS_CLASS_MAPPED_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
-        *pval = js_dup(*p->u.array.u.var_refs[idx]->pvalue);
+        /* arena: mapped arguments alias the parameter cells, which for a
+           base-resident arguments object live in the snapshot. Same
+           copy-on-write as any other closure cell. */
+        *pval = js_dup(*js_var_ref_active(ctx->rt,
+                                          p->u.array.u.var_refs[idx])->pvalue);
         return true;
     case JS_CLASS_INT8_ARRAY:
         if (unlikely(idx >= p->u.array.count)) return false;
@@ -11822,7 +11952,15 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         case JS_CLASS_MAPPED_ARGUMENTS:
             if (unlikely(idx >= (uint32_t)p->u.array.count))
                 goto slow_path;
-            set_value(ctx, p->u.array.u.var_refs[idx]->pvalue, val);
+            {
+                JSVarRef *vr = js_var_ref_for_write(ctx,
+                                        p->u.array.u.var_refs[idx]);
+                if (unlikely(!vr)) {
+                    JS_FreeValue(ctx, val);
+                    return -1;
+                }
+                set_value(ctx, vr->pvalue, val);
+            }
             break;
         case JS_CLASS_UINT8C_ARRAY:
             if (JS_ToUint8ClampFree(ctx, &v, val))
@@ -19952,18 +20090,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
         CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
         CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
-        CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
-        CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
-        CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
-        CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-        CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
-        CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref3): set_value(ctx, var_refs[3]->pvalue, js_dup(sp[-1])); BREAK;
+        CASE(OP_get_var_ref0): *sp++ = js_dup(*js_var_ref_active(rt, var_refs[0])->pvalue); BREAK;
+        CASE(OP_get_var_ref1): *sp++ = js_dup(*js_var_ref_active(rt, var_refs[1])->pvalue); BREAK;
+        CASE(OP_get_var_ref2): *sp++ = js_dup(*js_var_ref_active(rt, var_refs[2])->pvalue); BREAK;
+        CASE(OP_get_var_ref3): *sp++ = js_dup(*js_var_ref_active(rt, var_refs[3])->pvalue); BREAK;
+        CASE(OP_put_var_ref0): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[0]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, *--sp); } BREAK;
+        CASE(OP_put_var_ref1): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[1]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, *--sp); } BREAK;
+        CASE(OP_put_var_ref2): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[2]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, *--sp); } BREAK;
+        CASE(OP_put_var_ref3): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[3]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, *--sp); } BREAK;
+        CASE(OP_set_var_ref0): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[0]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, js_dup(sp[-1])); } BREAK;
+        CASE(OP_set_var_ref1): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[1]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, js_dup(sp[-1])); } BREAK;
+        CASE(OP_set_var_ref2): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[2]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, js_dup(sp[-1])); } BREAK;
+        CASE(OP_set_var_ref3): { JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[3]); if (unlikely(!vr_)) goto exception; set_value(ctx, vr_->pvalue, js_dup(sp[-1])); } BREAK;
 
         CASE(OP_get_var_ref):
             {
@@ -19971,7 +20109,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
                 idx = get_u16(pc);
                 pc += 2;
-                val = *var_refs[idx]->pvalue;
+                val = *js_var_ref_active(rt, var_refs[idx])->pvalue;
                 sp[0] = js_dup(val);
                 sp++;
             }
@@ -19981,7 +20119,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[idx]);
+                if (unlikely(!vr_))
+                    goto exception;
+                set_value(ctx, vr_->pvalue, sp[-1]);
                 sp--;
             }
             BREAK;
@@ -19990,7 +20131,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                set_value(ctx, var_refs[idx]->pvalue, js_dup(sp[-1]));
+                JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[idx]);
+                if (unlikely(!vr_))
+                    goto exception;
+                set_value(ctx, vr_->pvalue, js_dup(sp[-1]));
             }
             BREAK;
         CASE(OP_get_var_ref_check):
@@ -19999,7 +20143,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue val;
                 idx = get_u16(pc);
                 pc += 2;
-                val = *var_refs[idx]->pvalue;
+                val = *js_var_ref_active(rt, var_refs[idx])->pvalue;
                 if (unlikely(JS_IsUninitialized(val))) {
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
                     goto exception;
@@ -20013,11 +20157,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                if (unlikely(JS_IsUninitialized(*var_refs[idx]->pvalue))) {
+                JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[idx]);
+                if (unlikely(!vr_))
+                    goto exception;
+                if (unlikely(JS_IsUninitialized(*vr_->pvalue))) {
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
                     goto exception;
                 }
-                set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                set_value(ctx, vr_->pvalue, sp[-1]);
                 sp--;
             }
             BREAK;
@@ -20026,11 +20173,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                if (unlikely(!JS_IsUninitialized(*var_refs[idx]->pvalue))) {
+                JSVarRef *vr_ = js_var_ref_for_write(ctx, var_refs[idx]);
+                if (unlikely(!vr_))
+                    goto exception;
+                if (unlikely(!JS_IsUninitialized(*vr_->pvalue))) {
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
                     goto exception;
                 }
-                set_value(ctx, var_refs[idx]->pvalue, sp[-1]);
+                set_value(ctx, vr_->pvalue, sp[-1]);
                 sp--;
             }
             BREAK;
