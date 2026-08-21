@@ -56386,11 +56386,27 @@ static int64_t floor_div_int64(int64_t a, int64_t b) {
 static JSValue js_Date_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv);
 
+/* arena: a Date's time value lives in u.object_data, inside the
+   JSObject itself. For a base-resident Date that is snapshot memory:
+   the setters wrote it in place, so the mutation was visible to every
+   later request. These two functions are the whole surface — every
+   getter reaches the value through JS_ThisTimeValue and every setter
+   through JS_SetThisTimeValue — so redirecting both keeps the read and
+   the write on the same object, which is the part that matters. A
+   write redirect without a matching read redirect would leave setTime
+   updating the shadow while getTime still read base.
+
+   Note the asymmetry with the other u.object_data classes (Number,
+   String, Boolean, Symbol, BigInt): those are written once when the
+   box is constructed and never mutated, which is why they come back
+   clean in arena-baseclass and are left alone here. Adding a redirect
+   to JS_SetObjectData without chasing all their read sites would
+   create exactly the split this comment warns about. */
 static __exception int JS_ThisTimeValue(JSContext *ctx, double *valp,
                                         JSValueConst this_val)
 {
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
-        JSObject *p = JS_VALUE_GET_OBJ(this_val);
+        JSObject *p = js_object_active(ctx->rt, JS_VALUE_GET_OBJ(this_val));
         if (p->class_id == JS_CLASS_DATE && JS_IsNumber(p->u.object_data))
             return JS_ToFloat64(ctx, valp, p->u.object_data);
     }
@@ -56403,6 +56419,9 @@ static JSValue JS_SetThisTimeValue(JSContext *ctx, JSValueConst this_val, double
     if (JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (p->class_id == JS_CLASS_DATE) {
+            p = js_object_for_write(ctx, p);
+            if (unlikely(!p))
+                return JS_EXCEPTION;
             JS_FreeValue(ctx, p->u.object_data);
             p->u.object_data = js_float64(v);
             return js_dup(p->u.object_data);

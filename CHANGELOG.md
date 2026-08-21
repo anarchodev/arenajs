@@ -40,6 +40,22 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**Fixed: base `Date` objects are copy-on-write.** A Date's time value
+lives in `u.object_data`, inside the `JSObject` itself, so for a
+base-resident Date the setters wrote snapshot memory and the mutation
+was visible to every later request. `JS_ThisTimeValue` and
+`JS_SetThisTimeValue` are the whole surface — every getter reaches the
+value through the first and every setter through the second — so both
+now resolve to the request-arena shadow. Redirecting only the write
+would have left `setTime` updating the shadow while `getTime` still
+read base, which is worse than the leak.
+
+The other `u.object_data` classes (`Number`, `String`, `Boolean`,
+`Symbol`, `BigInt`) are written once at construction and never
+mutated, so they were already clean and are deliberately left alone: a
+redirect in the shared `JS_SetObjectData` without chasing all their
+read sites would create exactly that read/write split.
+
 **New harness `arena-baseclass`: exhaustive base-object mutation
 matrix.** Every base-write bug so far was found by someone thinking of
 a case, which neither scales nor converges — the fast-array hole sat

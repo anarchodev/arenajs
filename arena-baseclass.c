@@ -88,7 +88,7 @@ static const ClsEntry TABLE[] = {
 {9,"JS_CLASS_MAPPED_ARGUMENTS","Arguments",MUTATE,NULL,
     "(function(a,b){ return arguments; })(1,2)",
     {"T[0]=9",NULL},"T[0]","1"},
-{10,"JS_CLASS_DATE","Date",KNOWN_GAP,"u.object_data holds the time value; setters write it in base","new Date(0)",
+{10,"JS_CLASS_DATE","Date",MUTATE,NULL,"new Date(0)",
     {"T.setTime(5)","T.setFullYear(1999)",NULL},"T.getTime()","0"},
 {11,"JS_CLASS_MODULE_NS","Object",NO_STATE,
     "module namespace is spec-immutable: [[Set]] always fails",NULL,{NULL},NULL,NULL},
