@@ -4565,7 +4565,11 @@ bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id)
 JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id)
 {
     if (JS_IsRegisteredClass(rt, class_id)) {
-        return JS_DupAtomRT(rt, rt->class_array[class_id].class_id);
+        /* .class_id is the numeric id; the name lives in .class_name.
+           Returning the former handed callers an arbitrary atom index
+           (class 1 -> atom 1 -> "null", class 2 -> "false", ...).
+           Upstream quickjs-ng bug, introduced with the API in 307a59f. */
+        return JS_DupAtomRT(rt, rt->class_array[class_id].class_name);
     } else {
         return JS_ATOM_NULL;
     }
