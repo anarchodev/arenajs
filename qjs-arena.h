@@ -59,7 +59,18 @@ JS_EXTERN size_t js_dual_arena_request_used(const JSDualArena *da);
  *
  * Embedders use this to distinguish "the JS code threw" (user error)
  * from "we ran out of arena" (capacity — resize / retry / 503) and to
- * surface an actionable message with real numbers. */
+ * surface an actionable message with real numbers.
+ *
+ * REQUEST ARENA ONLY. Pre-freeze (base-mode) refusals are deliberately
+ * NOT recorded: exhausting base is a build-the-snapshot problem, not a
+ * per-request capacity signal, and there is no reset to clear the latch
+ * against. So this flag stays false no matter how far a snapshot
+ * overruns its base arena — do not use it as a base-exhaustion guard.
+ * Base exhaustion surfaces the ordinary way, as a thrown exception from
+ * the JS_Eval that ran out, so checking JS_IsException on every
+ * snapshot-time eval IS the base-exhaustion check. js_dual_arena_base_used
+ * against the base size you passed to JS_NewRuntimeArena is the
+ * headroom metric. */
 JS_EXTERN bool js_dual_arena_oom_hit(const JSDualArena *da);
 /* Bytes the refused allocation asked for (0 if no OOM this request). */
 JS_EXTERN size_t js_dual_arena_oom_requested(const JSDualArena *da);
