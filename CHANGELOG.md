@@ -40,6 +40,32 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**New harness `arena-baseclass`: exhaustive base-object mutation
+matrix.** Every base-write bug so far was found by someone thinking of
+a case, which neither scales nor converges — the fast-array hole sat
+behind a line in `ARENA_PLAN.md` for months, and hand-enumerating the
+affected classes afterwards still missed several. This test enumerates
+the *engine's* class table instead of a list someone wrote down: each
+registered class is either exercised with a live base-resident
+instance, or classified with a reason (no mutable state / unreachable
+from a JS snapshot / covered by another harness). A class that is
+registered but unclassified fails the test, so adding one to the engine
+forces someone to consider it. Each id is also pinned to the name
+`JS_GetClassName` reports, so an enum reshuffle is caught rather than
+silently testing the wrong class.
+
+It found **12 classes** that write base or leak across a reset, none of
+which were on the hand-written list: `MappedArguments`, `Date`, six
+iterator classes (`Iterator Concat`/`Helper`, `Map`/`Set`/`Array`/
+`String Iterator`), `Generator`, `Promise`, `AsyncGenerator` and
+`FinalizationRegistry`. A base-resident iterator is the sharpest case —
+its cursor leaks, so the second request gets the second element.
+
+Those are recorded as `KNOWN_GAP` entries, which are expected failures
+*with teeth*: each is asserted to still be broken, so fixing one turns
+the test red until the entry is promoted. The table doubles as the
+backlog.
+
 **Fixed: base ArrayBuffers are immutable after freeze.** A snapshot
 ArrayBuffer's bytes are base memory, so a request writing through any
 view onto it mutated the snapshot and the write was visible to every
