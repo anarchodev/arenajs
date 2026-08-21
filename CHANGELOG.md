@@ -40,7 +40,54 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+**Fixed: base atom table relocated into the request arena
+(rove#735).** `__JS_NewAtom`'s "grow the atom array" branch and
+`js_new_shape2`'s "resize the shape hash" branch were not gated on
+`rt->is_arena`. Post-freeze they still fired, so `js_realloc_rt`
+reallocated the base `rt->atom_array` / `rt->shape_hash` into the
+**request** arena and rewrote the pointer in base. The next
+`JS_ResetRequestArena` recycled that memory underneath them, after
+which any atom lookup — `js_empty_string()` on the first
+`JS_NewStringLen(ctx, s, 0)` was the usual first casualty — dereferenced
+recycled request bytes and segfaulted.
+
+Both branches are dead weight in arena mode: post-freeze interning
+allocates from `rt->req->atom_overlay` and hashed request shapes link
+into `rt->req->shape_overlay`, each with its own free list. Gating them
+off is the whole fix.
+
+The trigger is a knife-edge: the crash needs `rt->atom_free_index == 0`
+at `JS_FreezeRuntime`, i.e. the snapshot's atoms happening to exactly
+fill the base array. Adding or removing *one* atom anywhere in the
+snapshot flips it, which is why it presented as "one more call site in
+one shim and it dies". PATCH: no export, return-code, or wire-format
+change.
+
+New harness `arena-atomgrow` (in `make test-arena`) sweeps the
+snapshot's atom count one atom at a time and asserts, under the
+thermometer, that no post-freeze request dirties base. On the unfixed
+tree exactly 2 of 801 sweep points go red — which is why the existing
+test262 walk never caught this: the corpus never builds a snapshot that
+lands on the boundary.
+
+**⚠ Contract — `JS_NewClass` after `JS_FreezeRuntime` now aborts.** It
+grows `rt->class_array` and every `ctx->class_proto` through the same
+un-gated `js_realloc_rt`, so post-freeze it relocated them into the
+request arena with the identical outcome as above. It was never a
+supported call — it corrupted silently, several layers away, in someone
+else's request. It now prints the offending class id to stderr and
+aborts. Register every class into the snapshot, before the freeze. No
+signature or return-code change; callers that already respected the
+freeze boundary are unaffected.
+
+**Documented: `js_dual_arena_oom_hit()` is request-arena only.** It
+does not and never did report base-mode refusals — a snapshot can
+overrun its base arena by any margin with the flag still false, so it
+is not a base-exhaustion guard. Base exhaustion surfaces as a thrown
+exception from the `JS_Eval` that ran out, so checking `JS_IsException`
+on every snapshot-time eval *is* the base-exhaustion check;
+`js_dual_arena_base_used()` is the headroom metric. Header comment
+only, no behavior change.
 
 ## [0.3.5] - 2026-08-16
 

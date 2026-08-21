@@ -3718,7 +3718,16 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         }
     }
 
-    if (rt->atom_free_index == 0) {
+    /* arena: never grow the base atom_array post-freeze. The realloc
+       would land the new array in the request arena (js_realloc_rt
+       follows the current arena mode) and rewrite rt->atom_array,
+       rt->atom_size and rt->atom_free_index in base — so the whole
+       atom table dangles at the next request reset. It is also
+       unnecessary: post-freeze interning allocates from the
+       per-request overlay below, which carries its own free list.
+       The base free list is simply left where the snapshot ended,
+       whether or not it happened to be exhausted. */
+    if (!rt->is_arena && rt->atom_free_index == 0) {
         /* allow new atom entries */
         uint32_t new_size, start;
         JSAtomStruct **new_array;
@@ -4461,6 +4470,25 @@ static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
     int new_size, i;
     JSClass *cl, *new_class_array;
     struct list_head *el;
+
+    /* arena: classes belong in the snapshot. Registering one after
+       JS_FreezeRuntime writes rt->class_array (base) and, when the id
+       is past rt->class_count, reallocates both rt->class_array and
+       every ctx->class_proto into the REQUEST arena — which the next
+       JS_ResetRequestArena recycles, corrupting every class lookup in
+       every later request. Same failure mode as rove#735.
+       Fail loud here rather than let it surface as a segfault several
+       layers away in someone else's request; -1 would leave the caller
+       running with a half-registered class, which is the same silent
+       corruption one step removed. */
+    if (rt->is_arena) {
+        fprintf(stderr,
+                "arenajs: JS_NewClass(class_id=%u) called after "
+                "JS_FreezeRuntime.\n"
+                "         Register every class into the snapshot, before "
+                "the freeze.\n", (unsigned)class_id);
+        abort();
+    }
 
     if (class_id >= (1 << 16))
         return -1;
@@ -6029,7 +6057,12 @@ static no_inline JSShape *js_new_shape2(JSContext *ctx, JSObject *proto,
     JSShape *sh;
 
     /* resize the shape hash table if necessary */
-    if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size) {
+    /* arena: same hazard as the atom array — post-freeze, hashed shapes
+       link into rt->req->shape_overlay and rt->shape_hash_count is
+       frozen, so a resize here would relocate the base table into the
+       request arena for no benefit and leave it dangling after reset. */
+    if (!rt->is_arena
+        && 2 * (rt->shape_hash_count + 1) > rt->shape_hash_size) {
         resize_shape_hash(rt, rt->shape_hash_bits + 1);
     }
 
