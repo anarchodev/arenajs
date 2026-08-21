@@ -9933,6 +9933,47 @@ int JS_MarkAllPrototypes(JSRuntime *rt)
     return marked;
 }
 
+/* arena: mark every base-resident ArrayBuffer immutable at freeze.
+   A snapshot buffer's bytes are base memory, so a request writing
+   through any view onto it mutates the snapshot and the write is
+   visible to every later request — on a multi-tenant embedder that is
+   a cross-request channel, e.g. one tenant poisoning a shared base64
+   decode table for every other tenant on the thread.
+
+   Unlike a fast array these bytes cannot be copy-on-written cheaply:
+   they belong to the ArrayBuffer, so a copy would have to move every
+   aliasing view atomically, carry detached/resizable state with it,
+   and memcpy the whole buffer — an unbounded, embedder-controlled cost
+   paid per request, which trades a correctness bug for a capacity
+   cliff. Snapshot buffers are lookup tables in practice, so refuse the
+   write instead and let the embedder copy where it means to.
+
+   Implemented by reusing the ArrayBuffer immutability that quickjs-ng
+   already has: element stores, fill, copyWithin, sort, set, transfer,
+   resize, slice and the DataView setters all check it, with upstream's
+   own error. `.immutable` also reads true from JS, so a handler can
+   feature-detect rather than guess. */
+int JS_MarkAllBaseArrayBuffersImmutable(JSRuntime *rt)
+{
+    int marked = 0;
+    struct list_head *el;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)h;
+        if (p->class_id != JS_CLASS_ARRAY_BUFFER &&
+            p->class_id != JS_CLASS_SHARED_ARRAY_BUFFER)
+            continue;
+        JSArrayBuffer *abuf = p->u.array_buffer;
+        if (abuf && !abuf->immutable) {
+            abuf->immutable = true;
+            marked++;
+        }
+    }
+    return marked;
+}
+
 int JS_ForceAllAutoinit(JSRuntime *rt)
 {
     int passes = 0;
@@ -59808,6 +59849,11 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(this_val);
+        /* reverse() writes the elements in place; every other in-place
+           typed-array mutator checks this and it does not. Matters for
+           arena base buffers, which are marked immutable at freeze. */
+        if (typed_array_is_immutable(p))
+            return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
         switch (typed_array_size_log2(p->class_id)) {
         case 0:
             {
@@ -60421,7 +60467,16 @@ static int typed_array_init(JSContext *ctx, JSValue obj, JSValue buffer,
     ta->offset = offset;
     ta->length = len << size_log2;
     ta->track_rab = track_rab;
-    list_add_tail(&ta->link, &abuf->array_list);
+    /* arena: a base ArrayBuffer is marked immutable at freeze, so it can
+       never be detached, resized or transferred — and those are the only
+       three consumers of array_list. Linking a request-lifetime view into
+       a base-resident list head would write base (and leave the head
+       pointing at recycled memory after the reset), so keep this view's
+       link self-contained instead. */
+    if (unlikely(ctx->rt->is_arena && js_arena_ptr_is_base(abuf)))
+        init_list_head(&ta->link);
+    else
+        list_add_tail(&ta->link, &abuf->array_list);
     p->u.typed_array = ta;
     p->u.array.count = len;
     p->u.array.u.ptr = abuf->data + offset;
@@ -60771,7 +60826,16 @@ static JSValue js_dataview_constructor(JSContext *ctx,
     ta->offset = offset;
     ta->length = len;
     ta->track_rab = track_rab;
-    list_add_tail(&ta->link, &abuf->array_list);
+    /* arena: a base ArrayBuffer is marked immutable at freeze, so it can
+       never be detached, resized or transferred — and those are the only
+       three consumers of array_list. Linking a request-lifetime view into
+       a base-resident list head would write base (and leave the head
+       pointing at recycled memory after the reset), so keep this view's
+       link self-contained instead. */
+    if (unlikely(ctx->rt->is_arena && js_arena_ptr_is_base(abuf)))
+        init_list_head(&ta->link);
+    else
+        list_add_tail(&ta->link, &abuf->array_list);
     p->u.typed_array = ta;
     return obj;
 }
@@ -61191,6 +61255,13 @@ static JSObject *js_atomics_get_buf(JSContext *ctx,
             JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
             return NULL;
         }
+    }
+    /* Atomics RMW ops write through the buffer and no immutability
+       check exists on this path. Matters for arena base buffers, which
+       are marked immutable at freeze. Loads/waits are unaffected. */
+    if (abuf->immutable && !is_waitable) {
+        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+        return NULL;
     }
     if (JS_ToIndex(ctx, &idx, idx_val)) {
         return NULL;

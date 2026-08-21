@@ -40,6 +40,36 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**Fixed: base ArrayBuffers are immutable after freeze.** A snapshot
+ArrayBuffer's bytes are base memory, so a request writing through any
+view onto it mutated the snapshot and the write was visible to every
+later request. On a multi-tenant embedder that is a cross-request
+channel — one tenant poisoning a shared base64 decode table for every
+other tenant on the thread, which is a live shape in rove's snapshot.
+
+Unlike a fast array these bytes cannot be copy-on-written cheaply: they
+belong to the ArrayBuffer, so a copy would have to move every aliasing
+view atomically, carry detached/resizable state along, and memcpy the
+whole buffer — an unbounded, embedder-controlled per-request cost, i.e.
+a capacity cliff rather than a fix. `JS_FreezeRuntime` now marks every
+base-resident ArrayBuffer immutable instead, reusing the
+immutable-ArrayBuffer support quickjs-ng already has: element stores,
+`fill`, `copyWithin`, `sort`, `set`, `transfer`, `resize`, `slice` and
+the DataView setters all check it, with upstream's own error. Reads are
+unaffected, and `.immutable` reads `true` from JS so a handler can
+feature-detect. Copy explicitly — `new Uint8Array(BASE_TA)` — for a
+mutable per-request one.
+
+⚠ Note the asymmetry inherited from upstream: the *method* mutators
+throw `TypeError: ArrayBuffer is immutable`, but a bare element store
+(`ta[0] = x`) is silently refused rather than throwing, because
+upstream's `[[Set]]` returns false without propagating to a strict-mode
+throw. The write does not land either way.
+
+Two gaps filled while there, both of which also affect non-arena
+immutable buffers: `TypedArray.prototype.reverse` and the `Atomics`
+read-modify-write ops wrote through without checking immutability.
+
 **Fixed: base fast arrays are now copy-on-write.** The shadow
 mechanism covered a base object's *named properties* only —
 `js_clone_jsobject_for_write` shallow-copies the `u` union, and the

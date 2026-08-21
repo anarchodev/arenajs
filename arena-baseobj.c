@@ -35,15 +35,23 @@
  * element array on a pure read. The "read only" case below guards that:
  * it must stay at 0 pages without creating a shadow.
  *
- * SCOPE: fast arrays (JS_CLASS_ARRAY / ARGUMENTS). Base typed arrays,
- * ArrayBuffers, Date, Promise and generators hold their mutable state
- * elsewhere and are handled separately; they are not asserted here yet.
+ * Base typed arrays and ArrayBuffers take the other route: their bytes
+ * belong to the ArrayBuffer, so copy-on-write would have to move every
+ * aliasing view atomically, carry detached/resizable state along, and
+ * memcpy the whole buffer per request — an unbounded, embedder-controlled
+ * cost, i.e. a capacity cliff rather than a fix. They are marked
+ * immutable at freeze instead, so writes are refused.
+ *
+ * SCOPE: fast arrays, typed arrays and ArrayBuffers. Base Date, Promise
+ * and generators hold mutable state elsewhere and are handled separately;
+ * they are not asserted here yet.
  *
  * Build:  part of the arena_target foreach in CMakeLists.txt
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include "quickjs.h"
 #include "qjs-arena.h"
 
@@ -112,6 +120,35 @@ static void isolated_across_reset(JSRuntime *rt, JSContext *ctx,
     JS_FreeValue(ctx, v);
 }
 
+/* Assert a mutation is REFUSED — throws — and dirties no base page.
+   Base ArrayBuffers are marked immutable at freeze rather than
+   copy-on-written: their bytes belong to the buffer, so a copy would
+   have to move every aliasing view atomically and memcpy the whole
+   buffer per request, an unbounded embedder-controlled cost. */
+static void mutation_refused(JSRuntime *rt, JSContext *ctx,
+                             const char *label, const char *src)
+{
+    JS_ResetRequestArena(rt);
+    js_arena_thermometer_reset();
+    JSValue v = JS_Eval(ctx, src, strlen(src), label, JS_EVAL_TYPE_GLOBAL);
+    bool threw = JS_IsException(v);
+    if (threw)
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, v);
+    size_t pages = js_arena_thermometer_pages();
+    if (!threw) {
+        fprintf(stderr, "FAIL: %-28s did NOT throw; a base typed-array "
+                        "mutation must be refused.\n", label);
+        nfail++;
+    } else if (pages != 0) {
+        fprintf(stderr, "FAIL: %-28s threw but still dirtied %zu base "
+                        "page(s).\n", label, pages);
+        nfail++;
+    } else {
+        printf("  ok  %-28s refused, 0 base pages\n", label);
+    }
+}
+
 int main(void)
 {
     JSRuntime *rt = JS_NewRuntimeArena(16 * 1024 * 1024, 16 * 1024 * 1024);
@@ -129,6 +166,8 @@ int main(void)
         "globalThis.A_copy=[1,2,3,4];  globalThis.A_defp=[1,2,3,4];"
         "globalThis.A_len=[1,2,3,4];   globalThis.A_read=[1,2,3,4];"
         "globalThis.A_iso=[1,2,3,4];   globalThis.A_grow=[1,2,3,4];"
+        "globalThis.TA=new Uint8Array(8); globalThis.AB=new ArrayBuffer(8);"
+        "globalThis.ABR=new ArrayBuffer(8,{maxByteLength:16});"
         "'ok'", "snapshot");
     JS_FreeValue(ctx, snap);
     if (nfail) return 2;
@@ -166,6 +205,29 @@ int main(void)
     isolated_across_reset(rt, ctx, "growth then reset",
         "A_grow.push(99), A_grow.join(',')", "A_grow.join(',')", "1,2,3,4");
 
+    printf("base typed arrays / ArrayBuffers (refused, not copy-on-written):\n");
+    /* Element stores are refused by upstream's immutable-ArrayBuffer
+       path, which returns false rather than throwing, so they are
+       asserted for effect and isolation rather than for a throw. */
+    mutates_no_base(rt, ctx, "TA element store",   "TA[0]=7, TA[0]");
+    mutates_no_base(rt, ctx, "view onto base buffer",
+        "(()=>{const v=new Uint8Array(AB); return v.length;})()");
+    mutates_no_base(rt, ctx, "TA read",            "TA.join(',')");
+    mutation_refused(rt, ctx, "TA.fill",           "TA.fill(9)");
+    mutation_refused(rt, ctx, "TA.sort",           "TA.sort()");
+    mutation_refused(rt, ctx, "TA.reverse",        "TA.reverse()");
+    mutation_refused(rt, ctx, "TA.set",            "TA.set([1,2])");
+    mutation_refused(rt, ctx, "TA.copyWithin",     "TA.copyWithin(0,1)");
+    mutation_refused(rt, ctx, "DataView set",
+        "new DataView(AB).setUint8(0,5)");
+    mutation_refused(rt, ctx, "ArrayBuffer.transfer", "AB.transfer()");
+    mutation_refused(rt, ctx, "ArrayBuffer.resize",   "ABR.resize(16)");
+    isolated_across_reset(rt, ctx, "TA store isolation",
+        "TA[0]=200, 1", "TA.join(',')", "0,0,0,0,0,0,0,0");
+    /* The sanctioned escape hatch must still work. */
+    mutates_no_base(rt, ctx, "copy of base TA is writable",
+        "(()=>{const c=new Uint8Array(TA); c[0]=5; return c[0];})()");
+
     /* The growth case used to leave u.array.u.values pointing into the
        request arena. Churn the arena hard, then read through it: on the
        old code this is where the segfault landed. */
@@ -199,8 +261,8 @@ int main(void)
         fprintf(stderr, "\n%d case(s) failed.\n", nfail);
         return 1;
     }
-    printf("\nPASS: base fast arrays are copy-on-write — no base writes, "
-           "no cross-request leakage.\n");
+    printf("\nPASS: base fast arrays are copy-on-write and base typed arrays "
+           "are immutable —\n      no base writes, no cross-request leakage.\n");
     js_dual_arena_free(JS_GetDualArena(rt));
     return 0;
 }

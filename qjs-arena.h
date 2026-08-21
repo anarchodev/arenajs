@@ -189,6 +189,14 @@ extern const JSMallocFunctions js_dual_arena_malloc_funcs;
 JS_EXTERN JSRuntime *JS_NewRuntimeArena(size_t base_size,
                                         size_t request_size);
 JS_EXTERN void JS_FreezeRuntime(JSRuntime *rt);
+
+/* Marks every base-resident ArrayBuffer immutable. Called by
+   JS_FreezeRuntime: snapshot buffer bytes are base memory, so a write
+   through any view would mutate the snapshot and be visible to every
+   later request. Returns the number of buffers marked. Writes then
+   throw TypeError ("ArrayBuffer is immutable"); copy explicitly
+   (new Uint8Array(BASE_TA)) to get a mutable per-request one. */
+JS_EXTERN int JS_MarkAllBaseArrayBuffersImmutable(JSRuntime *rt);
 JS_EXTERN void JS_ResetRequestArena(JSRuntime *rt);
 JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
 
