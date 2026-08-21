@@ -40,7 +40,17 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+**Performance: O(1) shadow-table lookup for base objects.** The
+base-object shadow map was a linked list probed on every read and write
+that touches a base object, so cost scaled with how many base objects a
+request had already shadowed. Depth and frequency are independent axes,
+so an ordinary handler — mutate part of the prelude, then run a hot
+loop — paid the full depth on every iteration. Replaced with an
+open-addressed table keyed on the base pointer. Whole-request shapes
+improve 3.8×–17.5×; depth-1 is unchanged, and nothing regressed.
+`arena-bench` grows three shadow-depth rows that must stay flat in each
+other's company. No contract change: no export, signature, return code
+or wire format moves, and no observable semantics change.
 
 ## [0.3.6] - 2026-08-21
 
