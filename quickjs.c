@@ -3471,6 +3471,34 @@ static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
     } else {
         shadow->prop = NULL;
     }
+    /* arena: a fast array keeps its elements in u.array.u.values, which
+       the shallow `*shadow = *base` above leaves pointing at BASE
+       storage — so element writes through the shadow would still land
+       in the snapshot, and a growth realloc would relocate base memory
+       into the request arena (rove#735's failure mode). Deep-copy the
+       element array. Base element values are immortal, so no refcount
+       work is needed, same rule as the prop array above.
+
+       Only ARRAY/ARGUMENTS are handled here: MAPPED_ARGUMENTS keeps
+       var_refs rather than values, and typed arrays keep a pointer into
+       an ArrayBuffer that has to be shadowed at buffer granularity
+       (every aliasing view must move together) — both still alias base
+       and are handled elsewhere. */
+    if (base->fast_array &&
+        (base->class_id == JS_CLASS_ARRAY ||
+         base->class_id == JS_CLASS_ARGUMENTS)) {
+        uint32_t n = base->u.array.count;
+        if (n > 0) {
+            JSValue *vals = js_malloc(ctx, sizeof(JSValue) * (size_t)n);
+            if (!vals)
+                return NULL;
+            memcpy(vals, base->u.array.u.values, sizeof(JSValue) * (size_t)n);
+            shadow->u.array.u.values = vals;
+        } else {
+            shadow->u.array.u.values = NULL;
+        }
+        shadow->u.array.u1.size = n;   /* capacity == count; grow on demand */
+    }
     return shadow;
 }
 
@@ -4537,7 +4565,11 @@ bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id)
 JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id)
 {
     if (JS_IsRegisteredClass(rt, class_id)) {
-        return JS_DupAtomRT(rt, rt->class_array[class_id].class_id);
+        /* .class_id is the numeric id; the name lives in .class_name.
+           Returning the former handed callers an arbitrary atom index
+           (class 1 -> atom 1 -> "null", class 2 -> "false", ...).
+           Upstream quickjs-ng bug, introduced with the API in 307a59f. */
+        return JS_DupAtomRT(rt, rt->class_array[class_id].class_name);
     } else {
         return JS_ATOM_NULL;
     }
@@ -9905,6 +9937,47 @@ int JS_MarkAllPrototypes(JSRuntime *rt)
     return marked;
 }
 
+/* arena: mark every base-resident ArrayBuffer immutable at freeze.
+   A snapshot buffer's bytes are base memory, so a request writing
+   through any view onto it mutates the snapshot and the write is
+   visible to every later request — on a multi-tenant embedder that is
+   a cross-request channel, e.g. one tenant poisoning a shared base64
+   decode table for every other tenant on the thread.
+
+   Unlike a fast array these bytes cannot be copy-on-written cheaply:
+   they belong to the ArrayBuffer, so a copy would have to move every
+   aliasing view atomically, carry detached/resizable state with it,
+   and memcpy the whole buffer — an unbounded, embedder-controlled cost
+   paid per request, which trades a correctness bug for a capacity
+   cliff. Snapshot buffers are lookup tables in practice, so refuse the
+   write instead and let the embedder copy where it means to.
+
+   Implemented by reusing the ArrayBuffer immutability that quickjs-ng
+   already has: element stores, fill, copyWithin, sort, set, transfer,
+   resize, slice and the DataView setters all check it, with upstream's
+   own error. `.immutable` also reads true from JS, so a handler can
+   feature-detect rather than guess. */
+int JS_MarkAllBaseArrayBuffersImmutable(JSRuntime *rt)
+{
+    int marked = 0;
+    struct list_head *el;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)h;
+        if (p->class_id != JS_CLASS_ARRAY_BUFFER &&
+            p->class_id != JS_CLASS_SHARED_ARRAY_BUFFER)
+            continue;
+        JSArrayBuffer *abuf = p->u.array_buffer;
+        if (abuf && !abuf->immutable) {
+            abuf->immutable = true;
+            marked++;
+        }
+    }
+    return marked;
+}
+
 int JS_ForceAllAutoinit(JSRuntime *rt)
 {
     int passes = 0;
@@ -11712,6 +11785,19 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         /* fast path for array access */
         p = JS_VALUE_GET_OBJ(this_obj);
         idx = JS_VALUE_GET_INT(prop);
+        /* arena: every store below writes p->u.array directly. For a
+           base fast array that is a write into the snapshot — visible
+           to later requests, and a dangling pointer once the element
+           array has to grow. Redirect to the request-arena shadow,
+           whose element storage is a copy. On failure fall through to
+           the generic property path, which shadows for itself. */
+        if (unlikely(ctx->rt->is_arena && js_arena_ptr_is_base(p) &&
+                     (p->class_id == JS_CLASS_ARRAY ||
+                      p->class_id == JS_CLASS_ARGUMENTS))) {
+            p = js_object_for_write(ctx, p);
+            if (unlikely(!p))
+                goto slow_path;
+        }
         switch(p->class_id) {
         case JS_CLASS_ARRAY:
             if (unlikely(idx >= (uint32_t)p->u.array.count)) {
@@ -42834,6 +42920,35 @@ static JSValue js_aggregate_error_constructor(JSContext *ctx,
 
 /* Array */
 
+/* arena: swap a base fast array for its request-arena shadow before an
+   in-place mutation. The Array.prototype mutators take the element
+   pointer via js_get_fast_array and then write it, p->u.array.count and
+   p->prop[0] directly, so the redirect has to happen on the object they
+   resolve from — redirecting inside js_get_fast_array would also copy
+   the array for the read-only fast paths (indexOf, includes, toSorted),
+   which is exactly the cost we are avoiding by not converting base
+   arrays wholesale.
+
+   Consumes `obj` and returns an owned reference, so callers can assign
+   over their existing one. On OOM the original is returned unchanged
+   and the caller's generic path copes. */
+static JSValue js_array_obj_for_write(JSContext *ctx, JSValue obj)
+{
+    if (likely(!ctx->rt->is_arena) || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return obj;
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    if (likely(!js_arena_ptr_is_base(p)))
+        return obj;
+    if (p->class_id != JS_CLASS_ARRAY && p->class_id != JS_CLASS_ARGUMENTS)
+        return obj;
+    JSObject *sh = js_object_for_write(ctx, p);
+    if (!sh)
+        return obj;
+    JSValue nv = js_dup(JS_MKPTR(JS_TAG_OBJECT, sh));
+    JS_FreeValue(ctx, obj);   /* base free is a no-op; keeps non-base sane */
+    return nv;
+}
+
 static int JS_CopySubArray(JSContext *ctx,
                            JSValue obj, int64_t to_pos,
                            int64_t from_pos, int64_t count, int dir)
@@ -42845,6 +42960,18 @@ static int JS_CopySubArray(JSContext *ctx,
 
     p = NULL;
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        /* arena: this mutates in place — redirect a base array to its
+           shadow. `obj` is borrowed here, so re-derive rather than
+           taking ownership. */
+        if (unlikely(ctx->rt->is_arena)) {
+            JSObject *pb = JS_VALUE_GET_OBJ(obj);
+            if (js_arena_ptr_is_base(pb) && pb->class_id == JS_CLASS_ARRAY) {
+                JSObject *sh = js_object_for_write(ctx, pb);
+                if (!sh)
+                    return -1;
+                obj = JS_MKPTR(JS_TAG_OBJECT, sh);
+            }
+        }
         p = JS_VALUE_GET_OBJ(obj);
         if (p->class_id != JS_CLASS_ARRAY || !p->fast_array) {
             p = NULL;
@@ -43945,6 +44072,7 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
     uint32_t count32;
 
     obj = JS_ToObject(ctx, this_val);
+    obj = js_array_obj_for_write(ctx, obj);   /* arena: mutates in place */
     if (js_get_length64(ctx, &len, obj))
         goto exception;
     newLen = 0;
@@ -43999,6 +44127,16 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
     /* fast path for push on fast arrays */
     if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT && !unshift)) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
+        /* arena: expand_fast_array below would realloc a BASE element
+           array into the request arena and store the pointer back into
+           the base JSObject — dangling at the next reset. Redirect to
+           the shadow first. */
+        if (unlikely(ctx->rt->is_arena && js_arena_ptr_is_base(p)
+                     && p->class_id == JS_CLASS_ARRAY)) {
+            p = js_object_for_write(ctx, p);
+            if (unlikely(!p))
+                return JS_EXCEPTION;
+        }
         if (likely(p->class_id == JS_CLASS_ARRAY &&
                    p->fast_array &&
                    p->extensible &&
@@ -44065,6 +44203,7 @@ static JSValue js_array_reverse(JSContext *ctx, JSValueConst this_val,
 
     lval = JS_UNDEFINED;
     obj = JS_ToObject(ctx, this_val);
+    obj = js_array_obj_for_write(ctx, obj);   /* arena: mutates in place */
     if (js_get_length64(ctx, &len, obj))
         goto exception;
 
@@ -59714,6 +59853,11 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (len > 0) {
         p = JS_VALUE_GET_OBJ(this_val);
+        /* reverse() writes the elements in place; every other in-place
+           typed-array mutator checks this and it does not. Matters for
+           arena base buffers, which are marked immutable at freeze. */
+        if (typed_array_is_immutable(p))
+            return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
         switch (typed_array_size_log2(p->class_id)) {
         case 0:
             {
@@ -60327,7 +60471,16 @@ static int typed_array_init(JSContext *ctx, JSValue obj, JSValue buffer,
     ta->offset = offset;
     ta->length = len << size_log2;
     ta->track_rab = track_rab;
-    list_add_tail(&ta->link, &abuf->array_list);
+    /* arena: a base ArrayBuffer is marked immutable at freeze, so it can
+       never be detached, resized or transferred — and those are the only
+       three consumers of array_list. Linking a request-lifetime view into
+       a base-resident list head would write base (and leave the head
+       pointing at recycled memory after the reset), so keep this view's
+       link self-contained instead. */
+    if (unlikely(ctx->rt->is_arena && js_arena_ptr_is_base(abuf)))
+        init_list_head(&ta->link);
+    else
+        list_add_tail(&ta->link, &abuf->array_list);
     p->u.typed_array = ta;
     p->u.array.count = len;
     p->u.array.u.ptr = abuf->data + offset;
@@ -60677,7 +60830,16 @@ static JSValue js_dataview_constructor(JSContext *ctx,
     ta->offset = offset;
     ta->length = len;
     ta->track_rab = track_rab;
-    list_add_tail(&ta->link, &abuf->array_list);
+    /* arena: a base ArrayBuffer is marked immutable at freeze, so it can
+       never be detached, resized or transferred — and those are the only
+       three consumers of array_list. Linking a request-lifetime view into
+       a base-resident list head would write base (and leave the head
+       pointing at recycled memory after the reset), so keep this view's
+       link self-contained instead. */
+    if (unlikely(ctx->rt->is_arena && js_arena_ptr_is_base(abuf)))
+        init_list_head(&ta->link);
+    else
+        list_add_tail(&ta->link, &abuf->array_list);
     p->u.typed_array = ta;
     return obj;
 }
@@ -61097,6 +61259,13 @@ static JSObject *js_atomics_get_buf(JSContext *ctx,
             JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
             return NULL;
         }
+    }
+    /* Atomics RMW ops write through the buffer and no immutability
+       check exists on this path. Matters for arena base buffers, which
+       are marked immutable at freeze. Loads/waits are unaffected. */
+    if (abuf->immutable && !is_waitable) {
+        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+        return NULL;
     }
     if (JS_ToIndex(ctx, &idx, idx_val)) {
         return NULL;

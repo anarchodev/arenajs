@@ -40,6 +40,76 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**Fixed: base ArrayBuffers are immutable after freeze.** A snapshot
+ArrayBuffer's bytes are base memory, so a request writing through any
+view onto it mutated the snapshot and the write was visible to every
+later request. On a multi-tenant embedder that is a cross-request
+channel — one tenant poisoning a shared base64 decode table for every
+other tenant on the thread, which is a live shape in rove's snapshot.
+
+Unlike a fast array these bytes cannot be copy-on-written cheaply: they
+belong to the ArrayBuffer, so a copy would have to move every aliasing
+view atomically, carry detached/resizable state along, and memcpy the
+whole buffer — an unbounded, embedder-controlled per-request cost, i.e.
+a capacity cliff rather than a fix. `JS_FreezeRuntime` now marks every
+base-resident ArrayBuffer immutable instead, reusing the
+immutable-ArrayBuffer support quickjs-ng already has: element stores,
+`fill`, `copyWithin`, `sort`, `set`, `transfer`, `resize`, `slice` and
+the DataView setters all check it, with upstream's own error. Reads are
+unaffected, and `.immutable` reads `true` from JS so a handler can
+feature-detect. Copy explicitly — `new Uint8Array(BASE_TA)` — for a
+mutable per-request one.
+
+⚠ Note the asymmetry inherited from upstream: the *method* mutators
+throw `TypeError: ArrayBuffer is immutable`, but a bare element store
+(`ta[0] = x`) is silently refused rather than throwing, because
+upstream's `[[Set]]` returns false without propagating to a strict-mode
+throw. The write does not land either way.
+
+Two gaps filled while there, both of which also affect non-arena
+immutable buffers: `TypedArray.prototype.reverse` and the `Atomics`
+read-modify-write ops wrote through without checking immutability.
+
+**Fixed: base fast arrays are now copy-on-write.** The shadow
+mechanism covered a base object's *named properties* only —
+`js_clone_jsobject_for_write` shallow-copies the `u` union, and the
+mutating fast paths took the element pointer straight off the base
+`JSObject`. So every in-place array mutation (index store, `sort`,
+`reverse`, `fill`, `copyWithin`, `pop`, `shift`, `splice`) wrote into
+the snapshot and was visible to **every later request** — a
+cross-request data channel — and `push` reallocated
+`u.array.u.values` into the request arena and stored that pointer back
+into the base object, so the next reset left it dangling and the
+following request segfaulted. Same shape as rove#735 but reachable
+from ordinary JS with no knife-edge.
+
+The shadow now gets its own copy of the element array, kept in
+fast-array form so base arrays keep their compact layout and read
+speed, and four chokepoints redirect to it: `JS_SetPropertyValue`,
+`js_array_push`, `js_array_pop`, `js_array_reverse`, and
+`JS_CopySubArray` (`copyWithin`/`splice`). Read-only fast paths
+(`indexOf`, `includes`, `toSorted`, `slice`) deliberately do **not**
+redirect — shadowing those would copy the whole element array on a
+pure read.
+
+A base array now behaves exactly as a base object always has:
+mutations work, they are request-local, and the reset restores the
+snapshot. `test262` is unchanged at 97/80017, i.e. no JS semantics
+moved; the only observable differences are the leak and the crash
+going away. Code that *relied* on the leak — writing a base array in
+one request to read it back in the next — will stop seeing it, which
+is the point.
+
+New harness `arena-baseobj` asserts both halves independently, because
+they fail independently: no base page is dirtied, **and** the next
+request sees the snapshot value. Verified red on the unfixed tree (12
+failures, including the dangling read returning
+`1,2,29,1,[unsupported type]`).
+
+Base typed arrays, ArrayBuffers, `Date`, promises and generators hold
+their mutable state elsewhere and are still affected; they are handled
+separately.
+
 **Performance: O(1) shadow-table lookup for base objects.** The
 base-object shadow map was a linked list probed on every read and write
 that touches a base object, so cost scaled with how many base objects a

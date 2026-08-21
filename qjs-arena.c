@@ -682,6 +682,10 @@ void JS_FreezeRuntime(JSRuntime *rt)
        4. Relocate JSRequestState into the request arena. */
     JS_ForceAllAutoinit(rt);
     JS_MarkAllPrototypes(rt);
+    /* 2b. Snapshot ArrayBuffers become immutable: their bytes are base
+       memory and cannot be shadowed cheaply (see the function's
+       comment). Must happen while still in BASE mode. */
+    JS_MarkAllBaseArrayBuffersImmutable(rt);
     js_dual_arena_freeze(JS_GetDualArena(rt));
     /* Flip rt->is_arena now: from this point on every chokepoint takes
        the arena code path. Done AFTER js_dual_arena_freeze because the
