@@ -72,6 +72,11 @@ int main(void)
     /* Stash a snapshot-time global so the override-existing test
        can verify the base value comes back after reset. */
     if (eval_check(ctx, "globalThis.GREETING = 'hello from base';")) return 1;
+    /* Base-resident objects for the shadow-table scaling rows below.
+       Must be built pre-freeze: a global created during a request dies
+       with that request's arena. */
+    if (eval_check(ctx, "globalThis.SHDW = [];"
+                        "for (let i = 0; i < 256; i++) SHDW.push({x:0});")) return 1;
 
     JS_FreezeRuntime(rt);
 
@@ -115,6 +120,31 @@ int main(void)
     bench_eval_reset(ctx, rt, "B: override base GREETING",   script_b, ITER_COUNT);
     bench_eval_reset(ctx, rt, "C: delete base GREETING",     script_c, ITER_COUNT);
     bench_eval_reset(ctx, rt, "D: 100x push + reduce",       script_d, ITER_COUNT / 5);
+
+    /* Shadow-table scaling. The base-object shadow map is probed on
+       every write to a base object; it used to be a linked list, so
+       cost grew with the number of objects a request had shadowed.
+       These three rows must stay flat in each other's company — a
+       regression shows up as the K=64/K=256 rows drifting away from
+       the K=1 row. */
+    {
+        static const struct { const char *label; int k; } depths[] = {
+            { "shadow depth 1",   1 },
+            { "shadow depth 64",  64 },
+            { "shadow depth 256", 256 },
+        };
+        for (unsigned d = 0; d < sizeof depths / sizeof *depths; d++) {
+            char src[256];
+            /* Shadow K base objects, hammer the one shadowed FIRST —
+               the worst case for any position-sensitive structure. */
+            snprintf(src, sizeof src,
+                     "(() => { const o = SHDW[0]; o.x = 0;"
+                     " for (let k = 1; k < %d; k++) SHDW[k].x = k;"
+                     " for (let i = 0; i < 20000; i++) o.x = i; return o.x; })()",
+                     depths[d].k);
+            bench_eval_reset(ctx, rt, depths[d].label, src, ITER_COUNT / 50);
+        }
+    }
 
     /* Reset alone — floor */
     if (eval_check(ctx, script_a)) return 1;

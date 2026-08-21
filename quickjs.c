@@ -349,8 +349,14 @@ typedef struct JSRequestState {
     uint32_t *atom_hash_overlay;        /* request-arena chain heads */
     uint32_t atom_hash_overlay_size;    /* power of two; 0 = not allocated */
     /* Step 6: generic shadow map for base JSObjects. See JSObjectShadow
-       above. Linked list rooted here, allocated lazily. */
-    struct JSObjectShadow *shadow_map;
+       above. Open-addressed hash table keyed on the base pointer,
+       allocated lazily in the request arena and grown at 50% load.
+       Was a linked list; at realistic depths (a request that mutates
+       part of its prelude then loops) the walk cost ~1.2ns per entry
+       per write and dominated everything else. */
+    struct JSObjectShadow *shadow_tab;
+    uint32_t shadow_tab_size;    /* power of two; 0 = not allocated */
+    uint32_t shadow_tab_count;
     /* Per-request override for ctx->std_array_prototype: once a request
        does anything that would have set ctx->std_array_prototype = false
        on a non-arena runtime, we set this flag instead. Reads of
@@ -364,7 +370,7 @@ typedef struct JSRequestState {
     /* Per-request shadow for ctx->error_back_trace. Reads in arena
        mode prefer this (when not JS_UNDEFINED); writes land here.
        Multi-ctx support is a known limitation — for >1 ctx this
-       would need to be per-ctx like the shadow_map. */
+       would need to be per-ctx like the shadow table. */
     JSValue error_back_trace_req;
     /* Per-request Math.random() state. Initialised to 0 at every reset;
        JS_SetRandomSeed writes here in arena mode. The seed-zero contract
@@ -624,10 +630,12 @@ enum {
    Linked list keyed by base pointer. Sparse: only the JSObjects a
    given request actually mutates appear here. Reads on unshadowed
    base objects walk past zero or one entry, then fall through. */
+/* Open-addressed slot. base == NULL marks a free slot; entries are
+   never removed (a shadow lives for the whole request), so linear
+   probing needs no tombstones. */
 typedef struct JSObjectShadow {
     JSObject *base;
     JSObject *shadow;
-    struct JSObjectShadow *next;
 } JSObjectShadow;
 
 struct JSContext {
@@ -2317,6 +2325,14 @@ int JS_RelocateReqState(JSRuntime *rt)
        objects died wholesale with the allocator reset, links and all. */
     init_list_head(&new_req->gc_obj_list);
     init_list_head(&new_req->tmp_obj_list);
+    /* The shadow table lives in the request arena and dies with it.
+       Clear it explicitly rather than relying on the copied template
+       being pristine — a stale pointer here would survive the reset
+       and index recycled request memory, which is exactly the failure
+       mode of rove#735. */
+    new_req->shadow_tab = NULL;
+    new_req->shadow_tab_size = 0;
+    new_req->shadow_tab_count = 0;
     /* rt->malloc_gc_threshold is read-only post-freeze (the vanilla GC
        ratchet that mutates it is off in arena mode), so it doubles as
        the per-request seed and the floor for the ratchet in
@@ -3458,15 +3474,71 @@ static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
     return shadow;
 }
 
-/* arena: walk the shadow_map for a matching base entry. Returns the
+/* arena: probe the shadow table for a matching base entry. Returns the
    shadow JSObject, or NULL if not yet shadowed. */
+/* Most requests shadow a handful of objects; start small (256 B) and
+   let the doubling handle prelude-mutating handlers. */
+#define JS_SHADOW_TAB_INITIAL 16
+
+/* Fibonacci hashing on the pointer. Objects are >=16-byte aligned, so
+   the low bits carry no information — shift them out first, then take
+   the high bits of the multiply, which mix all input bits. */
+static inline uint32_t js_shadow_hash(const JSObject *p, uint32_t mask)
+{
+    uint64_t v = (uint64_t)(uintptr_t)p >> 4;
+    v *= 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(v >> 32) & mask;
+}
+
 static JSObject *js_object_shadow_lookup(JSRuntime *rt, JSObject *p)
 {
-    for (JSObjectShadow *e = rt->req->shadow_map; e; e = e->next) {
-        if (e->base == p)
-            return e->shadow;
+    JSObjectShadow *tab = rt->req->shadow_tab;
+    if (!tab)
+        return NULL;
+    uint32_t mask = rt->req->shadow_tab_size - 1;
+    uint32_t i = js_shadow_hash(p, mask);
+    for (;;) {
+        JSObject *b = tab[i].base;
+        if (!b)
+            return NULL;
+        if (b == p)
+            return tab[i].shadow;
+        i = (i + 1) & mask;
     }
-    return NULL;
+}
+
+/* Insert into an already-sized table. Caller guarantees a free slot. */
+static void js_shadow_tab_put(JSObjectShadow *tab, uint32_t mask,
+                              JSObject *base, JSObject *shadow)
+{
+    uint32_t i = js_shadow_hash(base, mask);
+    while (tab[i].base)
+        i = (i + 1) & mask;
+    tab[i].base = base;
+    tab[i].shadow = shadow;
+}
+
+/* Ensure room for one more entry (keep load factor <= 1/2). */
+static int js_shadow_tab_reserve(JSContext *ctx)
+{
+    JSRequestState *req = ctx->rt->req;
+    if (req->shadow_tab && (req->shadow_tab_count + 1) * 2 <= req->shadow_tab_size)
+        return 0;
+    uint32_t new_size = req->shadow_tab_size ? req->shadow_tab_size * 2
+                                             : JS_SHADOW_TAB_INITIAL;
+    JSObjectShadow *nt = js_mallocz_rt(ctx->rt, sizeof(*nt) * new_size);
+    if (!nt)
+        return -1;
+    uint32_t new_mask = new_size - 1;
+    for (uint32_t i = 0; i < req->shadow_tab_size; i++) {
+        if (req->shadow_tab[i].base)
+            js_shadow_tab_put(nt, new_mask, req->shadow_tab[i].base,
+                              req->shadow_tab[i].shadow);
+    }
+    js_free_rt(ctx->rt, req->shadow_tab);
+    req->shadow_tab = nt;
+    req->shadow_tab_size = new_size;
+    return 0;
 }
 
 /* Inverse of js_object_active: map a shadow back to the base identity
@@ -3482,9 +3554,20 @@ static JSObject *js_object_base_identity(JSRuntime *rt, JSObject *p)
         return p;
     if (js_arena_ptr_is_base(p))
         return p;
-    for (JSObjectShadow *e = rt->req->shadow_map; e; e = e->next) {
-        if (e->shadow == p)
-            return e->base;
+    /* Cold path: the only caller is JS_SetPrototypeInternal's identity
+       check, i.e. Object.setPrototypeOf / the __proto__ setter. A scan
+       is fine there — it is O(live entries) with contiguous locality,
+       where the old linked list was O(live entries) of pointer chasing.
+       Not worth a second pointer-keyed table until a caller makes it
+       hot. */
+    JSObjectShadow *tab = rt->req->shadow_tab;
+    uint32_t seen = 0, live = rt->req->shadow_tab_count;
+    for (uint32_t i = 0; i < rt->req->shadow_tab_size && seen < live; i++) {
+        if (!tab[i].base)
+            continue;
+        seen++;
+        if (tab[i].shadow == p)
+            return tab[i].base;
     }
     return p;
 }
@@ -3512,16 +3595,14 @@ static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
     JSObject *shadow = js_object_shadow_lookup(ctx->rt, p);
     if (shadow)
         return shadow;
+    if (js_shadow_tab_reserve(ctx) < 0)
+        return NULL;
     shadow = js_clone_jsobject_for_write(ctx, p);
     if (!shadow)
         return NULL;
-    JSObjectShadow *entry = js_mallocz_rt(ctx->rt, sizeof(*entry));
-    if (!entry)
-        return NULL;
-    entry->base = p;
-    entry->shadow = shadow;
-    entry->next = ctx->rt->req->shadow_map;
-    ctx->rt->req->shadow_map = entry;
+    js_shadow_tab_put(ctx->rt->req->shadow_tab,
+                      ctx->rt->req->shadow_tab_size - 1, p, shadow);
+    ctx->rt->req->shadow_tab_count++;
     return shadow;
 }
 
@@ -3567,7 +3648,7 @@ static inline void js_std_array_prototype_mark_dirty(JSContext *ctx)
 }
 
 /* v1 wrappers — kept so the existing global_var_obj call sites still
-   compile, now backed by the generic shadow_map. */
+   compile, now backed by the generic shadow table. */
 static inline JSObject *js_global_var_obj_active(JSContext *ctx)
 {
     return js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ctx->global_var_obj));
