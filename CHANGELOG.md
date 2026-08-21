@@ -40,6 +40,18 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.6] - 2026-08-21
+
+The **inviolate-base repair release**: a base-resident runtime table
+could be relocated into the request arena after freeze and then
+recycled out from under the runtime, which is the one invariant this
+project exists to hold. One fix, one guard against the same mistake
+being made through a different door, one sweep harness that can see
+the failure, and a header note for an API whose name promised more
+than it delivered.
+
 **Fixed: base atom table relocated into the request arena
 (rove#735).** `__JS_NewAtom`'s "grow the atom array" branch and
 `js_new_shape2`'s "resize the shape hash" branch were not gated on
