@@ -40,6 +40,27 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**Fixed: base iterators are copy-on-write.** An iterator keeps its
+cursor in a heap struct hanging off `u`, and the shadow's shallow copy
+of that union left the pointer aiming at the snapshot's struct — so
+`next()` on a base-resident iterator advanced the *snapshot's* cursor
+and the following request resumed where the previous one stopped.
+Request 2 got element 2. Six classes: `Map Iterator`, `Set Iterator`,
+`Array Iterator`, `String Iterator`, `Iterator Helper`, `Iterator
+Concat`.
+
+Four distinct state layouts, one uniform mechanism: the shadow gets its
+own copy of the state struct, and the `next()` (and `return()`)
+implementations resolve through it via a write-aware opaque getter.
+Read paths that do not advance a cursor keep the plain getter, so a
+plain inspection does not pay for a copy. `Iterator Concat`'s state has
+a flexible array member, so its copy is sized from the element count
+rather than `sizeof`.
+
+Iterators reach a snapshot far more easily by accident than generators
+do, and unlike a generator there is no ambiguity about the right
+answer, which is why these are fixed rather than refused.
+
 **Fixed: base closure cells (`JSVarRef`) are copy-on-write.** A
 snapshot closure's captured variables live in base, so assigning one
 wrote the snapshot and the value carried into the next request — a
