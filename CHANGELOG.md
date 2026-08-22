@@ -5,7 +5,8 @@ here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is [Semantic Versioning](https://semver.org/) applied to
 the contract, not to the fork as a whole.
 
-**Base:** quickjs-ng 0.15.1. arenajs versions independently; the
+**Base:** quickjs-ng 0.15.1 + the pre-allocator half of 0.16.0
+(upstream `377a25e`). arenajs versions independently; the
 upstream base is recorded here as lineage metadata and is not coupled
 to arenajs's release cadence.
 
@@ -39,6 +40,69 @@ version bump is only MINOR — are flagged **⚠ Contract** with the
 safe consumer pattern spelled out.
 
 ## [Unreleased]
+
+### Upstream sync — 0.15.1 → 0.16.0, pre-allocator (stage 2a)
+
+18 commits, `v0.15.1..377a25e`. The 0.16.0 range is deliberately **not**
+taken as one merge: upstream `9de2921` ("Add arena allocator") touches 53
+of the 181 `quickjs.c` functions arenajs patches, where every other commit
+in the range touches one to four. Cutting immediately before it keeps that
+port reviewable on its own. The range is linear, so the cut is clean.
+
+Two conflicts.
+
+`9b57175` (Error.prototype.stack accessor proposal) restructures the tail
+of `build_backtrace` into a three-way branch — `captureStackTrace` target,
+genuine Error, DOMException-and-the-like. Took upstream's structure whole
+and substituted our per-request `js_error_back_trace_*` accessors for
+`ctx->error_back_trace`. The new middle branch writes `p->u.object_data`
+directly, which bypasses the shadow, so it is annotated: `build_backtrace`
+only ever runs on a freshly constructed error, never a base one. The
+`Error.prototype.stack` *setter* was checked separately and is safe — it
+routes through `JS_DefinePropertyValue` / `JS_SetPropertyInternal2`, both
+shadow-covered.
+
+`249bb27` (Enforce immutability on TypedArray write paths) collided with
+our own `336ad63`, and upstream won on the merits. We had added an
+immutability check to `js_typed_array_reverse` because upstream lacked one
+("every other in-place typed-array mutator checks this and it does not").
+Upstream has now added exactly that check and placed it *before* the
+`len > 0` guard, so it also throws for a zero-length view. Ours was
+deleted as redundant.
+
+That pair is the quiet win of this stage. Our base-ArrayBuffer protection
+does not implement its own enforcement — `336ad63` sets upstream's
+`abuf->immutable` flag on every base buffer at freeze and relies on
+`typed_array_is_immutable(p)` to reject writes. `249bb27` keeps that exact
+predicate and applies it in more places (clearing 18 test262 expected
+failures), and `eb52863` fixes the ArrayBuffer immutable-method semantics
+around it. The base guarantee got stronger without us writing anything.
+
+Also inherited: `5f2fb55` ports Bellard's register-based regexp engine
+(+1657/-745 in `libregexp.c`, a file this fork has never touched, so it
+merged untouched) — it brings the `v` flag, regexp modifiers, duplicate
+named capture groups and properties-of-strings, and it removes
+`tests/bug1221.js`, whose bug the new engine does not have. `377a25e`
+inlines mixed int/float arithmetic and fast-array reads in the interpreter
+(+101/-0); its six new `u.array.` sites are reads, so they cannot violate
+base, but they are a class-13 audit surface if a write path is ever added
+alongside them.
+
+The expected-failure baseline drops 96 -> 74; the 22 are exactly what
+`249bb27` (18) and `eb52863` (4) fix. Two entries report a *changed*
+message rather than a changed verdict — `subarray/byteoffset-with-detached-buffer.js`
+now fails at the `makePassthrough` sub-case instead of `makeArrayBuffer`,
+i.e. it gets further than the recorded text. Building vanilla upstream at
+`377a25e` reproduces the identical drift, so this is upstream's own
+`test262_errors.txt` being briefly stale mid-release, not a divergence
+here; `83bd0ab`, just past our cut, fixes the bug and drops the entry.
+
+MINOR: no `arena_*` export changes, no wire-format changes. New JS-visible
+surface — `Error.prototype.stack` is now a prototype accessor rather than
+an own data property, the regexp engine gains `v`-flag and modifier
+support, and `4fb9b0c` implements nonextensible-applies-to-private.
+`05f0bde` adds the `JS_FreeValues`/`JS_FreeAtoms` vararg macros to
+`quickjs.h`.
 
 ### Upstream sync — quickjs-ng 0.14.0 → 0.15.1
 
