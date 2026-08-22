@@ -3468,6 +3468,11 @@ static int js_atom_hash_overlay_ensure(JSRuntime *rt)
      which have no exotic class, so a memcpy is correct. Generalize
      when other classes need shadowing.
    - first_weak_ref: NULL (shadow has no inherited weak refs). */
+/* arena: deep-copy an iterator's cursor state into a shadow. Defined
+   late, where all four state structs are visible. */
+static int js_arena_clone_iter_state(JSContext *ctx, JSObject *shadow,
+                                     JSObject *base);
+
 static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
 {
     JSObject *shadow = js_mallocz(ctx, sizeof(JSObject));
@@ -3501,6 +3506,8 @@ static JSObject *js_clone_jsobject_for_write(JSContext *ctx, JSObject *base)
        an ArrayBuffer that has to be shadowed at buffer granularity
        (every aliasing view must move together) — both still alias base
        and are handled elsewhere. */
+    if (js_arena_clone_iter_state(ctx, shadow, base) < 0)
+        return NULL;
     if (base->fast_array &&
         (base->class_id == JS_CLASS_ARRAY ||
          base->class_id == JS_CLASS_ARGUMENTS)) {
@@ -3649,6 +3656,31 @@ static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
                       ctx->rt->req->shadow_tab_size - 1, p, shadow);
     ctx->rt->req->shadow_tab_count++;
     return shadow;
+}
+
+/* arena: JS_GetOpaque2 for paths that are about to MUTATE the opaque
+   state. An iterator keeps its cursor in a heap struct hanging off `u`,
+   so next() on a base-resident iterator advanced the snapshot's cursor
+   and the following request resumed where the previous one stopped —
+   request 2 gets element 2. Resolve to the request-arena shadow, whose
+   state struct is a copy, before handing the pointer out.
+
+   Reads that do not advance the cursor keep using JS_GetOpaque2: this
+   allocates a shadow, and doing that for a plain inspection would pay
+   the copy for nothing. */
+static void *JS_GetOpaqueForWrite(JSContext *ctx, JSValueConst obj,
+                                  JSClassID class_id)
+{
+    if (unlikely(ctx->rt->is_arena) && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        if (js_arena_ptr_is_base(p) && p->class_id == class_id) {
+            JSObject *sh = js_object_for_write(ctx, p);
+            if (!sh)
+                return NULL;
+            return sh->u.opaque;
+        }
+    }
+    return JS_GetOpaque2(ctx, obj, class_id);
 }
 
 /* ---- arena: closure-cell (JSVarRef) shadows ----
@@ -45100,7 +45132,7 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
     JSValue val, obj;
     JSObject *p;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ARRAY_ITERATOR);
+    it = JS_GetOpaqueForWrite(ctx, this_val, JS_CLASS_ARRAY_ITERATOR);
     if (!it)
         goto fail1;
     if (JS_IsUndefined(it->obj))
@@ -45282,7 +45314,7 @@ static JSValue js_iterator_concat_next(JSContext *ctx, JSValueConst this_val,
     JSIteratorConcatData *it;
     int done;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
+    it = JS_GetOpaqueForWrite(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
     if (!it)
         return JS_EXCEPTION;
     if (it->running)
@@ -45355,7 +45387,7 @@ static JSValue js_iterator_concat_return(JSContext *ctx, JSValueConst this_val,
     JSIteratorConcatData *it;
     JSValue ret, *pval;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
+    it = JS_GetOpaqueForWrite(ctx, this_val, JS_CLASS_ITERATOR_CONCAT);
     if (!it)
         return JS_EXCEPTION;
     if (it->running)
@@ -45912,7 +45944,7 @@ static JSValue js_iterator_helper_next(JSContext *ctx, JSValueConst this_val,
 
     *pdone = false;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
+    it = JS_GetOpaqueForWrite(ctx, this_val, JS_CLASS_ITERATOR_HELPER);
     if (!it)
         return JS_EXCEPTION;
     if (it->executing)
@@ -48189,7 +48221,7 @@ static JSValue js_string_iterator_next(JSContext *ctx, JSValueConst this_val,
     uint32_t idx, c, start;
     JSString *p;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_STRING_ITERATOR);
+    it = JS_GetOpaqueForWrite(ctx, this_val, JS_CLASS_STRING_ITERATOR);
     if (!it) {
         *pdone = false;
         return JS_EXCEPTION;
@@ -53714,6 +53746,94 @@ typedef struct JSMapIteratorData {
     JSMapRecord *cur_record;
 } JSMapIteratorData;
 
+/* arena: give a shadowed iterator its own cursor.
+ *
+ * Every iterator keeps its state in a heap struct hanging off `u`, and
+ * the shallow `*shadow = *base` in js_clone_jsobject_for_write leaves
+ * that pointer aiming at the snapshot's struct — so advancing the
+ * shadow advanced base anyway. Four distinct layouts across the six
+ * affected classes, but one uniform mechanism: copy the struct into the
+ * request arena and repoint.
+ *
+ * JSValue fields are js_dup'd, which is a no-op for base values (they
+ * are immortal) and correct for anything a request has already put
+ * there. JSMapIteratorData.cur_record keeps pointing at the base map's
+ * record: base maps are frozen and their iteration lock is already
+ * base-aware, so the record is safe to read and never written.
+ *
+ * Called for every shadow creation, so it must stay a cheap switch for
+ * the overwhelming majority of objects that are not iterators. */
+static int js_arena_clone_iter_state(JSContext *ctx, JSObject *shadow,
+                                     JSObject *base)
+{
+    switch (base->class_id) {
+    case JS_CLASS_MAP_ITERATOR:
+    case JS_CLASS_SET_ITERATOR: {
+        JSMapIteratorData *src = base->u.map_iterator_data;
+        if (!src)
+            break;
+        JSMapIteratorData *dst = js_malloc(ctx, sizeof(*dst));
+        if (!dst)
+            return -1;
+        *dst = *src;
+        dst->obj = js_dup(src->obj);
+        shadow->u.map_iterator_data = dst;
+        break;
+    }
+    case JS_CLASS_ARRAY_ITERATOR:
+    case JS_CLASS_STRING_ITERATOR: {
+        JSArrayIteratorData *src = base->u.array_iterator_data;
+        if (!src)
+            break;
+        JSArrayIteratorData *dst = js_malloc(ctx, sizeof(*dst));
+        if (!dst)
+            return -1;
+        *dst = *src;
+        dst->obj = js_dup(src->obj);
+        shadow->u.array_iterator_data = dst;
+        break;
+    }
+    case JS_CLASS_ITERATOR_HELPER: {
+        JSIteratorHelperData *src = base->u.iterator_helper_data;
+        if (!src)
+            break;
+        JSIteratorHelperData *dst = js_malloc(ctx, sizeof(*dst));
+        if (!dst)
+            return -1;
+        *dst = *src;
+        dst->obj   = js_dup(src->obj);
+        dst->next  = js_dup(src->next);
+        dst->func  = js_dup(src->func);
+        dst->inner = js_dup(src->inner);
+        shadow->u.iterator_helper_data = dst;
+        break;
+    }
+    case JS_CLASS_ITERATOR_CONCAT: {
+        /* Variable length: `values[]` is a flexible array member holding
+           `count` elements, so size the copy from count rather than
+           sizeof the struct. */
+        JSIteratorConcatData *src = base->u.iterator_concat_data;
+        if (!src)
+            break;
+        size_t bytes = sizeof(*src) + (size_t)src->count * sizeof(JSValue);
+        JSIteratorConcatData *dst = js_malloc(ctx, bytes);
+        if (!dst)
+            return -1;
+        memcpy(dst, src, bytes);
+        dst->iter = js_dup(src->iter);
+        dst->next = js_dup(src->next);
+        for (uint32_t i = 0; i < src->count; i++)
+            dst->values[i] = js_dup(src->values[i]);
+        shadow->u.iterator_concat_data = dst;
+        break;
+    }
+    default:
+        break;
+    }
+    return 0;
+}
+
+
 static void js_map_iterator_finalizer(JSRuntime *rt, JSValueConst val)
 {
     JSObject *p;
@@ -53783,7 +53903,7 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
     JSMapRecord *mr;
     struct list_head *el;
 
-    it = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP_ITERATOR + magic);
+    it = JS_GetOpaqueForWrite(ctx, this_val, JS_CLASS_MAP_ITERATOR + magic);
     if (!it) {
         *pdone = false;
         return JS_EXCEPTION;
