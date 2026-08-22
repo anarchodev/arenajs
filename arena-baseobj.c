@@ -42,9 +42,15 @@
  * cost, i.e. a capacity cliff rather than a fix. They are marked
  * immutable at freeze instead, so writes are refused.
  *
- * SCOPE: fast arrays, typed arrays and ArrayBuffers. Base Date, Promise
- * and generators hold mutable state elsewhere and are handled separately;
- * they are not asserted here yet.
+ * Closure cells (JSVarRef) are asserted here too, and deliberately not
+ * in arena-baseclass: a JSVarRef has no JS_CLASS_* id, so the class
+ * matrix cannot reach it. That blind spot is why base closure state —
+ * the single most ordinary snapshot shape there is — survived two
+ * rounds of that audit.
+ *
+ * SCOPE: fast arrays, typed arrays, ArrayBuffers and closure cells.
+ * Base Promise and generators hold mutable state elsewhere and are
+ * handled separately; they are not asserted here yet.
  *
  * Build:  part of the arena_target foreach in CMakeLists.txt
  */
@@ -168,6 +174,11 @@ int main(void)
         "globalThis.A_iso=[1,2,3,4];   globalThis.A_grow=[1,2,3,4];"
         "globalThis.TA=new Uint8Array(8); globalThis.AB=new ArrayBuffer(8);"
         "globalThis.ABR=new ArrayBuffer(8,{maxByteLength:16});"
+        "globalThis.CTR=(function(){let n=0;return{inc(){return ++n;},"
+        "get(){return n;},set(v){n=v;}};})();"
+        "globalThis.PRM=(function(p){return{inc(){return ++p;},"
+        "get(){return p;}};})(0);"
+        "globalThis.RO=(function(){let k=5;return{get(){return k;}};})();"
         "'ok'", "snapshot");
     JS_FreeValue(ctx, snap);
     if (nfail) return 2;
@@ -228,6 +239,42 @@ int main(void)
     mutates_no_base(rt, ctx, "copy of base TA is writable",
         "(()=>{const c=new Uint8Array(TA); c[0]=5; return c[0];})()");
 
+    printf("base closure cells (JSVarRef):\n");
+    /* A JSVarRef is not a JSClass, so arena-baseclass structurally
+       cannot see these — the class matrix enumerates the object table,
+       not the environment. This is the most ordinary shape of all:
+       `globalThis.x = (function(){ let n = 0; ... })()`. */
+    mutates_no_base(rt, ctx, "captured let, mutated",   "CTR.inc()");
+    mutates_no_base(rt, ctx, "captured param, mutated", "PRM.inc()");
+    mutates_no_base(rt, ctx, "captured let, read only", "RO.get()");
+    isolated_across_reset(rt, ctx, "counter isolation",
+        "CTR.inc(), CTR.inc(), String(CTR.get())", "String(CTR.get())", "0");
+    isolated_across_reset(rt, ctx, "param isolation",
+        "PRM.inc(), String(PRM.get())", "String(PRM.get())", "0");
+    /* Isolation must not be bought by breaking sharing: two closures
+       over ONE cell have to keep observing each other within a request.
+       A per-closure copy would pass every check above and fail this. */
+    {
+        JS_ResetRequestArena(rt);
+        JSValue v = eval_val(ctx,
+            "CTR.inc(), CTR.inc(), CTR.set(7), String(CTR.get()) + ',' + "
+            "String(CTR.inc()) + ',' + String(CTR.get())", "sharing");
+        const char *got = JS_ToCString(ctx, v);
+        if (!got || strcmp(got, "7,8,8") != 0) {
+            fprintf(stderr,
+                "FAIL: closures sharing one cell disagreed: got '%s', "
+                "expected '7,8,8'.\n"
+                "      Each closure got its own copy; the shadow must be "
+                "keyed on the CELL,\n      not on the closure that reached "
+                "it.\n", got ? got : "(null)");
+            nfail++;
+        } else {
+            printf("  ok  %-28s shared cell stays shared (7,8,8)\n", "intra-request sharing");
+        }
+        if (got) JS_FreeCString(ctx, got);
+        JS_FreeValue(ctx, v);
+    }
+
     /* The growth case used to leave u.array.u.values pointing into the
        request arena. Churn the arena hard, then read through it: on the
        old code this is where the segfault landed. */
@@ -261,8 +308,9 @@ int main(void)
         fprintf(stderr, "\n%d case(s) failed.\n", nfail);
         return 1;
     }
-    printf("\nPASS: base fast arrays are copy-on-write and base typed arrays "
-           "are immutable —\n      no base writes, no cross-request leakage.\n");
+    printf("\nPASS: base fast arrays and closure cells are copy-on-write, base "
+           "typed arrays\n      are immutable — no base writes, no "
+           "cross-request leakage.\n");
     js_dual_arena_free(JS_GetDualArena(rt));
     return 0;
 }
