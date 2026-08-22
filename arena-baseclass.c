@@ -17,7 +17,14 @@
  *                 named properties (which the shadow already covers),
  *   UNREACHABLE - records why a JS snapshot cannot hold one, or
  *   COVERED     - defers to the harness that already asserts it, or
+ *   REFUSED     - cannot be isolated per request, so JS_FreezeRuntime
+ *                 refuses a snapshot containing one, or
  *   KNOWN_GAP   - a hole this test found that is not fixed yet.
+ *
+ * REFUSED entries are asserted in their own throwaway runtime via
+ * JS_ScanSnapshotHazards, and deliberately NOT built into this test's
+ * snapshot — doing that would abort the test itself, which is the
+ * refusal working correctly and useless as a test.
  *
  * KNOWN_GAP is an expected failure WITH TEETH: the class is asserted to
  * still be broken. Fix one and this test fails, telling you to promote
@@ -50,6 +57,7 @@
 typedef enum {
     MUTATE,       /* must be clean */
     KNOWN_GAP,    /* known broken; asserted to still be broken, see below */
+    REFUSED,      /* JS_FreezeRuntime refuses a snapshot holding one */
     NO_STATE,
     UNREACHABLE,
     COVERED,
@@ -159,18 +167,23 @@ static const ClsEntry TABLE[] = {
 {48,"JS_CLASS_REGEXP_STRING_ITERATOR","RegExp String Iterator",MUTATE,NULL,
     "'aa'.matchAll(/a/g)",
     {"T.next()",NULL},"T.next().value[0]","a"},
-{49,"JS_CLASS_GENERATOR","Generator",KNOWN_GAP,"generator_data holds the suspended frame; next() resumes it in base",
+{49,"JS_CLASS_GENERATOR","Generator",REFUSED,"a suspended frame cannot be copied non-arbitrarily; refused at freeze",
     "(function*(){ yield 1; yield 2; })()",
     {"T.next()",NULL},"T.next().value","1"},
 {50,"JS_CLASS_PROXY","Object",MUTATE,NULL,"new Proxy({a:1},{})",
     {"T.a=9","T.b=1",NULL},"T.a","1"},
-{51,"JS_CLASS_PROMISE","Promise",KNOWN_GAP,"promise_data holds the reaction lists; then() appends in base","Promise.resolve(1)",
+{51,"JS_CLASS_PROMISE","Promise",REFUSED,"a PENDING promise leaves a dangling reaction list; refused at freeze (settled is allowed)","new Promise(()=>{})",
     {"T.then(()=>{})","T.tag=1",NULL},"typeof T.then","function"},
+/* Settle the promise before returning the function: an unresolved one
+   left in the snapshot is itself a refusal hazard, which this test's own
+   snapshot tripped when the refusal landed. */
 {52,"JS_CLASS_PROMISE_RESOLVE_FUNCTION","PromiseResolveFunction",MUTATE,NULL,
-    "(()=>{ let r; new Promise(res=>{ r=res; }); return r; })()",
+    "(()=>{ let r; new Promise(res=>{ r=res; }); r(1); return r; })()",
     {"T.tag=1",NULL},"typeof T","function"},
+/* Resolve (not reject — an unhandled rejection is noise) so the promise
+   settles while the reject function is still captured. */
 {53,"JS_CLASS_PROMISE_REJECT_FUNCTION","PromiseRejectFunction",MUTATE,NULL,
-    "(()=>{ let j; new Promise((_,rej)=>{ j=rej; }); return j; })()",
+    "(()=>{ let j,r; new Promise((res,rej)=>{ r=res; j=rej; }); r(1); return j; })()",
     {"T.tag=1",NULL},"typeof T","function"},
 {54,"JS_CLASS_ASYNC_FUNCTION","AsyncFunction",MUTATE,NULL,
     "(async function(){ return 1; })",
@@ -184,7 +197,7 @@ static const ClsEntry TABLE[] = {
 {58,"JS_CLASS_ASYNC_GENERATOR_FUNCTION","AsyncGeneratorFunction",MUTATE,NULL,
     "(async function*(){ yield 1; })",
     {"T.tag=1",NULL},"typeof T","function"},
-{59,"JS_CLASS_ASYNC_GENERATOR","AsyncGenerator",KNOWN_GAP,"async_generator_data holds the queue and frame; next() writes base",
+{59,"JS_CLASS_ASYNC_GENERATOR","AsyncGenerator",REFUSED,"a suspended frame cannot be copied non-arbitrarily; refused at freeze",
     "(async function*(){ yield 1; yield 2; })()",
     {"T.next()",NULL},"typeof T.next","function"},
 /* The target needs its own strong base reference: a WeakRef to an
@@ -193,7 +206,7 @@ static const ClsEntry TABLE[] = {
 {60,"JS_CLASS_WEAK_REF","WeakRef",MUTATE,NULL,
     "(globalThis.WR_TARGET = {a:1}, new WeakRef(globalThis.WR_TARGET))",
     {"T.deref()","T.tag=1",NULL},"typeof T.deref()","object"},
-{61,"JS_CLASS_FINALIZATION_REGISTRY","FinalizationRegistry",KNOWN_GAP,"the registry list head is base-resident; register() writes it",
+{61,"JS_CLASS_FINALIZATION_REGISTRY","FinalizationRegistry",REFUSED,"weak-ref bookkeeping lives in base and callbacks cannot fire; refused at freeze",
     "new FinalizationRegistry(()=>{})",
     {"T.register({},1)","T.tag=1",NULL},"typeof T.register","function"},
 {62,"JS_CLASS_DOM_EXCEPTION","DOMException",MUTATE,NULL,
@@ -210,6 +223,49 @@ static const ClsEntry TABLE[] = {
 static int nfail;
 static int nred;   /* MUTATE classes that failed */
 static int ngap;   /* KNOWN_GAP classes, still broken as expected */
+static int nref;   /* REFUSED classes, refused as expected */
+
+/* A REFUSED class gets its own runtime: build one instance, assert the
+   hazard scan finds it, and never freeze. Freezing would abort — which
+   is the refusal working, and useless as an assertion. */
+static bool check_refused(const ClsEntry *e)
+{
+    JSRuntime *rt = JS_NewRuntimeArena(8 * 1024 * 1024, 8 * 1024 * 1024);
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) { fprintf(stderr, "FAIL: %s: runtime setup\n", e->enum_name); return false; }
+
+    /* Control: the scan must report nothing before we add the hazard. */
+    bool ok = true;
+    if (JS_ScanSnapshotHazards(rt, NULL) != 0) {
+        fprintf(stderr, "FAIL: %-34s scan reported a hazard in an empty "
+                        "snapshot\n", e->enum_name);
+        ok = false;
+    }
+
+    char buf[1024];
+    snprintf(buf, sizeof buf, "globalThis.HAZ = (%s), 1", e->ctor);
+    JSValue v = JS_Eval(ctx, buf, strlen(buf), e->enum_name, JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(v)) {
+        fprintf(stderr, "FAIL: %-34s constructor threw\n", e->enum_name);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        ok = false;
+    }
+    JS_FreeValue(ctx, v);
+
+    FILE *devnull = fopen("/dev/null", "w");
+    int n = JS_ScanSnapshotHazards(rt, devnull ? devnull : stderr);
+    if (devnull) fclose(devnull);
+    if (n < 1) {
+        fprintf(stderr,
+            "FAIL: %-34s is marked REFUSED but JS_ScanSnapshotHazards found\n"
+            "      nothing. Either the refusal regressed, or this class is now\n"
+            "      isolatable and the entry should become MUTATE.\n",
+            e->enum_name);
+        ok = false;
+    }
+    js_dual_arena_free(JS_GetDualArena(rt));
+    return ok;
+}
 
 static JSValue eval_q(JSContext *ctx, const char *src, const char *label,
                       bool *threw)
@@ -340,6 +396,7 @@ int main(void)
     for (int i = 0; i < TABLE_LEN; i++) {
         const ClsEntry *e = &TABLE[i];
         if (e->kind != MUTATE && e->kind != KNOWN_GAP) { n_skip++; continue; }
+        /* REFUSED entries are handled in check_refused(), in their own runtime. */
         char buf[1024];
         snprintf(buf, sizeof buf, "globalThis.MK_%u = (%s), 1", e->id, e->ctor);
         bool threw;
@@ -368,6 +425,14 @@ int main(void)
 
     for (int i = 0; i < TABLE_LEN; i++) {
         const ClsEntry *e = &TABLE[i];
+        if (e->kind == REFUSED) {
+            if (check_refused(e))
+                printf("  REF %-34s %s\n", e->enum_name, e->note);
+            else
+                nfail++;
+            nref++;
+            continue;
+        }
         if (e->kind == KNOWN_GAP) {
             if (check_class(rt, ctx, e, false)) {
                 fprintf(stderr,
@@ -402,8 +467,8 @@ int main(void)
             "%d structural failure(s).\n", nred, nfail);
         return 1;
     }
-    printf("\nPASS: every registered class is classified; %d clean, %d known "
-           "gap(s) still open.\n", n_mut - ngap, ngap);
+    printf("\nPASS: every registered class is classified; %d clean, %d "
+           "refused at freeze, %d known gap(s).\n", n_mut - ngap, nref, ngap);
     if (ngap)
         printf("      Known gaps are asserted to still be broken — fixing one "
                "turns this test red\n      until the entry is promoted.\n");

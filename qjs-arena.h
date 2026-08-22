@@ -190,6 +190,30 @@ JS_EXTERN JSRuntime *JS_NewRuntimeArena(size_t base_size,
                                         size_t request_size);
 JS_EXTERN void JS_FreezeRuntime(JSRuntime *rt);
 
+/* Reports snapshot state that cannot be isolated per request: pending
+ * promises, generators, async generators, and FinalizationRegistry.
+ * Writes a human-readable report to `out_FILE` (a FILE*, or NULL for
+ * stderr) naming each offender AND where it is reachable, e.g.
+ *
+ *   arenajs: the snapshot contains state that cannot be isolated per request:
+ *     pending Promise        at globalThis.platform.warmup
+ *                            resolve it before freezing, or create it per
+ *                            request (a settled Promise is fine)
+ *
+ * Returns the number of offenders (0 = clean), or -1 if the scan itself
+ * could not run. Cheap when clean: a class-id check per object, and the
+ * graph walk only happens once something has been found.
+ *
+ * JS_FreezeRuntime calls this and aborts if it is non-zero. Call it
+ * yourself BEFORE freezing to fail your own way — useful if you build
+ * more than one snapshot (worker, offline sim, browser replay), since
+ * otherwise the same mistake has to be diagnosed once per context.
+ *
+ * A SETTLED promise with no pending reactions is deliberately allowed:
+ * Promise.resolve(x) as a memoised value is reasonable in a snapshot,
+ * and its only base write is a debug-only flag. */
+JS_EXTERN int JS_ScanSnapshotHazards(JSRuntime *rt, void *out_FILE);
+
 /* Marks every base-resident ArrayBuffer immutable. Called by
    JS_FreezeRuntime: snapshot buffer bytes are base memory, so a write
    through any view would mutate the snapshot and be visible to every
