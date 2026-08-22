@@ -40,6 +40,39 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**Fixed: base closure cells (`JSVarRef`) are copy-on-write.** A
+snapshot closure's captured variables live in base, so assigning one
+wrote the snapshot and the value carried into the next request — a
+cross-request, therefore cross-tenant, channel in the most ordinary
+snapshot shape there is, since `globalThis.x = (function(){ let state
+= ...; return {...}; })()` is simply how a module is written. A base
+counter read 1, 2, 3 across three requests and dirtied two base pages
+each time.
+
+Scope, probed rather than reasoned. **Leaks:** a variable captured by
+a closure that escapes into the snapshot *and* reassigned after freeze.
+**Clean and unchanged:** top-level `let`/`const` in a
+`JS_EVAL_TYPE_GLOBAL` script (the global lexical environment is already
+shadowed), top-level `var`, a property on a base object, a captured
+`const` object whose *property* is mutated, and any captured variable
+that is only read. The line is that mutating what a captured variable
+*points at* was always fine; rebinding the variable was not.
+
+Copy-on-write keyed on the **cell**, not the closure that reached it —
+several closures routinely share one cell, and they must all resolve to
+the same shadow or isolation is bought by breaking sharing. Costs
++1.8 ns (+5%) on base closure read+write and nothing on request-local
+access.
+
+⚠ **Guidance interaction worth knowing** (surfaced by rove): enclosing
+a shim in an IIFE *moves* its top-level bindings from the clean
+category into the leaking one, because global lexicals are shadowed and
+closure cells were not. "Wrap your shims" — the usual fix for a
+name-reachability leak — was therefore incomplete advice on its own and
+needed "and keep module scope `const`" beside it. This release closes
+the trap either way, but the pairing still matters for anyone on an
+older pin.
+
 **Fixed: base `Date` objects are copy-on-write.** A Date's time value
 lives in `u.object_data`, inside the `JSObject` itself, so for a
 base-resident Date the setters wrote snapshot memory and the mutation
