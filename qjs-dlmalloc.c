@@ -15,6 +15,12 @@
 #define ONLY_MSPACES 1
 #define HAVE_MMAP 0
 #define HAVE_MORECORE 0
+/* HAVE_MREMAP 0 explicitly: dlmalloc otherwise takes its `#ifndef HAVE_MREMAP
+   / #ifdef linux` branch, which sets HAVE_MREMAP 1 and #defines _GNU_SOURCE to
+   expose mremap(). Every build here already passes -D_GNU_SOURCE, so that is a
+   macro redefinition -- a warning normally, an error under QJS_BUILD_WERROR
+   (the release job). mremap is unreachable with HAVE_MMAP 0 regardless. */
+#define HAVE_MREMAP 0
 #define USE_LOCKS 0
 #define NO_MALLOC_STATS 1
 
