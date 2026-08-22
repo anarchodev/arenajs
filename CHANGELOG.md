@@ -40,6 +40,29 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.4.0] - 2026-08-21
+
+The **base-isolation release**. A crash filed against the embedder
+(rove#735) turned out to be one instance of a much larger hole: the
+shadow mechanism protected a base object's *named properties* and
+nothing else, so every other kind of per-object mutable state — array
+elements, buffer bytes, closure cells, iterator cursors, a Date's time
+value — was written straight into the snapshot and carried into the
+next request. On a multi-tenant worker that is a cross-request channel,
+and in two cases a dangling pointer. Six families closed by
+copy-on-write or immutability, four kinds of state refused at freeze
+because isolating them has no non-arbitrary meaning, and a
+class-table-driven test that fails when a new class is added
+unclassified so this cannot silently regrow.
+
+MINOR: two new exports (`JS_ScanSnapshotHazards`,
+`JS_MarkAllBaseArrayBuffersImmutable`); every existing export keeps its
+name, signature and return codes. The ⚠ items change *when* an
+already-invalid program aborts, not any working program's behaviour —
+`make test262` is byte-identical to the previous release throughout.
+
 **⚠ Contract — `JS_FreezeRuntime` now refuses a snapshot holding state
 that cannot be isolated per request**, and aborts with a report naming
 each offender and *where it is reachable*. New public
