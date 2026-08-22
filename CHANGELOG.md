@@ -5,7 +5,7 @@ here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is [Semantic Versioning](https://semver.org/) applied to
 the contract, not to the fork as a whole.
 
-**Base:** quickjs-ng 0.14.0. arenajs versions independently; the
+**Base:** quickjs-ng 0.15.1. arenajs versions independently; the
 upstream base is recorded here as lineage metadata and is not coupled
 to arenajs's release cadence.
 
@@ -40,7 +40,60 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Upstream sync — quickjs-ng 0.14.0 → 0.15.1
+
+First of a staged catch-up with upstream; 28 commits. Merged rather
+than rebased, and cut at a release tag rather than at `master`, so each
+landing has a bounded diff and its own run of the arena harnesses.
+Three conflicts, all in `build_backtrace`, all the same shape: upstream
+`e1c1e41` duplicates `error_val` into a local to fix a use-after-free
+when a `DynBuf` OOM frees the current exception, while our side had
+de-globalised the reentrancy flag onto `rt->req` and moved
+`ctx->error_back_trace` behind accessors. Resolution takes upstream's
+lifetime fix and keeps the per-request state; every `goto done` path
+reaches the new `JS_FreeValue`.
+
+MINOR: no `arena_*` export changes, no wire-format changes. New
+**JS-visible surface** an embedded program can now use — explicit
+resource management (`using`, `await using`, `DisposableStack`,
+`AsyncDisposableStack`) — plus upstream additions to `quickjs.h`
+(`JS_NewUint64`, the `JS_FreeValues`/`JS_FreeAtoms` vararg macros,
+`JS_ABORT_ON_LEAKS`). `__JS_NewShortBigInt` moved out of `quickjs.h`
+into `quickjs.c`; it is `__`-prefixed internal API and no embedder in
+this tree or in rove referenced it.
+
+Inherited fixes that matter here rather than generally: the
+`build_backtrace` use-after-free above, a fast-array expansion overflow
+(`a653771`) and the completion of the fast-array delete use-after-free
+fix (`da49a37`) — both in the same element storage our base fast-array
+copy-on-write shadows — and two source-position corrections the trace
+UI reads, `source_loc` around `iterator_close` so a `for`/`of`
+`return()` frame reports the right line (`bcac5c2`) and column
+reporting for invalid number literals (`19fa597`).
+
+### Fixed
+
+**Base-resident `DisposableStack` and `AsyncDisposableStack` are now
+copy-on-write.** The two classes arrive with their state — a `disposed`
+flag and a growable `resources[]` array — hanging off `u.opaque`, so
+the shallow struct copy in `js_clone_jsobject_for_write` left a
+shadowed stack pointing at the snapshot's own struct: `use()`,
+`defer()` and `adopt()` appended to the *snapshot's* resource list and
+`dispose()` flipped the *snapshot's* flag, so request 2 inherited
+request 1's registered resources and could find the stack already
+disposed. Growing `resources[]` past capacity is the worse case — the
+`js_realloc` relocates a base table into the request arena, which is
+rove#735's failure mode. Closed the same way as the iterator cursors:
+the state struct and its array are copied into the request arena on
+shadow creation, and the four mutating entry points plus the dispose
+path resolve through `JS_GetOpaqueForWrite`. The `disposed` getter
+stays a plain read, so inspecting a base stack still costs no shadow.
+
+`arena-baseclass` found this the turn the merge landed, by design — it
+renumbered against the class enum, reported the two new ids as
+unclassified, and then reported the base writes once they were given
+mutation ops. The matrix is now 34 clean / 4 refused at freeze / 0
+known gaps.
 
 ## [0.4.0] - 2026-08-21
 
