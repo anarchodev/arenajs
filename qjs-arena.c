@@ -680,6 +680,19 @@ void JS_FreezeRuntime(JSRuntime *rt)
           write into snapshot memory.
        3. Flip the dual arena to request mode.
        4. Relocate JSRequestState into the request arena. */
+    /* 0. Refuse a snapshot holding state that cannot be isolated per
+       request. Done FIRST, and at freeze rather than at first use: a
+       snapshot is built once at startup where whoever built it sees the
+       error, whereas a first-use failure surfaces on a request and is
+       attributed to a tenant who did nothing wrong. The scan reports
+       where each offender is reachable — see JS_ScanSnapshotHazards. */
+    if (JS_ScanSnapshotHazards(rt, NULL) > 0) {
+        fprintf(stderr,
+                "arenajs: refusing to freeze. Call JS_ScanSnapshotHazards() "
+                "before JS_FreezeRuntime()\n         to detect this without "
+                "aborting.\n");
+        abort();
+    }
     JS_ForceAllAutoinit(rt);
     JS_MarkAllPrototypes(rt);
     /* 2b. Snapshot ArrayBuffers become immutable: their bytes are base

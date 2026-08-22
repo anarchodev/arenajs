@@ -40,6 +40,56 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+**⚠ Contract — `JS_FreezeRuntime` now refuses a snapshot holding state
+that cannot be isolated per request**, and aborts with a report naming
+each offender and *where it is reachable*. New public
+`JS_ScanSnapshotHazards(rt, FILE*)` performs the same scan without
+aborting, so an embedder can check before freezing and fail its own
+way — which matters when the same prelude is frozen into several
+contexts (a worker, an offline sim, a browser replay arena), since
+otherwise one mistake has to be diagnosed once per context.
+
+Refused: **pending promises, generators, async generators,
+FinalizationRegistry**. Allowed, deliberately: a **settled** promise
+with no pending reactions — `Promise.resolve(x)` as a memoised value is
+reasonable in a snapshot, and its only base write is a debug-only flag.
+
+The pending-promise case is not a tidiness problem. After the first
+`.then()`, the base promise's reaction-list head points *into the
+request arena*, and the reset recycles it. Later requests report zero
+changed bytes — which reads as benign and is not: the bump allocator is
+deterministic, so it hands back the same address and the pointer is
+rewritten identically. It is a latent dangling pointer wearing a clean
+diff, so refusing removes a crash rather than tidying a visibility
+problem.
+
+For the others the objection is that copy-on-write has no
+non-arbitrary meaning. A generator half-consumed at freeze would
+restart mid-body every request — defensible, arbitrary, and not
+something anyone writing `function*` in a prelude is reasoning about.
+Copying a promise's reaction list would make a resolution in request N
+invisible to N+1: correct isolation that contradicts intent, which is
+the worst kind of thing to debug from a support ticket.
+FinalizationRegistry entries carry weak-ref bookkeeping that lives in
+base, and its callbacks can never fire in an arena runtime anyway.
+
+The report gives a path, not just a class, because an embedder hitting
+this is looking at twenty prelude files with no line number and the
+object has no creation site:
+
+```
+arenajs: the snapshot contains state that cannot be isolated per request:
+  pending Promise        at globalThis.platform.warmup
+                         resolve it before freezing, or create it per request
+  Generator              at globalThis.tasks.queue[0]
+  FinalizationRegistry   at globalThis["weird-key"].reg
+  AsyncGenerator         (not reachable from the globals — held by a closure)
+```
+
+Cheap when clean: a class-id check per object, with the graph walk only
+running once something has been found, and its scratch sized to the
+actual object count.
+
 **Fixed: base iterators are copy-on-write.** An iterator keeps its
 cursor in a heap struct hanging off `u`, and the shadow's shallow copy
 of that union left the pointer aiming at the snapshot's struct — so

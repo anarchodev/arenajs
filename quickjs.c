@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include <string.h>
 #include <assert.h>
 #if !defined(_MSC_VER)
@@ -62276,6 +62277,308 @@ typedef struct JSFinalizationRegistryData {
     JSContext *ctx;
     JSValue cb;
 } JSFinalizationRegistryData;
+
+/* ---- arena: snapshot hazard scan ----
+ *
+ * Four kinds of object cannot be isolated per request, and unlike an
+ * array or an iterator there is no non-arbitrary answer for what
+ * copy-on-write would even mean:
+ *
+ *   pending Promise   copying the reaction list makes a resolution in
+ *                     request N invisible to N+1 — correct isolation
+ *                     that contradicts what the author meant. Worse, as
+ *                     things stand the base promise's reaction-list head
+ *                     is left pointing INTO the request arena after the
+ *                     first .then(), and the reset recycles it. Later
+ *                     requests report zero changed bytes only because
+ *                     the bump allocator is deterministic and hands back
+ *                     the same address, so the pointer is rewritten
+ *                     identically. That is a latent dangling pointer
+ *                     wearing a clean diff, not a tidiness problem.
+ *   generator /       copying a suspended frame means a generator that
+ *   async generator   was half-consumed at freeze restarts mid-body every
+ *                     request. Defensible, arbitrary, and nobody writing
+ *                     `function*` in a prelude is reasoning about it.
+ *   FinalizationRegistry
+ *                     its entries carry weak-ref registrations whose
+ *                     bookkeeping lives in base, so copying them is not
+ *                     cheap — and its callbacks can never fire in an
+ *                     arena runtime, because request objects die with
+ *                     the arena and base objects are immortal. A
+ *                     snapshot-resident registry is a hazard with no
+ *                     upside.
+ *
+ * A SETTLED promise with no pending reactions is deliberately allowed:
+ * its only base write is the debug-only is_handled flag, and
+ * Promise.resolve(x) as a memoised value is a reasonable thing to put in
+ * a snapshot.
+ *
+ * The scan reports WHERE, not just WHAT. An embedder hitting this is
+ * looking at twenty prelude files with no line number, and the object
+ * has no creation site to report — but it does have a reachability
+ * path, so we walk the object graph from the globals and name it as
+ * e.g. `globalThis.platform.warmup`. A diagnostic that says only THAT
+ * something is refused, without WHERE, is the kind of signal that
+ * carries no information: its absence would prompt a question, and a
+ * useless one closes it.
+ */
+
+typedef enum {
+    HAZ_NONE = 0,
+    HAZ_PENDING_PROMISE,
+    HAZ_GENERATOR,
+    HAZ_ASYNC_GENERATOR,
+    HAZ_FINALIZATION_REGISTRY,
+} JSSnapshotHazard;
+
+static const char *js_hazard_name(JSSnapshotHazard h)
+{
+    switch (h) {
+    case HAZ_PENDING_PROMISE:        return "pending Promise";
+    case HAZ_GENERATOR:              return "Generator";
+    case HAZ_ASYNC_GENERATOR:        return "AsyncGenerator";
+    case HAZ_FINALIZATION_REGISTRY:  return "FinalizationRegistry";
+    default:                         return "?";
+    }
+}
+
+static const char *js_hazard_advice(JSSnapshotHazard h)
+{
+    switch (h) {
+    case HAZ_PENDING_PROMISE:
+        return "resolve it before freezing, or create it per request "
+               "(a settled Promise is fine)";
+    case HAZ_GENERATOR:
+    case HAZ_ASYNC_GENERATOR:
+        return "call the generator function per request instead of "
+               "storing the generator";
+    case HAZ_FINALIZATION_REGISTRY:
+        return "construct it per request; its callbacks cannot fire in "
+               "an arena runtime anyway";
+    default:
+        return "";
+    }
+}
+
+static JSSnapshotHazard js_snapshot_hazard(JSObject *p)
+{
+    switch (p->class_id) {
+    case JS_CLASS_PROMISE: {
+        JSPromiseData *s = p->u.promise_data;
+        if (!s)
+            return HAZ_NONE;
+        /* Settled AND nothing queued: effectively immutable. */
+        if (s->promise_state != JS_PROMISE_PENDING &&
+            list_empty(&s->promise_reactions[0]) &&
+            list_empty(&s->promise_reactions[1]))
+            return HAZ_NONE;
+        return HAZ_PENDING_PROMISE;
+    }
+    case JS_CLASS_GENERATOR:
+        return p->u.generator_data ? HAZ_GENERATOR : HAZ_NONE;
+    case JS_CLASS_ASYNC_GENERATOR:
+        return p->u.async_generator_data ? HAZ_ASYNC_GENERATOR : HAZ_NONE;
+    case JS_CLASS_FINALIZATION_REGISTRY:
+        return HAZ_FINALIZATION_REGISTRY;
+    default:
+        return HAZ_NONE;
+    }
+}
+
+/* Breadth-first walk of the object graph from the globals, so a hazard
+   can be named by where it is reachable rather than only by its class.
+   Nodes record their parent and the property that reached them; a path
+   is reconstructed by walking back. Deliberately covers named
+   properties and fast-array elements only — that is what "find it in my
+   prelude" means. Anything reachable solely through a closure cell has
+   no property path and is reported without one rather than guessed at. */
+
+typedef struct {
+    JSObject *obj;
+    int       parent;   /* index into nodes[], -1 for a root */
+    JSAtom    atom;     /* property that reached it; JS_ATOM_NULL for roots */
+    uint32_t  index;    /* array index when atom == JS_ATOM_NULL and parent >= 0 */
+    bool      is_index;
+} JSHazNode;
+
+typedef struct {
+    JSHazNode *nodes;
+    int        count, capacity;
+    JSObject **seen;    /* open-addressed pointer set, power of two */
+    uint32_t   seen_size;
+} JSHazWalk;
+
+static bool haz_seen_add(JSHazWalk *w, JSObject *p)
+{
+    if (w->seen_size == 0)
+        return false;
+    uint32_t mask = w->seen_size - 1;
+    uint32_t i = js_shadow_hash(p, mask);
+    for (;;) {
+        if (!w->seen[i]) { w->seen[i] = p; return true; }
+        if (w->seen[i] == p) return false;
+        i = (i + 1) & mask;
+    }
+}
+
+static int haz_push(JSHazWalk *w, JSObject *p, int parent, JSAtom atom,
+                    uint32_t index, bool is_index)
+{
+    if (!p || !haz_seen_add(w, p))
+        return -1;
+    if (w->count == w->capacity)
+        return -1;   /* graph larger than the budget; stop descending */
+    JSHazNode *n = &w->nodes[w->count];
+    n->obj = p; n->parent = parent; n->atom = atom;
+    n->index = index; n->is_index = is_index;
+    return w->count++;
+}
+
+static void haz_print_path(JSContext *ctx, JSHazWalk *w, int idx, FILE *out)
+{
+    /* Reconstruct root-first. */
+    int chain[64], n = 0;
+    while (idx >= 0 && n < 64) { chain[n++] = idx; idx = w->nodes[idx].parent; }
+    fprintf(out, "globalThis");
+    for (int i = n - 2; i >= 0; i--) {   /* skip the root node itself */
+        JSHazNode *node = &w->nodes[chain[i]];
+        if (node->is_index) {
+            fprintf(out, "[%u]", node->index);
+        } else {
+            const char *nm = JS_AtomToCString(ctx, node->atom);
+            /* Print .name when it is a plain identifier, ["name"] otherwise. */
+            bool ident = nm && (isalpha((unsigned char)nm[0]) || nm[0] == '_' || nm[0] == '$');
+            for (const char *q = nm; ident && *q; q++)
+                if (!isalnum((unsigned char)*q) && *q != '_' && *q != '$')
+                    ident = false;
+            if (ident) fprintf(out, ".%s", nm);
+            else       fprintf(out, "[\"%s\"]", nm ? nm : "?");
+            if (nm) JS_FreeCString(ctx, nm);
+        }
+    }
+}
+
+#define JS_HAZ_MAX_NODES 200000
+
+int JS_ScanSnapshotHazards(JSRuntime *rt, void *out_FILE)
+{
+    FILE *out = out_FILE ? (FILE *)out_FILE : stderr;
+    struct list_head *el;
+    int found = 0;
+
+    /* Cheap pre-pass: if nothing is hazardous, skip the graph walk
+       entirely — the normal case pays only a class-id switch per
+       object. */
+    bool any = false;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        if (js_snapshot_hazard((JSObject *)h) != HAZ_NONE) { any = true; break; }
+    }
+    if (!any)
+        return 0;
+
+    JSContext *ctx = list_empty(&rt->context_list) ? NULL
+        : list_entry(rt->context_list.next, JSContext, link);
+    if (!ctx)
+        return -1;
+
+    /* Size the scratch to the actual object count rather than a fixed
+       maximum: a snapshot arena can be a few megabytes, and a
+       multi-megabyte fixed allocation here fails on exactly the small
+       runtimes that are cheapest to check. */
+    size_t nobj = 0;
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT)
+            nobj++;
+    }
+    if (nobj > JS_HAZ_MAX_NODES)
+        nobj = JS_HAZ_MAX_NODES;
+    uint32_t seen_size = 16;
+    while (seen_size < nobj * 2 && seen_size < (1u << 22))
+        seen_size <<= 1;
+
+    JSHazWalk w = { 0 };
+    w.capacity  = (int)nobj + 2;   /* + the two global roots */
+    w.nodes     = js_mallocz_rt(rt, sizeof(*w.nodes) * (size_t)w.capacity);
+    w.seen_size = seen_size;
+    w.seen      = js_mallocz_rt(rt, sizeof(*w.seen) * (size_t)w.seen_size);
+    if (!w.nodes || !w.seen) {
+        js_free_rt(rt, w.nodes); js_free_rt(rt, w.seen);
+        return -1;
+    }
+
+    list_for_each(el, &rt->context_list) {
+        JSContext *c = list_entry(el, JSContext, link);
+        if (JS_VALUE_GET_TAG(c->global_obj) == JS_TAG_OBJECT)
+            haz_push(&w, JS_VALUE_GET_OBJ(c->global_obj), -1, JS_ATOM_NULL, 0, false);
+        if (JS_VALUE_GET_TAG(c->global_var_obj) == JS_TAG_OBJECT)
+            haz_push(&w, JS_VALUE_GET_OBJ(c->global_var_obj), -1, JS_ATOM_NULL, 0, false);
+    }
+
+    for (int i = 0; i < w.count; i++) {
+        JSObject *p = w.nodes[i].obj;
+        JSShape *sh = p->shape;
+        if (sh) {
+            for (int k = 0; k < sh->prop_count; k++) {
+                JSShapeProperty *prs = &sh->prop[k];
+                if (prs->atom == JS_ATOM_NULL)
+                    continue;
+                if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                    continue;   /* getters/autoinit: do not invoke anything */
+                JSValue v = p->prop[k].u.value;
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
+                    haz_push(&w, JS_VALUE_GET_OBJ(v), i, prs->atom, 0, false);
+            }
+        }
+        if (p->fast_array &&
+            (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS)) {
+            for (uint32_t k = 0; k < p->u.array.count; k++) {
+                JSValue v = p->u.array.u.values[k];
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT)
+                    haz_push(&w, JS_VALUE_GET_OBJ(v), i, JS_ATOM_NULL, k, true);
+            }
+        }
+    }
+
+    /* Report every hazardous object, whether or not the walk found a
+       path to it — a hazard reachable only through a closure cell still
+       has to be reported, just without a location. */
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *h = list_entry(el, JSGCObjectHeader, link);
+        if (h->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        JSObject *p = (JSObject *)h;
+        JSSnapshotHazard hz = js_snapshot_hazard(p);
+        if (hz == HAZ_NONE)
+            continue;
+        if (found == 0)
+            fprintf(out, "arenajs: the snapshot contains state that cannot be "
+                         "isolated per request:\n");
+        int at = -1;
+        for (int i = 0; i < w.count; i++)
+            if (w.nodes[i].obj == p) { at = i; break; }
+        fprintf(out, "  %-22s ", js_hazard_name(hz));
+        if (at >= 0) {
+            fprintf(out, "at ");
+            haz_print_path(ctx, &w, at, out);
+        } else {
+            fprintf(out, "(not reachable from the globals — held by a "
+                         "closure or an internal reference)");
+        }
+        fprintf(out, "\n                         %s\n", js_hazard_advice(hz));
+        found++;
+    }
+    if (found)
+        fflush(out);
+
+    js_free_rt(rt, w.nodes);
+    js_free_rt(rt, w.seen);
+    return found;
+}
+
 
 static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
 {
