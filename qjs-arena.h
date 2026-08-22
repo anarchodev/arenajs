@@ -95,8 +95,13 @@ JS_EXTERN size_t js_dual_arena_oom_limit(const JSDualArena *da);
  */
 #define JS_ARENA_RANGES_MAX 16
 struct js_arena_range { const uint8_t *lo, *hi; };
-extern __thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
-extern __thread int                   js_arena_range_count;
+/* JS_EXTERN so a shared build exports them: js_arena_ptr_is_base() below is
+   a static inline compiled into every consumer (the arena-* harnesses among
+   them), so each one references these TLS symbols directly. Without the
+   visibility attribute -fvisibility=hidden keeps them internal to libqjs and
+   linking any consumer against a shared build fails. */
+extern JS_EXTERN __thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
+extern JS_EXTERN __thread int                   js_arena_range_count;
 
 static inline bool js_arena_ptr_is_base(const void *p)
 {
