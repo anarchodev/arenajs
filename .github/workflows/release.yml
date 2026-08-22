@@ -99,6 +99,13 @@ jobs:
           path: build/*-darwin-${{matrix.arch}}
 
   windows:
+    # arenajs: DISABLED, same reason as the windows-* jobs in ci.yml --
+    # qjs-arena.c is POSIX-only (mmap/mprotect/sigaction/SIGSEGV drive the
+    # thermometer and hard-mprotect enforcement), so the build dies on
+    # sys/mman.h. This fork publishes no Windows binaries; rove consumes
+    # qjs_arena_wasm via the CMake package. Re-enable together with the
+    # ci.yml jobs once the arena has a VirtualAlloc/VirtualProtect backend.
+    if: false
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -165,7 +172,7 @@ jobs:
             build/qjs-wasi-reactor.wasm
 
   upload-to-release:
-    needs: [linux, macos, windows, wasi, check_meson_version]
+    needs: [linux, macos, wasi, check_meson_version]  # windows: see above
     runs-on: ubuntu-22.04
     steps:
       - name: get assets
