@@ -5200,10 +5200,6 @@ bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id)
 JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id)
 {
     if (JS_IsRegisteredClass(rt, class_id)) {
-        /* .class_id is the numeric id; the name lives in .class_name.
-           Returning the former handed callers an arbitrary atom index
-           (class 1 -> atom 1 -> "null", class 2 -> "false", ...).
-           Upstream quickjs-ng bug, introduced with the API in 307a59f. */
         return JS_DupAtomRT(rt, rt->class_array[class_id].class_name);
     } else {
         return JS_ATOM_NULL;
@@ -7507,48 +7503,21 @@ JSValue JS_NewObjectProto(JSContext *ctx, JSValueConst proto)
 JSValue JS_NewObjectFrom(JSContext *ctx, int count, const JSAtom *props,
                          const JSValue *values)
 {
-    JSShapeProperty *pr;
-    uint32_t *hash;
-    JSRuntime *rt;
-    JSObject *p;
-    JSShape *sh;
     JSValue obj;
-    JSAtom atom;
-    intptr_t h;
     int i;
 
-    rt = ctx->rt;
     obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         return JS_EXCEPTION;
-    if (count > 0) {
-        p = JS_VALUE_GET_OBJ(obj);
-        sh = p->shape;
-        assert(sh->is_hashed);
-        assert(JS_REF_COUNT(sh) == 1);
-        js_shape_hash_unlink(rt, sh);
-        if (resize_properties(ctx, &sh, p, count)) {
-            js_shape_hash_link(rt, sh);
-            JS_FreeValue(ctx, obj);
-            return JS_EXCEPTION;
-        }
-        p->shape = sh;
-        for (i = 0; i < count; i++) {
-            atom = props[i];
-            pr = &get_shape_prop(sh)[i];
-            sh->hash = shape_hash(shape_hash(sh->hash, atom), JS_PROP_C_W_E);
-            h = atom & sh->prop_hash_mask;
-            hash = &prop_hash_end(sh)[-h - 1];
-            pr->hash_next = *hash;
-            *hash = i + 1;
-            pr->atom = JS_DupAtom(ctx, atom);
-            pr->flags = JS_PROP_C_W_E;
-            p->prop[i].u.value = values[i];
-        }
-        js_shape_hash_link(rt, sh);
-        sh->prop_count = count;
-    }
+    for (i = 0; i < count; i++)
+        if (JS_SetProperty(ctx, obj, props[i], values[i]) < 0)
+            goto fail;
     return obj;
+fail:
+    for (/*empty*/; i < count; i++)
+        JS_FreeValue(ctx, values[i]);
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
 }
 
 JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
@@ -10309,6 +10278,21 @@ static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
         ret = JS_NULL;
         break;
     }
+    /* arena: ctx->class_proto[] holds BASE pointers. A request that writes
+       one -- `Boolean.prototype.toString = f` -- gets a shadow, but every
+       primitive method lookup starts here, so without resolving to the
+       active object the chain walk begins at base and never sees the
+       shadow: `true.toString()` keeps calling the snapshot's method.
+
+       The effect is worse than a plain miss because it is inconsistent.
+       The same replacement IS visible through an ordinary object path, so a
+       request's change takes effect through some routes and not others.
+       Borrowed reference in, borrowed reference out; js_object_active is a
+       no-op outside arena mode. */
+    if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
+        JSObject *p = js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ret));
+        ret = JS_MKPTR(JS_TAG_OBJECT, p);
+    }
     return ret;
 }
 
@@ -10760,9 +10744,32 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
         JSObject *p_active = js_object_active(ctx->rt, p_orig);
         if (p_active != p_orig) {
             obj = JS_MKPTR(JS_TAG_OBJECT, p_active);
-            if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT
-                && JS_VALUE_GET_OBJ(this_obj) == p_orig)
-                this_obj = obj;
+            /* Deliberately do NOT swap this_obj to the shadow.
+             *
+             * Base is the identity JS observes; the shadow is storage,
+             * resolved here at the property-access boundary and never
+             * escaping into a pointer JS can compare. The inverse model --
+             * shadow as identity -- cannot work: a shadow is a separate
+             * allocation created lazily on first write, so
+             *
+             *     var before = Math;   // holds base
+             *     Math.foo = 1;        // shadow created here
+             *     before === Math      // would become false
+             *
+             * References already handed to JS cannot be rewritten, so
+             * shadow-identity flips mid-request at an arbitrary moment.
+             *
+             * Swapping the receiver leaked a shadow pointer into `this`,
+             * which made a shadowed object hold two JS-visible identities
+             * depending on the access path:
+             *
+             *     Object.defineProperty(Math, "p", {get(){ return this === Math }});
+             *     Math.p   // was false under arena, true on a vanilla runtime
+             *
+             * Removing the swap closed that and four other test262
+             * divergences, with cross-request isolation and the whole arena
+             * suite unaffected (0 base bytes over 17375 tests).
+             */
         }
     }
 
@@ -24260,6 +24267,7 @@ typedef struct JSToken {
     int line_num;   /* line number of token start */
     int col_num;    /* column number of token start */
     const uint8_t *ptr;
+    const uint8_t *line_start; /* first character of the line of token start */
     union {
         struct {
             JSValue str;
@@ -24293,6 +24301,7 @@ typedef struct JSParseState {
     const uint8_t *buf_start;
     const uint8_t *buf_ptr;
     const uint8_t *buf_end;
+    const uint8_t *line_start; /* first character of the current line */
     const uint8_t *eol;  // most recently seen end-of-line character
     const uint8_t *mark; // first token character, invariant: eol < mark
 
@@ -24453,13 +24462,8 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
     /* s->col_num is not advanced during token scanning, so derive the column
        as the 1-based offset of the token from the start of its line. */
     int err_col_num = s->token.col_num;
-    if (s->token.ptr && s->token.ptr >= s->buf_start) {
-        const uint8_t *line_start = s->token.ptr;
-        while (line_start > s->buf_start &&
-               line_start[-1] != '\n' && line_start[-1] != '\r')
-            line_start--;
-        err_col_num = (int)(s->token.ptr - line_start) + 1;
-    }
+    if (s->token.ptr && s->token.ptr >= s->token.line_start)
+        err_col_num = (int)(s->token.ptr - s->token.line_start) + 1;
     build_backtrace(ctx, ctx->rt->req->current_exception, JS_UNDEFINED, s->filename,
                     s->token.line_num, err_col_num, backtrace_flags);
     return -1;
@@ -24559,6 +24563,7 @@ static __exception int js_parse_template_part(JSParseState *s,
         }
         if (c == '\n') {
             s->line_num++;
+            s->line_start = p;
             s->eol = &p[-1];
             s->mark = p;
         } else if (c >= 0x80) {
@@ -24652,6 +24657,7 @@ static __exception int js_parse_string(JSParseState *s, int sep,
                 p++;
                 if (sep != '`') {
                     s->line_num++;
+                    s->line_start = p;
                     s->eol = &p[-1];
                     s->mark = p;
                 }
@@ -24979,6 +24985,7 @@ static __exception int next_token(JSParseState *s)
     s->token.line_num = s->line_num;
     s->token.col_num = s->col_num;
     s->token.ptr = p;
+    s->token.line_start = s->line_start;
     c = *p;
     switch(c) {
     case 0:
@@ -25006,6 +25013,7 @@ static __exception int next_token(JSParseState *s)
     case '\n':
         p++;
     line_terminator:
+        s->line_start = p;
         s->eol = &p[-1];
         s->mark = p;
         s->got_lf = true;
@@ -25034,10 +25042,12 @@ static __exception int next_token(JSParseState *s)
                     s->line_num++;
                     s->got_lf = true; /* considered as LF for ASI */
                     s->eol = p++;
+                    s->line_start = p;
                     s->mark = p;
                 } else if (*p == '\r') {
                     s->got_lf = true; /* considered as LF for ASI */
                     p++;
+                    s->line_start = p;
                 } else if (*p >= 0x80) {
                     c = utf8_decode(p, &p);
                     /* ignore invalid UTF-8 in comments */
@@ -25625,6 +25635,7 @@ static __exception int json_next_token(JSParseState *s)
     s->token.line_num = s->line_num;
     s->token.col_num = s->col_num;
     s->token.ptr = p;
+    s->token.line_start = s->line_start;
     c = *p;
     switch(c) {
     case 0:
@@ -25650,6 +25661,7 @@ static __exception int json_next_token(JSParseState *s)
     case '\n':
         s->line_num++;
         s->eol = p++;
+        s->line_start = p;
         s->mark = p;
         goto redo;
     case '\f':
@@ -26882,6 +26894,7 @@ typedef struct JSParsePos {
     int col_num;
     bool got_lf;
     const uint8_t *ptr;
+    const uint8_t *line_start;
     const uint8_t *eol;
     const uint8_t *mark;
 } JSParsePos;
@@ -26893,6 +26906,7 @@ static int js_parse_get_pos(JSParseState *s, JSParsePos *sp)
     sp->line_num = s->token.line_num;
     sp->col_num = s->token.col_num;
     sp->ptr = s->token.ptr;
+    sp->line_start = s->line_start;
     sp->eol = s->eol;
     sp->mark = s->mark;
     sp->got_lf = s->got_lf;
@@ -26906,6 +26920,7 @@ static __exception int js_parse_seek_token(JSParseState *s, const JSParsePos *sp
     s->line_num = sp->line_num;
     s->col_num = sp->col_num;
     s->buf_ptr = sp->ptr;
+    s->line_start = sp->line_start;
     s->eol = sp->eol;
     s->mark = sp->mark;
     s->got_lf = sp->got_lf;
@@ -29066,13 +29081,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         {
             JSAtom name;
             int identifier_line_num = s->token.line_num;
-            const uint8_t *identifier_line_start = s->token.ptr;
-            while (identifier_line_start > s->buf_start &&
-                   identifier_line_start[-1] != '\n' &&
-                   identifier_line_start[-1] != '\r')
-                identifier_line_start--;
             int identifier_col_num =
-                (int)(s->token.ptr - identifier_line_start) + 1;
+                (int)(s->token.ptr - s->line_start) + 1;
             if (s->token.u.ident.is_reserved) {
                 return js_parse_error_reserved_identifier(s);
             }
@@ -38946,8 +38956,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         goto fail;
 
     function_size = sizeof(*b);
-    cpool_offset = function_size;
-    function_size += fd->cpool_count * sizeof(*fd->cpool);
+    cpool_offset = (function_size + 7) & ~7;
+    function_size = cpool_offset + fd->cpool_count * sizeof(*fd->cpool);
     vardefs_offset = function_size;
     function_size += (fd->arg_count + fd->var_count) * sizeof(*b->vardefs);
     closure_var_offset = function_size;
@@ -39992,6 +40002,7 @@ static void js_parse_init(JSContext *ctx, JSParseState *s,
     s->col_num = 1;
     s->buf_start = s->buf_ptr = (const uint8_t *)input;
     s->buf_end = s->buf_ptr + input_len;
+    s->line_start = s->buf_ptr;
     s->mark = s->buf_ptr + min_int(1, input_len);
     s->eol = s->buf_ptr;
     s->token.val = ' ';
@@ -41651,8 +41662,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
 
     function_size = sizeof(*b);
-    cpool_offset = function_size;
-    function_size += bc.cpool_count * sizeof(*bc.cpool);
+    cpool_offset = (function_size + 7) & ~7;
+    function_size = cpool_offset + bc.cpool_count * sizeof(*bc.cpool);
     vardefs_offset = function_size;
     function_size += local_count * sizeof(*bc.vardefs);
     closure_var_offset = function_size;
@@ -42849,7 +42860,7 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
                                   const JSCFunctionListEntry *proto_fields, int n_proto_fields,
                                   int flags)
 {
-    JSValue ctor = JS_UNDEFINED, proto, parent_proto;
+    JSValue ctor = JS_UNDEFINED, proto, parent_proto, *class_proto;
     int proto_class_id, proto_flags, ctor_flags;
 
     proto_flags = 0;
@@ -42880,8 +42891,12 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
                                             n_proto_fields + 1);
         if (JS_IsException(proto))
             goto fail;
-        if (class_id >= 0)
-            ctx->class_proto[class_id] = js_dup(proto);
+        if (class_id >= 0) {
+            class_proto = &ctx->class_proto[class_id];
+            if (!JS_IsNull(*class_proto))
+                JS_FreeValue(ctx, *class_proto);
+            *class_proto = js_dup(proto);
+        }
     }
     if (JS_SetPropertyFunctionList(ctx, proto, proto_fields, n_proto_fields))
         goto fail;
@@ -43080,8 +43095,9 @@ static int js_obj_to_desc(JSContext *ctx, JSPropertyDescriptor *d,
     if (present) {
         flags |= JS_PROP_HAS_GET;
         getter = JS_GetProperty(ctx, desc, JS_ATOM_get);
-        if (JS_IsException(getter) ||
-            !(JS_IsUndefined(getter) || JS_IsFunction(ctx, getter))) {
+        if (JS_IsException(getter))
+            goto fail;
+        if (!(JS_IsUndefined(getter) || JS_IsFunction(ctx, getter))) {
             JS_ThrowTypeError(ctx, "Getter must be a function");
             goto fail;
         }
@@ -43092,8 +43108,9 @@ static int js_obj_to_desc(JSContext *ctx, JSPropertyDescriptor *d,
     if (present) {
         flags |= JS_PROP_HAS_SET;
         setter = JS_GetProperty(ctx, desc, JS_ATOM_set);
-        if (JS_IsException(setter) ||
-            !(JS_IsUndefined(setter) || JS_IsFunction(ctx, setter))) {
+        if (JS_IsException(setter))
+            goto fail;
+        if (!(JS_IsUndefined(setter) || JS_IsFunction(ctx, setter))) {
             JS_ThrowTypeError(ctx, "Setter must be a function");
             goto fail;
         }
@@ -44765,6 +44782,37 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
     return js_dup(p->u.object_data);
 }
 
+/* arena: a "is `this` the home object?" guard compares against a BASE
+   pointer (ctx->class_proto[...]), but a request reaches it holding the
+   SHADOW of that prototype -- JS_SetPropertyInternal swaps this_obj to the
+   shadow in lockstep with the receiver. The comparison then misses and the
+   guard silently does not fire.
+
+   Consequences vary by caller and none of them are good:
+     - SetterThatIgnoresPrototypeProperties (Iterator.prototype.constructor,
+       .Symbol.toStringTag) falls through to JS_SetProperty(this_val, ...),
+       re-enters itself, and exhausts the stack.
+     - Error.prototype.stack's setter silently accepts an assignment the
+       spec requires it to reject.
+
+   Same class as the setPrototypeOf identity bug; js_object_base_identity()
+   maps a shadow back to the base identity it stands for. Any new upstream
+   code of this shape needs the same treatment, and it never shows up as a
+   merge conflict. */
+static bool js_is_home_object(JSContext *ctx, JSValueConst this_val,
+                              JSClassID class_id)
+{
+    JSValueConst home = ctx->class_proto[class_id];
+    if (js_same_value(ctx, this_val, home))
+        return true;
+    if (!ctx->rt->is_arena ||
+        JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_TAG(home) != JS_TAG_OBJECT)
+        return false;
+    return js_object_base_identity(ctx->rt, JS_VALUE_GET_OBJ(this_val)) ==
+           JS_VALUE_GET_OBJ(home);
+}
+
 static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
                                   JSValueConst value)
 {
@@ -44774,7 +44822,7 @@ static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeErrorNotAnObject(ctx);
     if (!JS_IsString(value))
         return JS_ThrowTypeError(ctx, "Error.prototype.stack setter expects a string");
-    if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR]))
+    if (js_is_home_object(ctx, this_val, JS_CLASS_ERROR))
         return JS_ThrowTypeError(ctx, "Error.prototype.stack setter called on the home object");
     ret = JS_GetOwnPropertyFlagsInternal(ctx, &flags, JS_VALUE_GET_OBJ(this_val),
                                          JS_ATOM_stack);
@@ -45507,6 +45555,8 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
     n = 0;
 
     for(k = 0; k < len; k++) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         if (special & special_TA) {
             val = JS_GetPropertyInt64(ctx, obj, k);
             if (JS_IsException(val))
@@ -45628,6 +45678,8 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
         acc = js_dup(argv[1]);
     } else {
         for(;;) {
+            if (js_poll_interrupts(ctx))
+                goto exception;
             if (k >= len) {
                 JS_ThrowTypeError(ctx, "empty array");
                 goto exception;
@@ -45649,6 +45701,8 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
         }
     }
     for (; k < len; k++) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         k1 = (special & special_reduceRight) ? len - k - 1 : k;
         if (special & special_TA) {
             val = JS_GetPropertyInt64(ctx, obj, k1);
@@ -45750,6 +45804,8 @@ static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
             }
         }
         for (; n < len; n++) {
+            if (js_poll_interrupts(ctx))
+                goto exception;
             val = JS_GetPropertyInt64(ctx, obj, n);
             if (JS_IsException(val))
                 goto exception;
@@ -45796,6 +45852,8 @@ static JSValue js_array_indexOf(JSContext *ctx, JSValueConst this_val,
             }
         }
         for (; n < len; n++) {
+            if (js_poll_interrupts(ctx))
+                goto exception;
             int present = JS_TryGetPropertyInt64(ctx, obj, n, &val);
             if (present < 0)
                 goto exception;
@@ -45825,6 +45883,7 @@ static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
     int64_t len, n;
     JSValue *arrp;
     uint32_t count;
+    int present;
 
     obj = JS_ToObject(ctx, this_val);
     if (js_get_length64(ctx, &len, obj))
@@ -45845,7 +45904,9 @@ static JSValue js_array_lastIndexOf(JSContext *ctx, JSValueConst this_val,
             }
         }
         for (; n >= 0; n--) {
-            int present = JS_TryGetPropertyInt64(ctx, obj, n, &val);
+            if (js_poll_interrupts(ctx))
+                goto exception;
+            present = JS_TryGetPropertyInt64(ctx, obj, n, &val);
             if (present < 0)
                 goto exception;
             if (present) {
@@ -45908,6 +45969,8 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) add fast path for fast arrays
     for(; k != end; k += dir) {
+        if (js_poll_interrupts(ctx))
+            goto exception;
         index_val = js_int64(k);
         val = JS_GetPropertyValue(ctx, obj, index_val);
         if (JS_IsException(val))
@@ -46628,11 +46691,6 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
         return 0;
 
     if (psc->has_method) {
-        /* custom sort function is specified as returning 0 for identical
-         * objects: avoid method call overhead.
-         */
-        if (!memcmp(&ap->val, &bp->val, sizeof(ap->val)))
-            goto cmp_same;
         argv[0] = ap->val;
         argv[1] = bp->val;
         res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
@@ -46667,7 +46725,6 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
     }
     if (cmp != 0)
         return cmp;
-cmp_same:
     /* make sort stable: compare array offsets */
     return (ap->pos > bp->pos) - (ap->pos < bp->pos);
 
@@ -47020,30 +47077,6 @@ static const JSCFunctionListEntry js_iterator_wrap_proto_funcs[] = {
 
 static int check_iterator(JSContext *ctx, JSValueConst obj);
 
-/* arena: SetterThatIgnoresPrototypeProperties compares `this` against the home
-   object (%Iterator.prototype%) and throws when they are the same. That guard
-   is an IDENTITY check against a BASE pointer, so a request reaches it holding
-   the SHADOW of the home object -- JS_SetPropertyInternal swaps this_obj to the
-   shadow in lockstep with the receiver. The comparison then misses, the setter
-   falls through to JS_SetProperty(this_val, ...), which re-enters the same
-   setter: unbounded recursion, and the stack goes.
-
-   Same class as the setPrototypeOf identity bug; same remedy. Reached by
-   test262 built-ins/Iterator/prototype/{constructor,Symbol.toStringTag}/
-   weird-setter.js, which the corpus bump in this merge brought in. */
-static bool js_iterator_is_home_object(JSContext *ctx, JSValueConst this_val)
-{
-    JSValueConst home = ctx->class_proto[JS_CLASS_ITERATOR];
-    if (js_same_value(ctx, this_val, home))
-        return true;
-    if (!ctx->rt->is_arena ||
-        JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
-        JS_VALUE_GET_TAG(home) != JS_TAG_OBJECT)
-        return false;
-    return js_object_base_identity(ctx->rt, JS_VALUE_GET_OBJ(this_val)) ==
-           JS_VALUE_GET_OBJ(home);
-}
-
 static JSValue js_iterator_constructor_getset(JSContext *ctx,
                                               JSValueConst this_val,
                                               int argc, JSValueConst *argv,
@@ -47058,7 +47091,7 @@ static JSValue js_iterator_constructor_getset(JSContext *ctx,
         // setter is registered with length 1 (see JS_AddIntrinsicBaseObjects).
         if (check_iterator(ctx, this_val) < 0)
             return JS_EXCEPTION;
-        if (js_iterator_is_home_object(ctx, this_val))
+        if (js_is_home_object(ctx, this_val, JS_CLASS_ITERATOR))
             return JS_ThrowTypeError(ctx, "Cannot assign to read only property");
         ret = JS_GetOwnProperty(ctx, NULL, this_val, JS_ATOM_constructor);
         if (ret < 0)
@@ -47967,7 +48000,7 @@ static JSValue js_iterator_proto_set_toStringTag(JSContext *ctx, JSValueConst th
 
     if (check_iterator(ctx, this_val) < 0)
         return JS_EXCEPTION;
-    if (js_iterator_is_home_object(ctx, this_val))
+    if (js_is_home_object(ctx, this_val, JS_CLASS_ITERATOR))
         return JS_ThrowTypeError(ctx, "Cannot assign to read only property");
     res = JS_GetOwnProperty(ctx, NULL, this_val, JS_ATOM_Symbol_toStringTag);
     if (res < 0)
@@ -54272,7 +54305,7 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
     int res;
     JSObject *p;
     JSValueConst args[2];
-    bool ret, res2;
+    bool ret;
 
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_has);
     if (!s)
@@ -54298,8 +54331,15 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
         if (res < 0)
             return -1;
         if (res) {
-            res2 = !(desc_flags & JS_PROP_CONFIGURABLE);
-            if (res2 || !p->extensible) {
+            if (!(desc_flags & JS_PROP_CONFIGURABLE))
+                goto inconsistent;
+            /* must go through IsExtensible(): the target can be a proxy
+               itself, whose isExtensible trap is observable */
+            res = JS_IsExtensible(ctx, s->target);
+            if (res < 0)
+                return -1;
+            if (!res) {
+            inconsistent:
                 JS_ThrowTypeError(ctx, "proxy: inconsistent has");
                 return -1;
             }
@@ -54495,7 +54535,14 @@ static int js_proxy_get_own_property(JSContext *ctx, JSPropertyDescriptor *pdesc
         js_free_desc(ctx, &target_desc);
     if (JS_IsUndefined(trap_result_obj)) {
         if (target_desc_ret) {
-            if (!(target_desc.flags & JS_PROP_CONFIGURABLE) || !p->extensible)
+            if (!(target_desc.flags & JS_PROP_CONFIGURABLE))
+                goto fail;
+            /* must go through IsExtensible(): the target can be a proxy
+               itself, whose isExtensible trap is observable */
+            res = JS_IsExtensible(ctx, s->target);
+            if (res < 0)
+                return -1;
+            if (!res)
                 goto fail;
         }
         ret = false;
@@ -54558,7 +54605,7 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
 {
     JSProxyData *s;
     JSValue method, ret1, prop_val, desc_val;
-    int res;
+    int res, extensible_target;
     JSObject *p;
     JSValueConst args[3];
     JSPropertyDescriptor desc;
@@ -54602,11 +54649,19 @@ static int js_proxy_define_own_property(JSContext *ctx, JSValueConst obj,
     res = JS_GetOwnPropertyInternal(ctx, &desc, p, prop);
     if (res < 0)
         return -1;
+    /* must go through IsExtensible(): the target can be a proxy itself, in
+       which case its isExtensible trap is observable and may throw */
+    extensible_target = JS_IsExtensible(ctx, s->target);
+    if (extensible_target < 0) {
+        if (res)
+            js_free_desc(ctx, &desc);
+        return -1;
+    }
     setting_not_configurable = ((flags & (JS_PROP_HAS_CONFIGURABLE |
                                           JS_PROP_CONFIGURABLE)) ==
                                 JS_PROP_HAS_CONFIGURABLE);
     if (!res) {
-        if (!p->extensible || setting_not_configurable)
+        if (!extensible_target || setting_not_configurable)
             goto fail;
     } else {
         if (!check_define_prop_flags(desc.flags, flags) ||
@@ -54735,6 +54790,12 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
     prop_array = JS_CallFree(ctx, method, s->handler, 1, vc(&s->target));
     if (JS_IsException(prop_array))
         return -1;
+    /* CreateListFromArrayLike() requires an object */
+    if (JS_VALUE_GET_TAG(prop_array) != JS_TAG_OBJECT) {
+        JS_FreeValue(ctx, prop_array);
+        JS_ThrowTypeError(ctx, "proxy: ownKeys must return an object");
+        return -1;
+    }
     tab = NULL;
     len = 0;
     tab_size = 0;
@@ -57426,7 +57487,7 @@ static JSValue js_async_dispose_step(JSContext *ctx, JSValueConst this_val,
             return JS_EXCEPTION;
         resolve_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 0,
                                          1, &prev_err);
-        reject_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 0, 1,
+        reject_fn = JS_NewCFunctionData(ctx, js_async_dispose_rethrow, 1, 1,
                                         1, &prev_err);
         then_args[0] = resolve_fn;
         then_args[1] = reject_fn;
@@ -57539,7 +57600,7 @@ static JSValue js_disposable_stack_dispose(JSContext *ctx,
             data[2] = hint_val;
             resolve_fn = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 0,
                                              3, data);
-            reject_fn = JS_NewCFunctionData(ctx, js_async_dispose_step, 0, 1,
+            reject_fn = JS_NewCFunctionData(ctx, js_async_dispose_step, 1, 1,
                                             3, data);
             JS_FreeValue(ctx, hint_val);
             JS_FreeValue(ctx, res->value);
@@ -62403,10 +62464,13 @@ static JSValue js_typed_array_with(JSContext *ctx, JSValueConst this_val,
     if (idx < 0)
         idx = len + idx;
 
-    val = JS_ToPrimitive(ctx, argv[1], HINT_NUMBER);
+    if (p->class_id == JS_CLASS_BIG_INT64_ARRAY || p->class_id == JS_CLASS_BIG_UINT64_ARRAY) {
+        val = JS_ToBigInt(ctx, argv[1]);
+    } else {
+        val = JS_ToNumber(ctx, argv[1]);
+    }
     if (JS_IsException(val))
         return JS_EXCEPTION;
-
     /* re-validate after user code (spec step 9: IsValidIntegerIndex) */
     if (typed_array_is_oob(p)) {
         JS_FreeValue(ctx, val);
@@ -66445,7 +66509,7 @@ int JS_AddIntrinsicDOMException(JSContext *ctx)
     }
     JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_DOMException, ctor,
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
-    ctx->class_proto[JS_CLASS_DOM_EXCEPTION] = proto;
+    set_value(ctx, &ctx->class_proto[JS_CLASS_DOM_EXCEPTION], proto);
     return 0;
 }
 /* base64 */
@@ -67507,6 +67571,10 @@ uintptr_t js_std_cmd(int cmd, ...) {
         rv = -1;
         if (JS_IsString(*pv))
             rv = JS_VALUE_GET_STRING(*pv)->kind;
+        break;
+    case 4: // GetShapeHashCount
+        rt = va_arg(ap, JSRuntime *);
+        rv = rt->shape_hash_count;
         break;
     default:
         rv = -1;

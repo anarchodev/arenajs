@@ -5,7 +5,8 @@ here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is [Semantic Versioning](https://semver.org/) applied to
 the contract, not to the fork as a whole.
 
-**Base:** quickjs-ng 0.16.0. arenajs versions independently; the
+**Base:** quickjs-ng 0.16.2 (plus three commits past the tag).
+arenajs versions independently; the
 upstream base is recorded here as lineage metadata and is not coupled
 to arenajs's release cadence.
 
@@ -39,6 +40,107 @@ version bump is only MINOR — are flagged **⚠ Contract** with the
 safe consumer pattern spelled out.
 
 ## [Unreleased]
+
+### arena-test262 checks spec outcomes, not just base writes
+
+The walker asserted one thing: that no base byte moved. It never asked
+whether the test PASSED. That gap is not covered elsewhere --
+`run-test262` builds vanilla runtimes (`JS_NewRuntime`, not
+`JS_NewRuntimeArena`), so the shadow mechanism never engages and no
+arena-specific correctness bug can reach it. An `Error.prototype.stack`
+violation with **35 test262 files written against it** sat green through
+four upstream merges because of exactly this.
+
+It now judges outcomes -- parsing `negative:` frontmatter, treating an
+uncaught throw as failure -- and gates on them alongside base writes.
+Confirmed by reverting the fix from stage 2c and watching it name the
+two right files.
+
+Getting there meant fixing a lot of mismeasurement, and the count is the
+story: the first baseline was **10730**, the fifth is **297**. Nothing in
+between was an engine fix. Removed, in order: `$DONE` async tests (4464),
+Temporal/Intl/ShadowRealm features (4435), regexp OOM from a 16 MB
+request arena (sized to 128 MB), module tests leaking past the skip, and
+the intl402 subtree.
+
+Three of those traced to one fragility -- skips matching bracketed
+literals (`[module]`, `[async]`, `includes: [...]`) that do not survive
+the multi-line or multi-flag YAML forms upstream also uses. All now parse
+`flags:` as tokens. **A large baseline is a symptom, not an inventory.**
+
+Coverage went up as well: 14 harness files preloaded instead of 3
+(`propertyHelper.js` alone serves 5241 tests), and `flags: [onlyStrict]`
+honoured -- 665 tests were being run sloppy, where `this` is the global
+object and the TypeErrors strictness produces simply do not happen. The
+preload list doubles as the skip list, so the two cannot drift.
+
+### Both request-allocator regimes are now walked
+
+`ARENA_REQ_MODE=bump` runs the corpus on the bump cursor as well as the
+default GC mspace -- materially different paths (`js_free` a no-op, cycle
+collector off, ceiling cumulative rather than peak-live) that the
+`9de2921` refcount relocation touched and only one of which was ever
+exercised.
+
+Deliberately ONE baseline for both: the regime must not change observable
+semantics, so a mode-dependent failure surfaces as drift instead of
+hiding in a second file. It reports identical spec verdicts in both, the
+only difference being two `annexB` RegExp BMP sweeps that exhaust the
+cumulative ceiling -- now reported as `arena OOM`, a capacity result
+rather than a verdict.
+
+### ARENA_RUNTIME=vanilla, for comparing like with like
+
+The same harness on a plain runtime -- same skips, same preloads, same
+strict handling, same judging, only the arena removed. Diffing the two
+failure sets attributes a divergence unambiguously.
+
+This exists because comparing against `run-test262` per-file is
+unreliable and quietly so: it has its own skip set (`legacy-regexp=skip`,
+`import-defer=skip`), its own strict-mode policy, and `-f` semantics
+where **a skipped test prints nothing and reads as a pass**. Three
+attempts produced three different wrong answers before the variable was
+controlled directly instead.
+
+With it, the picture is exact: of 297 baselined arena failures, **289
+fail on a vanilla runtime too** -- engine gaps shared with upstream --
+and 8 are arena-specific. Those 8 are the real work; see the two fixes
+that took the figure there from 74.
+
+### Upstream sync — v0.16.1 + v0.16.2 (stage 3)
+
+The last 22 commits, `v0.16.0..upstream/master`. The staged catch-up is
+done: 127 of 127 upstream commits are in, and the base lineage is back
+on a tag (plus three commits past it -- two docs and one two-line arity
+fix).
+
+Merged to `master` rather than the `v0.16.2` tag only after checking the
+thing that bit us at `377a25e`: `test262_errors.txt` and the test262
+submodule pointer are byte-identical between the tag and `master`, so
+there is no mid-release baseline staleness to inherit.
+
+Two conflicts.
+
+`JS_GetClassName` resolved to nothing at all. Upstream's `94c303f`
+landed the same fix as our `8c995aa`, so the code is now identical and
+only our comment about the (now-fixed) upstream bug differed -- dropped,
+and the divergence with it.
+
+`js_parse_error` took `0e19436`, which replaces the backward line scan
+merged in 2c with the tokenizer's recorded `s->token.line_start`. That
+is the whole point of the commit -- the old scan is quadratic over a
+long line -- so upstream's version wins, with our per-request exception
+access kept.
+
+Both checks that earned their place in 2c were run again and came back
+clean: no new direct uses of de-globalised or shadowed runtime state,
+and no new identity comparisons against `ctx->class_proto[...]`.
+
+Notable inheritances: `ad874ef` adds interrupt checks to the Array
+prototype methods, closing a hole where a request could sit in
+`bigArray.reduce(fn)` past its CPU budget because nothing polled;
+`0e19436` removes the quadratic parser lookup, which a one-shot VM pays
+on every request.
 
 ### Upstream sync — the rest of 0.16.0 (stage 2c)
 
