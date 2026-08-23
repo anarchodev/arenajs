@@ -5,7 +5,8 @@ here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is [Semantic Versioning](https://semver.org/) applied to
 the contract, not to the fork as a whole.
 
-**Base:** quickjs-ng 0.16.0. arenajs versions independently; the
+**Base:** quickjs-ng 0.16.2 (plus three commits past the tag).
+arenajs versions independently; the
 upstream base is recorded here as lineage metadata and is not coupled
 to arenajs's release cadence.
 
@@ -39,6 +40,41 @@ version bump is only MINOR — are flagged **⚠ Contract** with the
 safe consumer pattern spelled out.
 
 ## [Unreleased]
+
+### Upstream sync — v0.16.1 + v0.16.2 (stage 3)
+
+The last 22 commits, `v0.16.0..upstream/master`. The staged catch-up is
+done: 127 of 127 upstream commits are in, and the base lineage is back
+on a tag (plus three commits past it -- two docs and one two-line arity
+fix).
+
+Merged to `master` rather than the `v0.16.2` tag only after checking the
+thing that bit us at `377a25e`: `test262_errors.txt` and the test262
+submodule pointer are byte-identical between the tag and `master`, so
+there is no mid-release baseline staleness to inherit.
+
+Two conflicts.
+
+`JS_GetClassName` resolved to nothing at all. Upstream's `94c303f`
+landed the same fix as our `8c995aa`, so the code is now identical and
+only our comment about the (now-fixed) upstream bug differed -- dropped,
+and the divergence with it.
+
+`js_parse_error` took `0e19436`, which replaces the backward line scan
+merged in 2c with the tokenizer's recorded `s->token.line_start`. That
+is the whole point of the commit -- the old scan is quadratic over a
+long line -- so upstream's version wins, with our per-request exception
+access kept.
+
+Both checks that earned their place in 2c were run again and came back
+clean: no new direct uses of de-globalised or shadowed runtime state,
+and no new identity comparisons against `ctx->class_proto[...]`.
+
+Notable inheritances: `ad874ef` adds interrupt checks to the Array
+prototype methods, closing a hole where a request could sit in
+`bigArray.reduce(fn)` past its CPU budget because nothing polled;
+`0e19436` removes the quadratic parser lookup, which a one-shot VM pays
+on every request.
 
 ### Upstream sync — the rest of 0.16.0 (stage 2c)
 
