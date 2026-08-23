@@ -10278,6 +10278,21 @@ static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
         ret = JS_NULL;
         break;
     }
+    /* arena: ctx->class_proto[] holds BASE pointers. A request that writes
+       one -- `Boolean.prototype.toString = f` -- gets a shadow, but every
+       primitive method lookup starts here, so without resolving to the
+       active object the chain walk begins at base and never sees the
+       shadow: `true.toString()` keeps calling the snapshot's method.
+
+       The effect is worse than a plain miss because it is inconsistent.
+       The same replacement IS visible through an ordinary object path, so a
+       request's change takes effect through some routes and not others.
+       Borrowed reference in, borrowed reference out; js_object_active is a
+       no-op outside arena mode. */
+    if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
+        JSObject *p = js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ret));
+        ret = JS_MKPTR(JS_TAG_OBJECT, p);
+    }
     return ret;
 }
 
@@ -10729,9 +10744,32 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
         JSObject *p_active = js_object_active(ctx->rt, p_orig);
         if (p_active != p_orig) {
             obj = JS_MKPTR(JS_TAG_OBJECT, p_active);
-            if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT
-                && JS_VALUE_GET_OBJ(this_obj) == p_orig)
-                this_obj = obj;
+            /* Deliberately do NOT swap this_obj to the shadow.
+             *
+             * Base is the identity JS observes; the shadow is storage,
+             * resolved here at the property-access boundary and never
+             * escaping into a pointer JS can compare. The inverse model --
+             * shadow as identity -- cannot work: a shadow is a separate
+             * allocation created lazily on first write, so
+             *
+             *     var before = Math;   // holds base
+             *     Math.foo = 1;        // shadow created here
+             *     before === Math      // would become false
+             *
+             * References already handed to JS cannot be rewritten, so
+             * shadow-identity flips mid-request at an arbitrary moment.
+             *
+             * Swapping the receiver leaked a shadow pointer into `this`,
+             * which made a shadowed object hold two JS-visible identities
+             * depending on the access path:
+             *
+             *     Object.defineProperty(Math, "p", {get(){ return this === Math }});
+             *     Math.p   // was false under arena, true on a vanilla runtime
+             *
+             * Removing the swap closed that and four other test262
+             * divergences, with cross-request isolation and the whole arena
+             * suite unaffected (0 base bytes over 17375 tests).
+             */
         }
     }
 
