@@ -180,6 +180,12 @@ test-arena: $(BUILD_DIR)
 # an engine gap we share with upstream.
 ARENA262_TREES = built-ins language annexB staging intl402
 test-arena262:
+	# Identity probes for the base/shadow split. test262 cannot reach this --
+	# the invariant is arenajs's own, not a language rule -- and every case in
+	# there corresponds to a bug that shipped. Run both ways: a failure under
+	# ARENA_RUNTIME=vanilla is an engine gap, one under arena alone is ours.
+	$(BUILD_DIR)/arena-test262 tests/arena-shadow
+	ARENA_RUNTIME=vanilla $(BUILD_DIR)/arena-test262 tests/arena-shadow
 	for t in $(ARENA262_TREES); do $(BUILD_DIR)/arena-test262 test262/test/$$t || exit 1; done
 	for t in $(ARENA262_TREES); do ARENA_REQ_MODE=bump $(BUILD_DIR)/arena-test262 test262/test/$$t || exit 1; done
 

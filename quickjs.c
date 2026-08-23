@@ -10278,21 +10278,6 @@ static JSValueConst JS_GetPrototypePrimitive(JSContext *ctx, JSValueConst val)
         ret = JS_NULL;
         break;
     }
-    /* arena: ctx->class_proto[] holds BASE pointers. A request that writes
-       one -- `Boolean.prototype.toString = f` -- gets a shadow, but every
-       primitive method lookup starts here, so without resolving to the
-       active object the chain walk begins at base and never sees the
-       shadow: `true.toString()` keeps calling the snapshot's method.
-
-       The effect is worse than a plain miss because it is inconsistent.
-       The same replacement IS visible through an ordinary object path, so a
-       request's change takes effect through some routes and not others.
-       Borrowed reference in, borrowed reference out; js_object_active is a
-       no-op outside arena mode. */
-    if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
-        JSObject *p = js_object_active(ctx->rt, JS_VALUE_GET_OBJ(ret));
-        ret = JS_MKPTR(JS_TAG_OBJECT, p);
-    }
     return ret;
 }
 
@@ -10816,7 +10801,20 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
             break;
         }
         /* cannot raise an exception */
+        /* arena: resolve the primitive's prototype to its shadow for LOOKUP only.
+           ctx->class_proto[] holds base pointers, so a request that replaced a
+           method on a primitive prototype could not see its own change:
+
+               Boolean.prototype.toString = function () { return typeof this };
+               [true, false].toLocaleString()      // used the snapshot's method
+
+           Deliberately NOT inside JS_GetPrototypePrimitive: its third caller is
+           JS_GetPrototype, whose result goes straight back to JS via
+           Object.getPrototypeOf(5). Resolving there leaked the shadow as a
+           JS-visible identity, so `Object.getPrototypeOf(5) !== Number.prototype`.
+           Base is what JS compares; the shadow is for the walk. */
         p = JS_VALUE_GET_OBJ(JS_GetPrototypePrimitive(ctx, obj));
+        if (ctx->rt->is_arena && p) p = js_object_active(ctx->rt, p);
         if (!p)
             return JS_UNDEFINED;
     } else {
@@ -11840,8 +11838,16 @@ static JSProperty *add_property(JSContext *ctx,
     if (unlikely(p->is_prototype)) {
         /* track addition of small integer properties to
            Array.prototype and Object.prototype */
-        if (unlikely((p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
-                      p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) &&
+        /* arena: compare BASE identities. A request adding an indexed
+           property to Array.prototype writes the SHADOW, so `p` is the
+           shadow here while class_proto[] holds base -- the comparison
+           missed, the fast path was never marked dirty, and array element
+           writes kept bypassing the prototype chain entirely. A setter
+           installed on Array.prototype["0"] then never fired at all. */
+        JSObject *p_id = ctx->rt->is_arena
+                       ? js_object_base_identity(ctx->rt, p) : p;
+        if (unlikely((p_id == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
+                      p_id == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) &&
                      __JS_AtomIsTaggedInt(prop))) {
             js_std_array_prototype_mark_dirty(ctx);
         }
@@ -12030,6 +12036,27 @@ static int call_setter(JSContext *ctx, JSObject *setter,
         func = JS_MKPTR(JS_TAG_OBJECT, setter);
         /* Note: the field could be removed in the setter */
         func = js_dup(func);
+        /* arena: this is where the receiver crosses into JS, and the one
+           place the shadow must not follow it. JS_SetPropertyInternal2
+           keeps this_obj on the shadow deliberately -- C builtins use it
+           as a WRITE target, and putting base there makes splice() and
+           length-truncate write the snapshot (caught by arena-baseobj,
+           not by the corpus). But a setter compares it:
+
+               var window = this;                     // base
+               Object.defineProperty(this, "foo", {set(){ this === window }});
+               window.foo = 1;
+
+           and a reference captured before the shadow existed can never
+           be rewritten, so base is the only identity that compares
+           stably. Map here and nowhere else: internal writes keep the
+           shadow, JS sees base. */
+        if (unlikely(ctx->rt->is_arena) &&
+            JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT) {
+            JSObject *b = js_object_base_identity(ctx->rt,
+                                                  JS_VALUE_GET_OBJ(this_obj));
+            this_obj = JS_MKPTR(JS_TAG_OBJECT, b);
+        }
         ret = JS_CallFree(ctx, func, this_obj, 1, vc(&val));
         JS_FreeValue(ctx, val);
         if (JS_IsException(ret))
@@ -12284,6 +12311,10 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
     default:
         if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
             obj = JS_GetPrototypePrimitive(ctx, obj);
+        /* arena: same as the read path -- shadow for the walk. */
+        if (ctx->rt->is_arena && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+            obj = JS_MKPTR(JS_TAG_OBJECT,
+                           js_object_active(ctx->rt, JS_VALUE_GET_OBJ(obj)));
         p = NULL;
         p1 = JS_VALUE_GET_OBJ(obj);
         goto prototype_lookup;
@@ -54348,6 +54379,28 @@ static int js_proxy_has(JSContext *ctx, JSValueConst obj, JSAtom atom)
     return ret;
 }
 
+/* arena: the receiver handed to a Proxy trap crosses into JS, so the
+   shadow must not follow it -- same boundary rule as call_setter.
+   JS_SetPropertyInternal2 keeps this_obj on the shadow because C builtins
+   write through it, but a trap compares the receiver:
+
+       set(t, id, v, r) { assert(r === globalThis) }
+
+   and worse, hands it back to Reflect.set(t, id, v, r). With the shadow
+   there, that does an ordinary set on the shadow, which re-walks the
+   shadow's prototype chain, re-enters the same trap, and recurses until
+   the stack goes -- staging/sm/Proxy/global-receiver.js. */
+static JSValueConst js_arena_js_receiver(JSContext *ctx, JSValueConst receiver)
+{
+    if (unlikely(ctx->rt->is_arena) &&
+        JS_VALUE_GET_TAG(receiver) == JS_TAG_OBJECT) {
+        JSObject *b = js_object_base_identity(ctx->rt,
+                                              JS_VALUE_GET_OBJ(receiver));
+        return JS_MKPTR(JS_TAG_OBJECT, b);
+    }
+    return receiver;
+}
+
 static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
                             JSValueConst receiver)
 {
@@ -54360,6 +54413,7 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_get);
     if (!s)
         return JS_EXCEPTION;
+    receiver = js_arena_js_receiver(ctx, receiver);
     /* Note: recursion is possible thru the prototype of s->target */
     if (JS_IsUndefined(method))
         return JS_GetPropertyInternal(ctx, s->target, atom, receiver, false);
@@ -54410,6 +54464,7 @@ static int js_proxy_set(JSContext *ctx, JSValueConst obj, JSAtom atom,
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_set);
     if (!s)
         return -1;
+    receiver = js_arena_js_receiver(ctx, receiver);
     if (JS_IsUndefined(method)) {
         return JS_SetPropertyInternal2(ctx, s->target, atom,
                                        js_dup(value), receiver, flags);

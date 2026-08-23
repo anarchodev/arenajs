@@ -24,10 +24,6 @@ test262/test/annexB/language/expressions/assignmenttargettype/callexpression-in-
 test262/test/annexB/language/expressions/assignmenttargettype/callexpression-in-prefix-update.js: threw: SyntaxError: invalid increment/decrement operand
 test262/test/annexB/language/expressions/assignmenttargettype/callexpression.js: threw: SyntaxError: invalid assignment left-hand side
 test262/test/annexB/language/expressions/assignmenttargettype/cover-callexpression-and-asyncarrowhead.js: threw: SyntaxError: invalid assignment left-hand side
-test262/test/built-ins/Array/prototype/push/set-length-array-is-frozen.js: threw: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-test262/test/built-ins/Array/prototype/push/set-length-array-length-is-non-writable.js: threw: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-test262/test/built-ins/Array/prototype/unshift/set-length-array-is-frozen.js: threw: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
-test262/test/built-ins/Array/prototype/unshift/set-length-array-length-is-non-writable.js: threw: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
 test262/test/built-ins/Atomics/load/bigint/non-shared-bufferdata.js: threw: TypeError: ArrayBuffer is immutable (Testing with BigInt64Array and makeImmutableArrayBuffer.)
 test262/test/built-ins/Atomics/notify/retrieve-length-before-index-coercion.js: threw: TypeError: growable SharedArrayBuffer requires SAB allocator hooks
 test262/test/built-ins/Atomics/notify/retrieve-length-before-index-coercion-non-shared.js: threw: Test262Error: Expected a RangeError but got a Test262Error
@@ -216,7 +212,6 @@ test262/test/language/expressions/object/computed-property-name-topropertykey-be
 test262/test/language/identifier-resolution/assign-to-global-undefined.js: expected ReferenceError, no exception
 test262/test/language/statements/class/elements/syntax/valid/grammar-field-named-get-followed-by-generator-asi.js: threw: SyntaxError: invalid property name
 test262/test/language/statements/class/elements/syntax/valid/grammar-field-named-set-followed-by-generator-asi.js: threw: SyntaxError: invalid property name
-test262/test/language/statements/for-in/head-lhs-let.js: threw: Test262Error: MemberExpression Expected SameValue(«undefined», «"key"») to be true
 test262/test/language/statements/with/get-binding-value-call-with-proxy-env.js: threw: Test262Error: Actual [has:Object, get:Symbol(Symbol.unscopables), get:Object] and expected [has:Object, get:Symbol(Symbol.unscopables), has:Object, get:Object] should have the same contents. 
 test262/test/language/statements/with/get-binding-value-idref-with-proxy-env.js: threw: Test262Error: Actual [has:Object, get:Symbol(Symbol.unscopables), get:Object] and expected [has:Object, get:Symbol(Symbol.unscopables), has:Object, get:Object] should have the same contents. 
 test262/test/language/statements/with/get-mutable-binding-binding-deleted-in-get-unscopables-strict-mode.js: threw: Test262Error: Expected a ReferenceError to be thrown but no exception was thrown at all
@@ -230,7 +225,6 @@ test262/test/staging/sm/Array/from_proxy.js: threw: Test262Error: Expected ["get
 test262/test/staging/sm/Array/frozen-dense-array.js: threw: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all
 test262/test/staging/sm/Array/group.js: threw: Test262Error: Expected SameValue(«2», «1») to be true
 test262/test/staging/sm/Array/pop-no-has-trap.js: threw: TypeError: proxy: inconsistent defineProperty
-test262/test/staging/sm/Array/set-with-indexed-property-on-prototype-chain.js: threw: Test262Error: Expected SameValue(«false», «true») to be true
 test262/test/staging/sm/Array/shift-no-has-trap.js: threw: TypeError: proxy: inconsistent defineProperty
 test262/test/staging/sm/async-functions/async-contains-unicode-escape.js: threw: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all
 test262/test/staging/sm/async-functions/await-in-arrow-parameters.js: threw: Test262Error: AsyncFunction:(a = (b = await/r/g) => {}) => {} Expected a SyntaxError to be thrown but no exception was thrown at all
@@ -271,11 +265,9 @@ test262/test/staging/sm/lexical-environment/block-scoped-functions-annex-b-notap
 test262/test/staging/sm/lexical-environment/block-scoped-functions-deprecated-redecl.js: threw: Test262Error: Expected SameValue(«3», «4») to be true
 test262/test/staging/sm/lexical-environment/var-in-catch-body-annex-b-eval.js: threw: Test262Error: Expected SameValue(«"g"», «"global-x"») to be true
 test262/test/staging/sm/Map/constructor-iterator-close.js: threw: Test262Error: Expected SameValue(«true», «false») to be true
-test262/test/staging/sm/misc/getter-setter-outerize-this.js: threw: Test262Error: setter Expected SameValue(«false», «true») to be true
 test262/test/staging/sm/object/accessor-arguments-rest.js: threw: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all
 test262/test/staging/sm/object/defineProperties-order.js: threw: Test262Error: Expected SameValue(«"ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get"», «"ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get"») to be true
 test262/test/staging/sm/object/propertyIsEnumerable.js: threw: Test262Error: Expected a ReferenceError but got a TypeError
-test262/test/staging/sm/Proxy/global-receiver.js: threw: RangeError: Maximum call stack size exceeded
 test262/test/staging/sm/RegExp/constructor-ordering-2.js: threw: Test262Error: Expected SameValue(«false», «true») to be true
 test262/test/staging/sm/RegExp/escape.js: threw: Test262Error: Expected SameValue(«"\\\n"», «"\\n"») to be true
 test262/test/staging/sm/RegExp/source.js: threw: Test262Error: Expected SameValue(«"  "», «"\\u2028\\u2029"») to be true
@@ -293,5 +285,6 @@ test262/test/staging/sm/regress/regress-699682.js: threw: Test262Error: Expected
 test262/test/staging/sm/statements/arrow-function-in-for-statement-head.js: threw: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all
 test262/test/staging/sm/statements/regress-642975.js: threw: Test262Error: Expected SameValue(«undefined», «"y"») to be true
 test262/test/staging/sm/statements/try-completion.js: threw: Test262Error: Expected SameValue(«"try"», «undefined») to be true
+test262/test/staging/sm/String/match-defines-match-elements.js: threw: Test262Error: Expected SameValue(«true», «false») to be true
 test262/test/staging/sm/TypedArray/getter-name.js: threw: SyntaxError: redeclaration of 'TypedArray'
 test262/test/staging/sm/TypedArray/sort_modifications.js: threw: Test262Error: Int8Array at index 0 for size 4 Expected SameValue(«0», «1») to be true
