@@ -5,8 +5,8 @@ here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is [Semantic Versioning](https://semver.org/) applied to
 the contract, not to the fork as a whole.
 
-**Base:** quickjs-ng 0.15.1 + the pre-allocator half of 0.16.0
-(upstream `377a25e`). arenajs versions independently; the
+**Base:** quickjs-ng 0.15.1 + 0.16.0 through `9de2921` (the arena
+allocator). arenajs versions independently; the
 upstream base is recorded here as lineage metadata and is not coupled
 to arenajs's release cadence.
 
@@ -40,6 +40,63 @@ version bump is only MINOR — are flagged **⚠ Contract** with the
 safe consumer pattern spelled out.
 
 ## [Unreleased]
+
+### Upstream sync — the allocator commit (stage 2b)
+
+One commit, upstream `9de2921` "Add arena allocator", taken on its own
+because it touches 53 of the 181 `quickjs.c` functions arenajs patches
+where every other commit in the 0.16.0 range touches one to four.
+
+It does two separable-in-principle things, and only one of them is
+usable here.
+
+**The refcount relocation, adopted.** `JSRefCountHeader` is deleted
+outright and `JSGCObjectHeader` keeps only its list link; `ref_count`,
+`gc_obj_type` and `mark` move into an 8-byte `JSMallocBlockHeader`
+preceding every allocation, reached through `JS_REF_COUNT()` /
+`JS_GC_TYPE()` / `JS_GC_MARK()`. This is not optional and not really
+"upstream's allocator" — it is where the engine's refcount now lives,
+including the base-object refcounts `arena_rc_inc`/`arena_rc_dec` guard.
+The model is untouched: `js_arena_ptr_is_base()` is an address-range
+test and the block header sits inside the same allocation, so a base
+object's refcount is still base memory under the same PROT_READ
+hardening. Only the address written moves.
+
+The port came to roughly 45 sites rather than the dozen the chokepoints
+suggested, because `9de2921` also relocates `JSShape`'s properties out
+of the struct (`sh->prop[i]` becomes `get_shape_prop(sh)[i]`).
+
+**The small-block pool, disabled for arena runtimes.** Its bookkeeping —
+`JSArena.first_free_block`, `.n_used_blocks`, the `free_arena_list`
+links — is per-runtime and outlives the freeze boundary. Any size class
+whose newest arena is partially full at `JS_FreezeRuntime` leaves that
+`JSArena`, allocated in base, on `free_arena_list`; the first
+post-freeze request allocation in that class writes it. Letting arena
+runtimes pool measures as `arena-smoke` reporting 30 dirtied base pages
+and four other harnesses taking SIGSEGV.
+
+Gated at **runtime** rather than with upstream's compile-time
+`JS_ARENA_LARGE_BLOCKS_ONLY`, because `js_arena_malloc` has `rt` in
+scope. Vanilla runtimes — the `qjs` CLI, plain embedders, the vanilla
+half of `arena-coexist` — keep the pool and its ~18% geomean; arena
+runtimes always take the large path. Mixing is safe in both directions
+because `js_arena_free` is self-describing: `arena_malloc_large` stamps
+`block_idx = JS_ARENA_FREE_NIL`. An arena runtime forfeits nothing it
+wanted — pooling recycles small blocks across a long-lived heap, which
+is the workload a one-shot per-request VM structurally does not have.
+
+**One bug worth recording, because it was ours and not upstream's.**
+The conflict resolution took the HEAD side of all 36 conflicts, which is
+correct where both sides carry content but silently *deletes* upstream's
+line where our side is empty. That happened once, in `js_realloc_rt`,
+and left four arena fast paths calling `rt->mf.js_*` directly with a
+user pointer instead of going through the `js_arena_*` wrappers that
+reach back to the block header — so the backing allocator read eight
+bytes off the front of its own chunk. It presented as a SEGV in
+`mspace_realloc`. Treating it as a class rather than a site turned up
+all four, plus `old_size` taking usable-size from the raw pointer. A
+fifth site lived inside an `assert()` and was therefore invisible until
+the Debug/ASan build.
 
 ### Upstream sync — 0.15.1 → 0.16.0, pre-allocator (stage 2a)
 
