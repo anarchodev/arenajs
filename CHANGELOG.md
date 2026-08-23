@@ -41,6 +41,40 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.5.0] - 2026-08-23
+
+The **upstream-sync and shadow-identity release**. Two strands.
+
+quickjs-ng caught up from 0.14.0 to 0.16.2 -- all 127 commits, staged
+across five landings so the one that resisted merging (`9de2921`, which
+touches 53 of the 181 `quickjs.c` functions this fork patches) could be
+ported on its own.
+
+And a class of bug the sync made visible: `arena-test262` only ever
+asserted that no base byte moved, never that the test PASSED. Teaching it
+to check outcomes, and adding a way to run the identical harness on a
+vanilla runtime, put a number on arena/vanilla divergence for the first
+time: **74 test262 files**. That number is now **zero**.
+
+**⚠ Contract — the bytecode version moved 25 -> 27.** Not this fork's
+doing: upstream's `440883b` (explicit resource management) and `5f2fb55`
+(the register-based regexp engine port) each bumped it. `BC_VERSION`
+gates deserialisation, so **anything holding bytecode written by an
+earlier engine cannot load it** -- persisted `JS_WriteObject` output,
+cached `qjsc` results, `JS_READ_OBJ_BYTECODE` on stored blobs. The
+in-tree `gen/*.c` are regenerated and `make codegen` is verified
+idempotent; embedders that cache compiled output need to invalidate.
+
+MINOR otherwise: every `arena_*` export keeps its name, signature and
+return codes, verified by diffing the header surface against v0.4.0. New
+JS-visible surface arrives with the sync (explicit resource management,
+the iterator proposals, `Error.prototype.stack` as an accessor, regexp
+`v`-flag and modifiers) and `quickjs.h` gains `JS_PromiseThen`,
+`JS_PromiseMarkAsHandled`, `JS_NewUint64` and the `JS_FreeValues` /
+`JS_FreeAtoms` vararg macros.
+
 ### Fixed — ARENA_PLAN class 4 is closed
 
 Per-request state that lived on the base-resident `JSRuntime` /
