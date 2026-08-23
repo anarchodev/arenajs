@@ -5,8 +5,7 @@ here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is [Semantic Versioning](https://semver.org/) applied to
 the contract, not to the fork as a whole.
 
-**Base:** quickjs-ng 0.15.1 + 0.16.0 through `9de2921` (the arena
-allocator). arenajs versions independently; the
+**Base:** quickjs-ng 0.16.0. arenajs versions independently; the
 upstream base is recorded here as lineage metadata and is not coupled
 to arenajs's release cadence.
 
@@ -40,6 +39,76 @@ version bump is only MINOR — are flagged **⚠ Contract** with the
 safe consumer pattern spelled out.
 
 ## [Unreleased]
+
+### Upstream sync — the rest of 0.16.0 (stage 2c)
+
+The remaining 59 commits, `9de2921..v0.16.0`. Four conflicts in
+`quickjs.c`, none of them the interesting part.
+
+Two were pure arenajs determinism additions where upstream's side of the
+conflict was empty; they were resolved programmatically with an assertion
+that upstream's side really is empty, so 2b's "taking ours silently
+deletes upstream's line" failure cannot recur unnoticed. The other two
+needed real merging: `js_parse_error` took upstream's column-derivation
+(`65e766e`) over our per-request exception access, and `js_new_module_def`
+kept our arena-gated list linking while taking upstream's new
+`m->attributes = JS_UNDEFINED` — dropping that would have left a JSValue
+uninitialised and later freed.
+
+**The problems were all in code that merged cleanly.**
+
+`rt->parent_promise` — upstream's new `JS_PromiseThen` writes a field this
+fork moved to `rt->req->parent_promise`. New code in a new function, so no
+conflict; only the compiler caught it, and only because the field no
+longer exists on `JSRuntime`.
+
+That prompted an audit for the silent version of the same hazard: a field
+we *shadow* rather than remove still exists, so new upstream code using it
+compiles and quietly bypasses the shadow. Comparing direct-use counts
+against the pre-merge tree found `ctx->random_state` going from 3 uses to
+7. **`807f271` seeds the Map/Set key hash from the wall clock at context
+init** — `ctx->random_state = js__gettimeofday_us()`, with `hash_seed`
+derived from it before `js_random_init()` zeroes the state again. Wall
+clock reads in context init went from 0 to 1, which is exactly what
+`55aff69` exists to prevent. `Math.random` was unaffected; `hash_seed` was
+not. Now pinned for arena runtimes, with upstream's randomised seed kept
+for vanilla ones where it guards against hash-collision DoS (upstream
+issue #205). An arena runtime takes the collision risk knowingly: request
+CPU is bounded by the interrupt handler, and a reproducible snapshot is
+the product.
+
+### Fixed
+
+**`SetterThatIgnoresPrototypeProperties` recursed until the stack gave
+out, on any base-resident Iterator prototype.** Upstream's new setters
+(`161db12`, `93d3f7d`) guard with an identity check against a base
+pointer:
+
+```c
+if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ITERATOR]))
+    return JS_ThrowTypeError(ctx, "Cannot assign to read only property");
+```
+
+A request reaches that guard holding the *shadow* of the home object —
+`JS_SetPropertyInternal` swaps `this_obj` to the shadow in lockstep with
+the receiver — so the comparison misses, the setter falls through to
+`JS_SetProperty(this_val, ...)`, and re-enters itself. `Iterator.prototype
+.constructor = ""` from a request was enough.
+
+Same class as the `setPrototypeOf` identity bug, and the remedy was
+already in the tree: `js_object_base_identity()`, whose comment claimed
+its only caller was `JS_SetPrototypeInternal`. Both new setters now route
+through it.
+
+Worth noting what did *not* find this. It is not a merge conflict. ASan is
+silent, because stack exhaustion is not a heap error. Calling the setter
+explicitly (`set.call(P, "")`) does not reproduce it — only plain
+assignment goes through the receiver-swapping path. It surfaced because
+this merge bumps the test262 submodule (`d5e73fc` -> `5ef1e57`) and the
+newer corpus carries `built-ins/Iterator/prototype/*/weird-setter.js`.
+
+**Any upstream code comparing `this` against `ctx->class_proto[...]` is a
+shadow-identity hazard, and it will never appear as a conflict.**
 
 ### Upstream sync — the allocator commit (stage 2b)
 
