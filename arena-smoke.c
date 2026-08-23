@@ -2,6 +2,7 @@
  * Smoke test for the dual-arena allocator.
  * Build:  cc arena-smoke.c -I. build/libqjs.a -lm -lpthread -o build/arena-smoke
  */
+#include <signal.h>   /* SIGSEGV -- glibc leaks it via sys/wait.h, FreeBSD does not */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

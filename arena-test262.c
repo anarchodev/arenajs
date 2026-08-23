@@ -63,7 +63,8 @@ static char *slurp(const char *path, size_t *out_len)
    don't support yet. Conservative — when in doubt, skip. */
 static int test_is_skippable(const char *src, size_t len)
 {
-    /* test262 frontmatter is `/*---` ... `---*\/` near the top. */
+    /* test262 frontmatter is a block comment opening with three dashes
+       and closing with three dashes, near the top of the file. */
     const char *fm = strstr(src, "/*---");
     if (!fm) return 1; /* no frontmatter -> not test262, skip */
     const char *fmend = strstr(fm, "---*/");

@@ -12,7 +12,7 @@ on:
       - '.github/workflows/ci.yml'
   push:
     branches:
-      - master
+      - main
     paths:
       - '**'
       - '!.gitignore'
@@ -57,7 +57,14 @@ jobs:
           - { os: ubuntu-latest, configType: shared }
           - { os: ubuntu-latest, configType: asan+ubsan, runTest262: true }
           - { os: ubuntu-latest, configType: msan }
-          - { os: ubuntu-latest, configType: tcc }
+          # arenajs: DISABLED. tcc 0.9.27 has no thread-local storage in any
+          # spelling -- __thread, _Thread_local and thread_local all fail to
+          # parse -- and qjs-arena.h needs TLS for the base-range list that
+          # js_arena_ptr_is_base() reads. That predicate is called from
+          # refcount chokepoints with no runtime handle in scope, so the
+          # thread-local is load-bearing, not incidental. Verified locally
+          # against tcc 0.9.27; re-enable when tcc gains TLS.
+          # - { os: ubuntu-latest, configType: tcc }
           - { os: ubuntu-latest, arch: x86, runTest262: true }
           - { os: ubuntu-latest, arch: riscv64 }
 
@@ -173,6 +180,14 @@ jobs:
           ./build/lre-test
 
   windows-msvc:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: ${{ matrix.config.os }}
     strategy:
       fail-fast: false
@@ -221,6 +236,14 @@ jobs:
           cl.exe /DJS_NAN_BOXING=1 /Zs cxxtest.cc
 
   windows-clang:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -254,6 +277,14 @@ jobs:
           build\function_source.exe
 
   windows-clang-cl:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -289,6 +320,14 @@ jobs:
           build\${{matrix.buildType}}\lre-test.exe
 
   windows-ninja:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -324,6 +363,14 @@ jobs:
           build\lre-test.exe
 
   windows-sdk:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -360,6 +407,14 @@ jobs:
           build\${{matrix.buildType}}\lre-test.exe
 
   windows-mingw:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -416,6 +471,14 @@ jobs:
       run: |
         ./build/lre-test
   windows-mingw-shared:
+    # arenajs: DISABLED. This fork's arena layer (qjs-arena.c) is POSIX-only --
+    # mmap/mprotect/sigaction/SIGSEGV drive the thermometer and the hard-mprotect
+    # inviolate-base enforcement -- so every Windows job dies on
+    #   qjs-arena.c: fatal error: sys/mman.h: No such file or directory
+    # Windows is not a delivery target (rove consumes qjs_arena_wasm via CMake).
+    # Re-enable by porting the arena to VirtualAlloc/VirtualProtect + a vectored
+    # exception handler, not by deleting this comment.
+    if: false
     runs-on: windows-latest
     defaults:
       run:
@@ -609,6 +672,12 @@ jobs:
           make test
 
   amalgam:
+    # arenajs: DISABLED. amalgam.js inlines quickjs.c only, so the amalgamation
+    # cannot compile in this fork -- js_arena_ptr_is_base / JSDualArena are
+    # undeclared. Re-enabling means teaching amalgam.js about qjs-arena.h/.c,
+    # qjs-dlmalloc.c, dlmalloc.c and the trace sources. The amalgamation is not
+    # a product here; rove builds qjs_arena_wasm from the CMake package.
+    if: false
     strategy:
       matrix:
         # TODO(bnoordhuis) test on windows
@@ -733,7 +802,7 @@ jobs:
               ASAN_OPTIONS: report_globals=0:halt_on_error=1:abort_on_error=1:print_summary=1
         platform:
           - ubuntu-latest
-          - windows-latest
+          # windows-latest removed: see the windows-* jobs above (POSIX-only arena)
           - macos-latest
 
         exclude:

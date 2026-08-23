@@ -15,6 +15,12 @@
 #define ONLY_MSPACES 1
 #define HAVE_MMAP 0
 #define HAVE_MORECORE 0
+/* HAVE_MREMAP 0 explicitly: dlmalloc otherwise takes its `#ifndef HAVE_MREMAP
+   / #ifdef linux` branch, which sets HAVE_MREMAP 1 and #defines _GNU_SOURCE to
+   expose mremap(). Every build here already passes -D_GNU_SOURCE, so that is a
+   macro redefinition -- a warning normally, an error under QJS_BUILD_WERROR
+   (the release job). mremap is unreachable with HAVE_MMAP 0 regardless. */
+#define HAVE_MREMAP 0
 #define USE_LOCKS 0
 #define NO_MALLOC_STATS 1
 
@@ -49,4 +55,18 @@
 #define LACKS_SYS_MMAN_H 1
 #endif
 
+/* dlmalloc computes TOP_FOOT_SIZE via align_offset(chunk2mem(0)) -- pointer
+   arithmetic on NULL, which clang rejects under -Werror
+   (-Wgnu-null-pointer-arithmetic; hit by the emscripten CI job). The idiom is
+   benign and dlmalloc.c is vendored verbatim, so suppress it here in the
+   wrapper rather than diverge from upstream. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-null-pointer-arithmetic"
+#endif
+
 #include "dlmalloc.c"
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif

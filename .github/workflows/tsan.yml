@@ -3,7 +3,7 @@ name: tsan
 on:
   push:
     branches:
-      - master
+      - main
     paths:
       - '**'
       - '!.gitignore'

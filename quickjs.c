@@ -3879,6 +3879,20 @@ static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
         ctx->error_back_trace = val;
 }
 
+/* arena: take ownership of the active back-trace and clear the slot.
+   js_error_back_trace_active() hands back a BORROWED JSValueConst, but the
+   three call sites that clear the slot take ownership of what they get --
+   matching the pre-arena semantics, where ctx->error_back_trace was a plain
+   owned field. Launder the const once, here, instead of at each site: under
+   JS_CHECK_JSVALUE (the `jscheck` CI job) the implicit conversion is an
+   error, and three separate casts would be three places to get it wrong. */
+static inline JSValue js_error_back_trace_take(JSContext *ctx)
+{
+    JSValue v = unsafe_unconst(js_error_back_trace_active(ctx));
+    js_error_back_trace_set(ctx, JS_UNDEFINED);
+    return v;
+}
+
 /* arena: in non-arena mode write the base flag; in arena mode set the
    per-request dirty mark instead so base ctx is not mutated. */
 static inline void js_std_array_prototype_mark_dirty(JSContext *ctx)
@@ -22278,8 +22292,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                     *sp++ = rt->req->current_exception;
                     rt->req->current_exception = JS_UNINITIALIZED;
-                    JS_FreeValueRT(rt, js_error_back_trace_active(ctx));
-                    js_error_back_trace_set(ctx, JS_UNDEFINED);
+                    JS_FreeValueRT(rt, js_error_back_trace_take(ctx));
                     pc = b->byte_code_buf + pos;
                     goto restart;
                 }
@@ -39392,10 +39405,9 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (!rt->req->current_stack_frame) {
         /* arena: route through the per-request shadow so we don't touch
            the base ctx field. */
-        JSValue cur = js_error_back_trace_active(ctx);
+        JSValue cur = js_error_back_trace_take(ctx);
         if (!JS_IsUndefined(cur)) {
             JS_FreeValueRT(rt, cur);
-            js_error_back_trace_set(ctx, JS_UNDEFINED);
         }
     }
     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
@@ -66224,8 +66236,7 @@ uintptr_t js_std_cmd(int cmd, ...) {
     case 2: // ErrorBackTrace
         ctx = va_arg(ap, JSContext *);
         pv = va_arg(ap, JSValue *);
-        *pv = js_error_back_trace_active(ctx);
-        js_error_back_trace_set(ctx, JS_UNDEFINED);
+        *pv = js_error_back_trace_take(ctx);
         break;
     case 3: // GetStringKind
         ctx = va_arg(ap, JSContext *);
