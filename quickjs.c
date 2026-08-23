@@ -11840,8 +11840,16 @@ static JSProperty *add_property(JSContext *ctx,
     if (unlikely(p->is_prototype)) {
         /* track addition of small integer properties to
            Array.prototype and Object.prototype */
-        if (unlikely((p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
-                      p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) &&
+        /* arena: compare BASE identities. A request adding an indexed
+           property to Array.prototype writes the SHADOW, so `p` is the
+           shadow here while class_proto[] holds base -- the comparison
+           missed, the fast path was never marked dirty, and array element
+           writes kept bypassing the prototype chain entirely. A setter
+           installed on Array.prototype["0"] then never fired at all. */
+        JSObject *p_id = ctx->rt->is_arena
+                       ? js_object_base_identity(ctx->rt, p) : p;
+        if (unlikely((p_id == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
+                      p_id == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) &&
                      __JS_AtomIsTaggedInt(prop))) {
             js_std_array_prototype_mark_dirty(ctx);
         }

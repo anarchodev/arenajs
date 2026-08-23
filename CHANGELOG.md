@@ -41,6 +41,55 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+### Fixed
+
+**A setter installed on `Array.prototype["0"]` never fired.** `add_property`
+tracks additions of small-integer properties to `Array.prototype` and
+`Object.prototype` so it can invalidate the array fast path, but it
+compared against `ctx->class_proto[...]` -- a BASE pointer -- while a
+request's `defineProperty` writes the SHADOW. The comparison missed, the
+fast path was never marked dirty, and array element writes kept
+bypassing the prototype chain entirely:
+
+```js
+var calls = 0;
+Object.defineProperty(Array.prototype, "0", { set(v) { calls++ } });
+var a = []; a[0] = 1; a.push(2);
+// vanilla: calls === 2    arena: calls === 0
+```
+
+Now compares base identities via `js_object_base_identity()`. That is
+also a correction to the previous entry, which claimed the helper
+patches a leak that no longer happens: comparing a possibly-shadow
+pointer against a known-base one is a different problem from a shadow
+escaping into `this`, and it is a permanent use.
+
+Takes the arena-vs-vanilla divergence from 8 files to 2, and the
+`arena-test262` baseline from 297 to 292.
+
+### Not fixed, and why — the receiver swap on the set path
+
+Removing the receiver swap from `JS_SetPropertyInternal2` looks correct
+by symmetry with `JS_GetPropertyInternal`, where removing it was right.
+It fixes the last two divergences. It passes the whole arena suite, all
+eight targeted tests, and `run-test262 -c tests.conf`.
+
+It also breaks **17 corpus tests**, every one of them assignment to an
+undeclared global:
+
+```js
+count = 1;   // ReferenceError: count is not defined
+```
+
+The set path has `if (p == p1) break;`, which uses receiver-vs-target
+identity to tell an ordinary `[[Set]]` from a `Reflect.set`-style one
+with a different receiver. Forcing the two pointers equal is what makes
+an ordinary global assignment take the ordinary path. The get path has
+no such branch, which is why the same removal was safe there.
+
+Recorded because it is a trap worth signposting: every narrow gate
+passed, and only the 32763-test corpus caught it.
+
 ### arena-test262 checks spec outcomes, not just base writes
 
 The walker asserted one thing: that no base byte moved. It never asked
