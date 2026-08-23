@@ -186,6 +186,10 @@ test-arena262:
 	# ARENA_RUNTIME=vanilla is an engine gap, one under arena alone is ours.
 	$(BUILD_DIR)/arena-test262 tests/arena-shadow
 	ARENA_RUNTIME=vanilla $(BUILD_DIR)/arena-test262 tests/arena-shadow
+	# ARENA_PLAN class 4: per-request state on the base-resident runtime.
+	# 01/02 are ordered -- one request installs, the next asserts isolation.
+	$(BUILD_DIR)/arena-test262 tests/arena-request-state
+	ARENA_RUNTIME=vanilla $(BUILD_DIR)/arena-test262 tests/arena-request-state
 	for t in $(ARENA262_TREES); do $(BUILD_DIR)/arena-test262 test262/test/$$t || exit 1; done
 	for t in $(ARENA262_TREES); do ARENA_REQ_MODE=bump $(BUILD_DIR)/arena-test262 test262/test/$$t || exit 1; done
 
