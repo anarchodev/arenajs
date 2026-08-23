@@ -470,6 +470,25 @@ typedef struct JSRequestState {
        Multi-ctx support is a known limitation — for >1 ctx this
        would need to be per-ctx like the shadow table. */
     JSValue error_back_trace_req;
+    /* Request-side twins of ctx->error_prepare_stack and
+       ctx->error_stack_trace_limit (both base-resident on JSContext).
+       ARENA_PLAN class 4: without these, `Error.prepareStackTrace = f`
+       and `Error.stackTraceLimit = n` write the snapshot -- measured at
+       14 and 1 bytes -- and the value outlives the request. The
+       prepareStackTrace case is the worse one: it stores a FUNCTION, so
+       base ends up holding a request pointer whose closure dangles once
+       the arena is rewound, and every later request's build_backtrace
+       calls it.
+
+       Unlike error_back_trace_req these need an explicit "was set" flag
+       rather than treating UNDEFINED as absent: assigning undefined is
+       meaningful for both (it disables the hook / the trace limit), so
+       a value sentinel would fall through to the base value and ignore
+       the request's own assignment. */
+    JSValue error_prepare_stack_req;
+    JSValue error_stack_trace_limit_req;
+    bool error_prepare_stack_set;
+    bool error_stack_trace_limit_set;
     /* Per-request Math.random() state. Initialised to 0 at every reset;
        JS_SetRandomSeed writes here in arena mode. The seed-zero contract
        (Math.random returns 0 until seeded) is preserved per-request. */
@@ -2779,6 +2798,10 @@ int JS_RelocateReqState(JSRuntime *rt)
     new_req->gc_mode =
         js_dual_arena_request_mode(JS_GetDualArena(rt)) == JS_ARENA_REQ_MODE_GC;
     new_req->error_back_trace_req = JS_UNDEFINED;
+    new_req->error_prepare_stack_req = JS_UNDEFINED;
+    new_req->error_stack_trace_limit_req = JS_UNDEFINED;
+    new_req->error_prepare_stack_set = false;
+    new_req->error_stack_trace_limit_set = false;
     new_req->date_now_pinned_req = -1;   /* unpinned until the host pins */
     new_req->time_origin_req = 0;
     new_req->random_state_req = 0;
@@ -4290,6 +4313,46 @@ static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
    owned field. Launder the const once, here, instead of at each site: under
    JS_CHECK_JSVALUE (the `jscheck` CI job) the implicit conversion is an
    error, and three separate casts would be three places to get it wrong. */
+/* arena: see the JSRequestState twins. Reads fall back to the base value
+   until the request assigns; after that the request's own value wins even
+   if it is undefined. */
+static inline JSValueConst js_error_prepare_stack_active(JSContext *ctx)
+{
+    if (ctx->rt->is_arena && ctx->rt->req->error_prepare_stack_set)
+        return ctx->rt->req->error_prepare_stack_req;
+    return ctx->error_prepare_stack;
+}
+static inline void js_error_prepare_stack_store(JSContext *ctx, JSValue val)
+{
+    if (ctx->rt->is_arena) {
+        JS_FreeValue(ctx, ctx->rt->req->error_prepare_stack_req);
+        ctx->rt->req->error_prepare_stack_req = val;
+        ctx->rt->req->error_prepare_stack_set = true;
+    } else {
+        JS_FreeValue(ctx, ctx->error_prepare_stack);
+        ctx->error_prepare_stack = val;
+    }
+}
+static inline JSValueConst js_error_stack_limit_active(JSContext *ctx)
+{
+    if (ctx->rt->is_arena && ctx->rt->req->error_stack_trace_limit_set)
+        return ctx->rt->req->error_stack_trace_limit_req;
+    return ctx->error_stack_trace_limit;
+}
+static inline void js_error_stack_limit_store(JSContext *ctx, JSValue val)
+{
+    if (ctx->rt->is_arena) {
+        JS_FreeValue(ctx, ctx->rt->req->error_stack_trace_limit_req);
+        ctx->rt->req->error_stack_trace_limit_req = val;
+        ctx->rt->req->error_stack_trace_limit_set = true;
+    } else {
+        /* upstream leaks the previous value here; its sibling
+           js_error_set_prepareStackTrace frees first. */
+        JS_FreeValue(ctx, ctx->error_stack_trace_limit);
+        ctx->error_stack_trace_limit = val;
+    }
+}
+
 static inline JSValue js_error_back_trace_take(JSContext *ctx)
 {
     JSValue v = unsafe_unconst(js_error_back_trace_active(ctx));
@@ -9651,7 +9714,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     // Extract stack trace limit.
     // Ignore error since it sets d to NAN anyway.
     // coverity[check_return]
-    JS_ToFloat64(ctx, &d, ctx->error_stack_trace_limit);
+    JS_ToFloat64(ctx, &d, js_error_stack_limit_active(ctx));
     if (isnan(d) || d < 0.0)
         stack_trace_limit = 0;
     else if (d > INT32_MAX)
@@ -9670,7 +9733,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     i = 0;
 
     if (!JS_IsNull(ctx->error_ctor)) {
-        prepare = js_dup(ctx->error_prepare_stack);
+        prepare = js_dup(js_error_prepare_stack_active(ctx));
         has_prepare = JS_IsFunction(ctx, prepare);
     }
 
@@ -11908,8 +11971,17 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     uint32_t i, len, new_count;
 
     /* track modification of Array.prototype */
-    if (unlikely(p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]))) {
-        ctx->std_array_prototype = false;
+    /* arena: two bugs in one line before this. The write went straight to
+       the base flag instead of the per-request mark, and the identity test
+       compared a possibly-SHADOW `p` against the BASE class_proto -- so a
+       request converting the shadowed Array.prototype to a normal array
+       both dirtied the snapshot and failed to invalidate the fast path.
+       Same pair as add_property. */
+    {
+        JSObject *p_id = ctx->rt->is_arena
+                       ? js_object_base_identity(ctx->rt, p) : p;
+        if (unlikely(p_id == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY])))
+            js_std_array_prototype_mark_dirty(ctx);
     }
     if (js_shape_prepare_update(ctx, p, NULL))
         return -1;
@@ -44892,14 +44964,14 @@ static JSValue js_error_get_stackTraceLimit(JSContext *ctx, JSValueConst this_va
     if (JS_IsException(val))
         return val;
     JS_FreeValue(ctx, val);
-    return js_dup(ctx->error_stack_trace_limit);
+    return js_dup(js_error_stack_limit_active(ctx));
 }
 
 static JSValue js_error_set_stackTraceLimit(JSContext *ctx, JSValueConst this_val, JSValueConst value)
 {
     if (JS_IsUndefined(this_val) || JS_IsNull(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    ctx->error_stack_trace_limit = js_dup(value);
+    js_error_stack_limit_store(ctx, js_dup(value));
     return JS_UNDEFINED;
 }
 
@@ -44911,15 +44983,14 @@ static JSValue js_error_get_prepareStackTrace(JSContext *ctx, JSValueConst this_
     if (JS_IsException(val))
         return val;
     JS_FreeValue(ctx, val);
-    return js_dup(ctx->error_prepare_stack);
+    return js_dup(js_error_prepare_stack_active(ctx));
 }
 
 static JSValue js_error_set_prepareStackTrace(JSContext *ctx, JSValueConst this_val, JSValueConst value)
 {
     if (JS_IsUndefined(this_val) || JS_IsNull(this_val))
         return JS_ThrowTypeErrorNotAnObject(ctx);
-    JS_FreeValue(ctx, ctx->error_prepare_stack);
-    ctx->error_prepare_stack = js_dup(value);
+    js_error_prepare_stack_store(ctx, js_dup(value));
     return JS_UNDEFINED;
 }
 

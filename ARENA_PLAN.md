@@ -248,12 +248,26 @@ never large structures.
 `current_stack_frame`, `in_out_of_memory`, `in_build_stack_trace`,
 `parent_promise`.
 
-**Where to look next:** `ctx->error_back_trace`,
-`ctx->error_prepare_stack`, `ctx->error_stack_trace_limit`,
-`ctx->std_array_prototype` flag, `ctx->binary_object_count` /
-`binary_object_size` (per-context stats). Any list head on rt that
-gets `list_add`/`list_del` per request: `job_list`,
-`loaded_modules` (on ctx).
+**Closed.** `ctx->error_back_trace`, `ctx->error_prepare_stack` and
+`ctx->error_stack_trace_limit` all have request-side twins now; the
+latter two needed an explicit "was set" flag rather than the UNDEFINED
+sentinel the first uses, because assigning `undefined` is meaningful for
+both (it disables the hook / the limit) and a value sentinel would fall
+through to the base value. `ctx->binary_object_count` /
+`binary_object_size` were already behind an `is_arena` guard.
+`loaded_modules` self-loops the link in arena mode; `job_list` measured
+clean.
+
+`ctx->std_array_prototype` was the instructive one. It had an accessor
+(`js_std_array_prototype_mark_dirty`) *and* a call site that bypassed it,
+writing the base flag directly — and that same site compared a
+possibly-shadow pointer against the base `class_proto`, so it also failed
+to invalidate the fast path. A field that is *partially* routed is worse
+than one that is not routed at all: the accessor's existence reads as
+proof the field is handled.
+
+Regression coverage: `tests/arena-request-state/`, run both ways by
+`make test-arena`.
 
 ### 5. List-head writes for tracking that nothing reads in arena mode
 

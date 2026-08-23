@@ -41,6 +41,50 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+### Fixed — ARENA_PLAN class 4 is closed
+
+Per-request state that lived on the base-resident `JSRuntime` /
+`JSContext`, so a request writing it dirtied the snapshot and the value
+outlived the request.
+
+**`Error.prepareStackTrace` and `Error.stackTraceLimit`** now have
+request-side twins. Measured base writes of 14 and 1 bytes.
+`prepareStackTrace` is the serious one: it stores a **function**, so base
+held a request pointer whose closure dangles once the arena is rewound,
+and every later request's `build_backtrace` called it. Under an
+object-capability design it is also an ambient-authority hook -- a
+dependency that sets it observes every error thrown by every other
+module, including capability-holding code.
+
+Both needed an explicit "was set" flag rather than the UNDEFINED sentinel
+`error_back_trace_req` uses: assigning `undefined` is meaningful for each
+(it disables the hook / the limit), so a value sentinel would fall
+through to the base value and ignore the request's own assignment.
+
+Also fixes an upstream refcount leak while there --
+`js_error_set_stackTraceLimit` never freed the previous value, unlike its
+sibling `js_error_set_prepareStackTrace`.
+
+**`convert_fast_array_to_array`** carried both class-4 bugs on one line:
+it wrote `ctx->std_array_prototype = false` directly instead of the
+per-request mark, and compared a possibly-shadow pointer against the base
+`class_proto` so it also failed to invalidate the array fast path.
+
+That field is the lesson worth keeping. It *had* an accessor and one call
+site bypassed it. **A partially-routed field is worse than an unrouted
+one** -- the accessor's existence reads as proof the field is handled, and
+an audit that greps for the accessor finds it and moves on.
+
+`binary_object_count` / `binary_object_size` turned out to be behind an
+`is_arena` guard already; ARENA_PLAN's entry for them was stale.
+
+### Added — `tests/arena-request-state`
+
+Four ordered probes plus a README, wired into `make test-arena` and run
+under both runtimes. The 01/02 ordering *is* the test: one request
+installs the stack hooks, the next asserts it sees neither.
+
+
 ### Fixed — the shadow must not cross into JS
 
 Three more places where a request could observe the shadow as a distinct
