@@ -156,11 +156,32 @@ test-arena: $(BUILD_DIR)
 	$(BUILD_DIR)/arena-bench
 	$(BUILD_DIR)/arena-coexist
 	$(BUILD_DIR)/arena-interrupt
-	$(BUILD_DIR)/arena-test262 test262/test/built-ins
-	$(BUILD_DIR)/arena-test262 test262/test/language
-	$(BUILD_DIR)/arena-test262 test262/test/annexB
-	$(BUILD_DIR)/arena-test262 test262/test/staging
-	$(BUILD_DIR)/arena-test262 test262/test/intl402
+	$(MAKE) test-arena262
+
+# arena-test262 checks two independent things per test: that no base byte
+# was written, and that the test actually PASSES under an arena runtime.
+# The second is not covered by run-test262, which builds vanilla runtimes
+# (JS_NewRuntime, not JS_NewRuntimeArena) and so can never exercise the
+# shadow mechanism -- an Error.prototype.stack bug with 35 test262 files
+# written against it sat green through four upstream merges.
+#
+# Spec failures are gated against arena_test262_errors.txt with the same
+# contract as test262_errors.txt: NEW, CHANGED and FIXED are all errors.
+# Base writes have no baseline and never should.
+#
+# Run twice, because the request allocator has two regimes and only one
+# was ever exercised. Both share ONE baseline: the regime must not change
+# observable semantics, so a divergence shows up as drift rather than
+# hiding in a second file.
+#
+# Regenerate the baseline with ARENA_BASELINE_UPDATE=1 (writes .new for
+# review). ARENA_RUNTIME=vanilla replays the same harness with the arena
+# removed, which is how an arena-specific divergence is told apart from
+# an engine gap we share with upstream.
+ARENA262_TREES = built-ins language annexB staging intl402
+test-arena262:
+	for t in $(ARENA262_TREES); do $(BUILD_DIR)/arena-test262 test262/test/$$t || exit 1; done
+	for t in $(ARENA262_TREES); do ARENA_REQ_MODE=bump $(BUILD_DIR)/arena-test262 test262/test/$$t || exit 1; done
 
 unicode_gen: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target unicode_gen
@@ -168,4 +189,4 @@ unicode_gen: $(BUILD_DIR)
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test-arena test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam test-arena262 ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test-arena test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
