@@ -265,11 +265,9 @@ test262/test/staging/sm/lexical-environment/block-scoped-functions-annex-b-notap
 test262/test/staging/sm/lexical-environment/block-scoped-functions-deprecated-redecl.js: threw: Test262Error: Expected SameValue(«3», «4») to be true
 test262/test/staging/sm/lexical-environment/var-in-catch-body-annex-b-eval.js: threw: Test262Error: Expected SameValue(«"g"», «"global-x"») to be true
 test262/test/staging/sm/Map/constructor-iterator-close.js: threw: Test262Error: Expected SameValue(«true», «false») to be true
-test262/test/staging/sm/misc/getter-setter-outerize-this.js: threw: Test262Error: setter Expected SameValue(«false», «true») to be true
 test262/test/staging/sm/object/accessor-arguments-rest.js: threw: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all
 test262/test/staging/sm/object/defineProperties-order.js: threw: Test262Error: Expected SameValue(«"ownKeys,getOwnPropertyDescriptor,getOwnPropertyDescriptor,get,get"», «"ownKeys,getOwnPropertyDescriptor,get,getOwnPropertyDescriptor,get"») to be true
 test262/test/staging/sm/object/propertyIsEnumerable.js: threw: Test262Error: Expected a ReferenceError but got a TypeError
-test262/test/staging/sm/Proxy/global-receiver.js: threw: RangeError: Maximum call stack size exceeded
 test262/test/staging/sm/RegExp/constructor-ordering-2.js: threw: Test262Error: Expected SameValue(«false», «true») to be true
 test262/test/staging/sm/RegExp/escape.js: threw: Test262Error: Expected SameValue(«"\\\n"», «"\\n"») to be true
 test262/test/staging/sm/RegExp/source.js: threw: Test262Error: Expected SameValue(«"  "», «"\\u2028\\u2029"») to be true

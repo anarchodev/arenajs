@@ -41,6 +41,56 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+### Fixed — the shadow must not cross into JS
+
+Three more places where a request could observe the shadow as a distinct
+object identity. Together with the array-fast-path fix below they take the
+arena-vs-vanilla divergence over the test262 corpus to **zero**.
+
+**Accessor and Proxy receivers.** `JS_SetPropertyInternal2` keeps
+`this_obj` on the shadow deliberately -- C builtins write through it -- but
+that receiver was reaching JS unchanged. A setter compared it
+(`this === window`), and a Proxy trap was handed it and passed it to
+`Reflect.set(t, id, v, r)`, which set on the shadow, re-walked the
+shadow's prototype chain, re-entered the same trap and recursed until the
+stack went. Mapped to base identity at `call_setter` and at the Proxy
+`get`/`set` traps -- the points where the receiver crosses into JS, and
+nowhere else, so internal writes keep the shadow.
+
+**`Object.getPrototypeOf` on a primitive returned a shadow.** This one was
+self-inflicted: the previous release resolved shadows inside
+`JS_GetPrototypePrimitive` so a request could see its own replacement of
+`Boolean.prototype.toString`. That helper has three callers -- two lookups
+that want the shadow, and `JS_GetPrototype`, whose result goes straight
+back to JS. So `Object.getPrototypeOf(5) !== Number.prototype` once
+`Number.prototype` had been written. Resolution moved to the two lookup
+sites.
+
+Which sharpens the rule from "resolve shadows on read" to:
+
+> Resolve at the point of **use**. Never in a helper whose result can be
+> **returned**.
+
+### Added — `tests/arena-shadow`
+
+Identity probes for the base/shadow split, run by `arena-test262` and
+wired into `make test-arena`. Roughly 60 checks across five files:
+method/getter/setter receivers, `Reflect`, `call`/`apply`/`bind`,
+inherited accessors, `super`, boxed primitives, `__proto__` round-trips,
+Proxy traps, `Symbol.toPrimitive`/`valueOf`/`toJSON`, `Symbol.iterator`,
+`with` scope chains, generators, and `Object.getPrototypeOf` on every
+primitive.
+
+test262 cannot supply this: the invariant is arenajs's own, not a language
+rule. Every case corresponds to a bug that shipped, and the
+`Object.getPrototypeOf(5)` leak above was found by these probes after
+32763 corpus tests passed clean.
+
+They run under both runtimes, because a check that fails identically on a
+vanilla runtime is a bug in the probe rather than an escape -- which is
+how the `JSON.stringify` replacer case here got caught before it was
+committed.
+
 ### Fixed
 
 **A setter installed on `Array.prototype["0"]` never fired.** `add_property`
