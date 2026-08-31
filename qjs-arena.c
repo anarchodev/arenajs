@@ -96,10 +96,10 @@ struct JSDualArena {
 __thread struct js_arena_range js_arena_ranges[JS_ARENA_RANGES_MAX];
 __thread int                   js_arena_range_count = 0;
 
-/* Per-thread list of registered request ranges (+ current-mode pointer
-   for usable_size dispatch); see qjs-arena.h. */
-__thread struct js_arena_req_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
-__thread int                       js_arena_req_range_count = 0;
+/* Per-thread chunk set of registered request memory; see qjs-arena.h. */
+__thread struct js_arena_chunk *js_arena_chunk_tab = NULL;
+__thread uint32_t               js_arena_chunk_mask = 0;
+__thread uint32_t               js_arena_chunk_count = 0;
 
 int js_arena_register_base(const uint8_t *lo, const uint8_t *hi)
 {
@@ -125,29 +125,91 @@ void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi)
     }
 }
 
-int js_arena_register_request(const uint8_t *lo, const uint8_t *hi,
-                              const uint8_t *mode)
+#define JS_ARENA_CHUNK_TAB_INITIAL 64
+
+static void chunk_tab_put(struct js_arena_chunk *tab, uint32_t mask,
+                          uintptr_t key, JSDualArena *owner)
 {
-    if (js_arena_req_range_count >= JS_ARENA_RANGES_MAX)
+    uint32_t i = js_arena_chunk_hash(key, mask);
+    while (tab[i].key && tab[i].key != key)
+        i = (i + 1) & mask;
+    tab[i].key = key;
+    tab[i].owner = owner;
+}
+
+/* Rebuild the table at `new_size` slots (power of two), dropping every
+   entry owned by `drop` (NULL drops nothing). */
+static int chunk_tab_rebuild(uint32_t new_size, JSDualArena *drop)
+{
+    struct js_arena_chunk *nt = calloc(new_size, sizeof(*nt));
+    if (!nt)
         return -1;
-    js_arena_req_ranges[js_arena_req_range_count].lo = lo;
-    js_arena_req_ranges[js_arena_req_range_count].hi = hi;
-    js_arena_req_ranges[js_arena_req_range_count].mode = mode;
-    js_arena_req_range_count++;
+    uint32_t nmask = new_size - 1, kept = 0;
+    if (js_arena_chunk_tab) {
+        for (uint32_t i = 0; i <= js_arena_chunk_mask; i++) {
+            struct js_arena_chunk *e = &js_arena_chunk_tab[i];
+            if (e->key && e->owner && e->owner != drop) {
+                chunk_tab_put(nt, nmask, e->key, e->owner);
+                kept++;
+            }
+        }
+        free(js_arena_chunk_tab);
+    }
+    js_arena_chunk_tab = nt;
+    js_arena_chunk_mask = nmask;
+    js_arena_chunk_count = kept;
     return 0;
 }
 
-void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi)
+int js_arena_register_request(const uint8_t *lo, const uint8_t *hi,
+                              JSDualArena *owner)
 {
-    for (int i = 0; i < js_arena_req_range_count; i++) {
-        if (js_arena_req_ranges[i].lo == lo && js_arena_req_ranges[i].hi == hi) {
-            js_arena_req_range_count--;
-            js_arena_req_ranges[i] = js_arena_req_ranges[js_arena_req_range_count];
-            js_arena_req_ranges[js_arena_req_range_count].lo = NULL;
-            js_arena_req_ranges[js_arena_req_range_count].hi = NULL;
-            js_arena_req_ranges[js_arena_req_range_count].mode = NULL;
-            return;
-        }
+    assert(((uintptr_t)lo & (JS_ARENA_CHUNK_SIZE - 1)) == 0);
+    assert(((uintptr_t)hi & (JS_ARENA_CHUNK_SIZE - 1)) == 0);
+    uintptr_t first = (uintptr_t)lo >> JS_ARENA_CHUNK_SHIFT;
+    uintptr_t n = ((uintptr_t)hi >> JS_ARENA_CHUNK_SHIFT) - first;
+    /* Grow ahead of insertion so load stays <= 1/2 for the whole batch. */
+    size_t need = (size_t)js_arena_chunk_count + n;
+    uint32_t size = js_arena_chunk_mask ? js_arena_chunk_mask + 1
+                                        : JS_ARENA_CHUNK_TAB_INITIAL;
+    while ((size_t)size < need * 2)
+        size *= 2;
+    if (size != js_arena_chunk_mask + 1) {
+        if (chunk_tab_rebuild(size, NULL) < 0)
+            return -1;
+    }
+    for (uintptr_t c = 0; c < n; c++)
+        chunk_tab_put(js_arena_chunk_tab, js_arena_chunk_mask,
+                      first + c + 1, owner);
+    js_arena_chunk_count += (uint32_t)n;
+    return 0;
+}
+
+void js_arena_unregister_request(JSDualArena *owner)
+{
+    if (!js_arena_chunk_tab)
+        return;
+    uint32_t live = 0;
+    for (uint32_t i = 0; i <= js_arena_chunk_mask; i++)
+        if (js_arena_chunk_tab[i].key && js_arena_chunk_tab[i].owner &&
+            js_arena_chunk_tab[i].owner != owner)
+            live++;
+    if (live == 0) {
+        free(js_arena_chunk_tab);
+        js_arena_chunk_tab = NULL;
+        js_arena_chunk_mask = 0;
+        js_arena_chunk_count = 0;
+        return;
+    }
+    /* Rebuild without the owner's chunks (open addressing has no cheap
+       delete). If the rebuild can't allocate, fall back to blanking the
+       owner: stale keys stay in the table as never-matching entries
+       (their owner is dead), which preserves probe chains at the cost
+       of some load. Teardown is rare; correctness over thrift. */
+    if (chunk_tab_rebuild(js_arena_chunk_mask + 1, owner) < 0) {
+        for (uint32_t i = 0; i <= js_arena_chunk_mask; i++)
+            if (js_arena_chunk_tab[i].owner == owner)
+                js_arena_chunk_tab[i].owner = NULL;
     }
 }
 
@@ -168,15 +230,18 @@ static int arena_init(JSArena *a, size_t capacity)
     if (capacity == 0)
         capacity = ARENA_DEFAULT_SIZE;
 #if defined(__wasm__) || defined(ARENA_NO_THERM)
-    /* No mprotect on WASM, so the buffer doesn't need page-aligned starts.
-       Round capacity to ARENA_ALIGN and grab a 16-byte-aligned block. */
-    capacity = (capacity + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
+    /* No mprotect on WASM, so page alignment isn't needed for the
+       thermometer — but the request chunk set (qjs-arena.h) keys on
+       JS_ARENA_CHUNK_SIZE chunks and is only exact if buffers start and
+       end on chunk boundaries. Round capacity to a chunk multiple and
+       grab a chunk-aligned block. */
+    capacity = (capacity + JS_ARENA_CHUNK_SIZE - 1) & ~(JS_ARENA_CHUNK_SIZE - 1);
     if (capacity < ARENA_PREFIX_LEN + ARENA_HEADER_SIZE + ARENA_ALIGN)
         return -1;
 #if defined(_WIN32)
-    void *buf = _aligned_malloc(capacity, ARENA_ALIGN); /* mingw: (size, align), no aligned_alloc */
+    void *buf = _aligned_malloc(capacity, JS_ARENA_CHUNK_SIZE); /* mingw: (size, align), no aligned_alloc */
 #else
-    void *buf = aligned_alloc(ARENA_ALIGN, capacity);
+    void *buf = aligned_alloc(JS_ARENA_CHUNK_SIZE, capacity);
 #endif
     if (!buf)
         return -1;
@@ -188,7 +253,12 @@ static int arena_init(JSArena *a, size_t capacity)
     long pagesz = sysconf(_SC_PAGESIZE);
     if (pagesz <= 0)
         pagesz = 4096;
-    capacity = (capacity + (size_t)pagesz - 1) & ~(size_t)(pagesz - 1);
+    /* mmap starts are page-aligned; the request chunk set needs chunk-
+       aligned ends too, so round to whichever is larger. (Chunks are 4k;
+       pages are 4k/16k/64k — always a multiple.) */
+    size_t round = (size_t)pagesz > JS_ARENA_CHUNK_SIZE ? (size_t)pagesz
+                                                        : JS_ARENA_CHUNK_SIZE;
+    capacity = (capacity + round - 1) & ~(round - 1);
     if (capacity < ARENA_PREFIX_LEN + ARENA_HEADER_SIZE + ARENA_ALIGN)
         return -1;
 
@@ -355,8 +425,7 @@ void js_dual_arena_free(JSDualArena *da)
        the mspace's only segment is our buffer (EXTERN_BIT), reclaimed by
        arena_destroy below. */
     js_arena_unregister_base(lo, hi);
-    js_arena_unregister_request(da->request.buf,
-                                da->request.buf + da->request.capacity);
+    js_arena_unregister_request(da);
     arena_destroy(&da->base);
     arena_destroy(&da->request);
     free(da);
@@ -384,9 +453,14 @@ void js_dual_arena_freeze(JSDualArena *da)
     da->mode = JS_ARENA_MODE_REQUEST;
     request_mode_apply(da);
     js_arena_register_base(da->base.buf, da->base.buf + da->base.capacity);
-    js_arena_register_request(da->request.buf,
-                              da->request.buf + da->request.capacity,
-                              &da->req_mode);
+    if (js_arena_register_request(da->request.buf,
+                                  da->request.buf + da->request.capacity,
+                                  da) < 0) {
+        /* Without the registration js_malloc_usable_size would misread
+           every request pointer as a bump allocation. Not recoverable. */
+        fprintf(stderr, "js_dual_arena_freeze: request chunk table OOM\n");
+        abort();
+    }
 }
 
 void js_dual_arena_set_request_mode(JSDualArena *da, JSArenaReqMode mode)
@@ -627,14 +701,9 @@ static size_t jda_usable_size(const void *ptr)
        mode (all live request pointers match the current mode; the mode
        only changes at reset, which kills them all). Everything else
        (base arena, pre-freeze pointers) carries a bump header. */
-    const uint8_t *b = (const uint8_t *)ptr;
-    for (int i = 0; i < js_arena_req_range_count; i++) {
-        if (b >= js_arena_req_ranges[i].lo && b < js_arena_req_ranges[i].hi) {
-            if (*js_arena_req_ranges[i].mode == JS_ARENA_REQ_MODE_GC)
-                return mspace_usable_size(ptr);
-            return (size_t)arena_user_size(ptr);
-        }
-    }
+    JSDualArena *owner = js_arena_ptr_request_owner(ptr);
+    if (owner && owner->req_mode == JS_ARENA_REQ_MODE_GC)
+        return mspace_usable_size(ptr);
     return (size_t)arena_user_size(ptr);
 }
 

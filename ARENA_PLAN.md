@@ -1068,3 +1068,61 @@ ceiling (watch for the `tag=NULL` OOM diagnostic in production logs).
 Until then it stays designed-but-unbuilt — the bump-only allocator is
 simpler and faster for handlers that fit, which is the expected
 common case.
+
+## Chunked request arena + suspended requests (branch `feat/chunked-request-arena`)
+
+Goal: (a) request memory as page-granular extents handed out by a host
+provider on demand instead of one fixed buffer; (b) more than one
+request in flight per runtime, parked at job boundaries (a handler that
+`await`s a host promise holds its request arena until resumed). (b)
+needs (a): a parked request must cost its live chunks, not 16 MiB.
+
+Design notes established before starting (2026-08-30):
+
+- **No stack capture.** JS runs on the C stack; suspension is only ever
+  at a job boundary (`JS_ExecutePendingJob` returns, `job_list` empty
+  or not). Await is the yield point; the engine grows no scheduler.
+- **`rt->req` is the whole request identity.** Everything a request
+  owns already hangs off `JSRequestState` (class-4 audit). Switching
+  requests = switching that pointer — but it lives on the base-resident
+  `JSRuntime`, so it needs one indirection through a non-base slot.
+- **`JSDualArena` is 1 base + 1 request.** Becomes 1 base + N request
+  arenas, each owning its head slot, mspace, chunk list, OOM latch and
+  mode. `JSRequestState` gets an `arena` field so chokepoints stop
+  going through `JS_GetDualArena(rt)`.
+- **Same thread, still.** Base-range TLS list and `rt->stack_top`.
+  Suspension is the host event loop's concern on the owning thread.
+- **Replay:** interleaving order becomes part of the trace; the engine
+  stays deterministic per request.
+- **dlmalloc already chains segments.** `HAVE_MORECORE=1` with a custom
+  `MORECORE` that pulls page-aligned extents from the provider; keep
+  `HAVE_MMAP=0`. Extents are variable-size at 4k granularity (big
+  strings / ArrayBuffers / shapes need contiguous runs > 4k); default
+  extent 64k–256k, 4k is the floor, not the norm.
+
+Steps (1–2 are contract-neutral; 3–4 change the embedder contract and
+get CHANGELOG entries):
+
+- [x] **1. Page-set membership replaces `js_arena_req_ranges`.**
+  `js_malloc_usable_size` gets only a pointer, so request-vs-base
+  dispatch needs a membership test that survives N non-contiguous
+  chunks; the old table was 16 fixed ranges. Now a per-thread
+  open-addressed hash set keyed on `addr >> JS_ARENA_CHUNK_SHIFT` (4k),
+  value = owning `JSDualArena*`. O(1) lookup independent of chunk
+  count; registered at freeze, dropped by owner at free. Buffers are
+  chunk-aligned and chunk-sized on every path (the WASM/`ARENA_NO_THERM`
+  path was 16-byte aligned) so the set is exact. `arena-smoke` asserts
+  request/base/libc pointers classify correctly and that the table is
+  released with the last arena.
+- [ ] **2. Chunked request arena behind the existing single-request
+  API.** Provider callback (`js_dual_arena_new` gains a provider; NULL =
+  today's fixed buffer as a one-extent provider). Bump mode over a chunk
+  list; GC mode via `MORECORE`. Reset returns all but the head chunk.
+  OOM latch records the provider's refusal. Soak: 46k corpus, both
+  regimes, ASan + hardened base.
+- [ ] **3. `rt->req` indirection + split `JSDualArena`.** Host-heap
+  `req_cur` slot; `JSRequestArena` as its own object; `req->arena`.
+- [ ] **4. Multi-request API.** `JS_NewRequest` / `JS_EnterRequest` /
+  `JS_LeaveRequest` / `JS_FreeRequest`; `JS_ResetRequestArena` becomes
+  Free+New on the head chunk so run-to-completion embedders are
+  unchanged.

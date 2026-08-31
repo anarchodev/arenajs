@@ -119,35 +119,73 @@ static inline bool js_arena_ptr_is_base(const void *p)
 JS_EXTERN int  js_arena_register_base(const uint8_t *lo, const uint8_t *hi);
 JS_EXTERN void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi);
 
-/* Same registry pattern for request-region ranges. Needed because
- * js_malloc_usable_size receives only the pointer — no opaque — and
- * must dispatch between mspace chunks (mspace_usable_size) and
- * bump-header allocations. Each entry carries a pointer to its arena's
- * CURRENT request mode: with per-reset allocator selection, whether a
- * request-range pointer is an mspace chunk or a bump allocation is a
- * property of the arena's mode this request — and every live request
- * pointer matches the current mode, because a reset (the only moment
- * the mode can change) kills all request allocations wholesale. */
-struct js_arena_req_range {
-    const uint8_t *lo, *hi;
-    const uint8_t *mode;   /* -> JSDualArena.req_mode (JSArenaReqMode) */
+/* Request-region membership: a per-thread hash set of chunk indices.
+ *
+ * Needed because js_malloc_usable_size receives only the pointer — no
+ * opaque — and must dispatch between mspace chunks (mspace_usable_size)
+ * and bump-header allocations; the owning arena's CURRENT request mode
+ * decides, and every live request pointer matches it because a reset
+ * (the only moment the mode can change) kills all request allocations
+ * wholesale.
+ *
+ * Unlike the base list above this is NOT a bounded range table: request
+ * memory is registered one JS_ARENA_CHUNK_SIZE chunk at a time, keyed on
+ * (addr >> JS_ARENA_CHUNK_SHIFT), so a request region can be any number
+ * of non-contiguous chunks and membership stays O(1) regardless of how
+ * many are registered. Request buffers are chunk-aligned and chunk-sized
+ * (arena_init rounds them) so the set is exact — no foreign heap pointer
+ * shares a chunk with request memory. Storage is libc-malloc'd, sized to
+ * keep the load factor <= 1/2; it lives outside base and outside any
+ * request region. Registering is O(chunks) and happens at freeze;
+ * lookups are a multiply, a mask and a probe. */
+#define JS_ARENA_CHUNK_SHIFT 12
+#define JS_ARENA_CHUNK_SIZE  ((size_t)1 << JS_ARENA_CHUNK_SHIFT)
+struct js_arena_chunk {
+    uintptr_t   key;    /* chunk index + 1; 0 = empty slot */
+    JSDualArena *owner;
 };
-extern __thread struct js_arena_req_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
-extern __thread int                       js_arena_req_range_count;
+extern JS_EXTERN __thread struct js_arena_chunk *js_arena_chunk_tab;
+extern JS_EXTERN __thread uint32_t               js_arena_chunk_mask;  /* size - 1; 0 = no table */
+extern JS_EXTERN __thread uint32_t               js_arena_chunk_count;
+
+static inline uint32_t js_arena_chunk_hash(uintptr_t key, uint32_t mask)
+{
+    uint64_t v = (uint64_t)key * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(v >> 32) & mask;
+}
+
+/* Owning arena of a request-region pointer, or NULL for anything else
+ * (base, pre-freeze, vanilla heap). */
+static inline JSDualArena *js_arena_ptr_request_owner(const void *p)
+{
+    struct js_arena_chunk *tab = js_arena_chunk_tab;
+    if (!tab)
+        return NULL;
+    uintptr_t key = ((uintptr_t)p >> JS_ARENA_CHUNK_SHIFT) + 1;
+    uint32_t mask = js_arena_chunk_mask;
+    uint32_t i = js_arena_chunk_hash(key, mask);
+    for (;;) {
+        uintptr_t k = tab[i].key;
+        if (k == 0)
+            return NULL;
+        if (k == key)
+            return tab[i].owner;
+        i = (i + 1) & mask;
+    }
+}
 
 static inline bool js_arena_ptr_is_request(const void *p)
 {
-    const uint8_t *b = (const uint8_t *)p;
-    for (int i = 0; i < js_arena_req_range_count; i++) {
-        if (b >= js_arena_req_ranges[i].lo && b < js_arena_req_ranges[i].hi)
-            return true;
-    }
-    return false;
+    return js_arena_ptr_request_owner(p) != NULL;
 }
 
+/* Register every chunk of [lo, hi) — both chunk-aligned — as owned by
+ * `owner`. Returns 0, or -1 if the table could not grow (malloc failure);
+ * on -1 nothing was registered. Unregister drops every chunk owned by
+ * `owner` and frees the table when it empties. */
 JS_EXTERN int  js_arena_register_request(const uint8_t *lo, const uint8_t *hi,
-                                         const uint8_t *mode);
-JS_EXTERN void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi);
+                                         JSDualArena *owner);
+JS_EXTERN void js_arena_unregister_request(JSDualArena *owner);
 
 /* Fixed per-request state slot. The first JS_ARENA_REQUEST_SLOT_SIZE
  * bytes of the request region (after the 16-byte cursor prefix) are

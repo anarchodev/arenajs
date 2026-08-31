@@ -63,6 +63,25 @@ int main(void)
     JS_FreezeRuntime(rt);
     printf("frozen=%d\n", js_dual_arena_is_frozen(da));
 
+    /* Request-chunk membership: a post-freeze allocation is request
+       memory owned by this arena; the runtime struct (base) and a libc
+       pointer are not. Both must hold or js_malloc_usable_size
+       dispatches to the wrong size function. */
+    {
+        void *req_p = js_malloc_rt(rt, 64);
+        void *libc_p = malloc(64);
+        if (js_arena_ptr_request_owner(req_p) != da ||
+            js_arena_ptr_is_request(rt) ||
+            js_arena_ptr_is_request(libc_p) ||
+            !js_arena_ptr_is_base(rt)) {
+            fprintf(stderr, "request chunk membership wrong\n"); return 1;
+        }
+        printf("chunk_tab: %u chunks registered (%zu B request)\n",
+               js_arena_chunk_count, js_dual_arena_request_used(da));
+        free(libc_p);
+        js_free_rt(rt, req_p);
+    }
+
     if (js_arena_thermometer_enable() < 0) {
         fprintf(stderr, "thermometer enable failed\n"); return 1;
     }
@@ -278,5 +297,8 @@ int main(void)
        runtime, contexts, and everything they own live in arena pages
        that vanish in one munmap. */
     js_dual_arena_free(da);
+    if (js_arena_chunk_tab != NULL || js_arena_chunk_count != 0) {
+        fprintf(stderr, "request chunk table not released\n"); return 1;
+    }
     return 0;
 }
