@@ -373,8 +373,37 @@ JS_EXTERN int JS_ScanSnapshotHazards(JSRuntime *rt, void *out_FILE);
    throw TypeError ("ArrayBuffer is immutable"); copy explicitly
    (new Uint8Array(BASE_TA)) to get a mutable per-request one. */
 JS_EXTERN int JS_MarkAllBaseArrayBuffersImmutable(JSRuntime *rt);
+/* Reset the CURRENT request (no-op if none is entered), then re-init its
+ * state: the run-to-completion path. */
 JS_EXTERN void JS_ResetRequestArena(JSRuntime *rt);
 JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
+
+/* ----- requests as objects -----
+ *
+ * A frozen runtime runs one request at a time but may hold any number:
+ * a request that returned to the host with work pending (a promise
+ * awaiting a host operation, jobs not yet drained) keeps its memory
+ * and its state until the host enters it again. Enter and leave only
+ * ever happen at a job boundary — with no JS frame live — which is
+ * where the C stack is empty; JS_EnterRequest / JS_LeaveRequest refuse
+ * (-1) if called from inside JS. Values never cross requests: only
+ * base is shared. With no request entered the runtime reads the
+ * pristine template state and accepts no allocation.
+ *
+ * JS_NewRequest creates a request arena with the given budget /
+ * provider (see js_dual_arena_new2) and allocator mode, and initialises
+ * its state; the entered request, if any, is left entered. The request
+ * created by JS_NewRuntimeArena is entered at freeze, so a
+ * single-request embedder never sees this API. */
+JS_EXTERN JSRequestArena *JS_NewRequest(JSRuntime *rt, size_t request_cap,
+                                        const JSArenaChunkProvider *prov,
+                                        JSArenaReqMode mode);
+JS_EXTERN int  JS_EnterRequest(JSRuntime *rt, JSRequestArena *req);
+JS_EXTERN int  JS_LeaveRequest(JSRuntime *rt);
+JS_EXTERN JSRequestArena *JS_CurrentRequest(JSRuntime *rt);
+/* Frees the request's memory. Leaves it first if it is entered; refuses
+ * (-1) from inside JS. */
+JS_EXTERN int  JS_FreeRequest(JSRuntime *rt, JSRequestArena *req);
 
 /* Internal: marks a runtime as arena-backed. Set by JS_NewRuntimeArena;
    defined in quickjs.c so it can reach the JSRuntime struct. */

@@ -1237,7 +1237,10 @@ void JS_ResetRequestArena(JSRuntime *rt)
     /* Rewind the cursor to the floor (past the fixed JSRequestState
        slot), then re-init the slot in place. rt->req (a one-time base
        write at freeze) stays valid with zero further base writes. */
-    js_dual_arena_reset_request(JS_GetDualArena(rt));
+    JSDualArena *da = JS_GetDualArena(rt);
+    if (!js_dual_arena_current_request(da))
+        return; /* nothing entered (JS_LeaveRequest): nothing to reset */
+    js_dual_arena_reset_request(da);
     JS_RelocateReqState(rt);
 }
 

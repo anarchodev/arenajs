@@ -415,6 +415,54 @@ int main(void)
         }
     }
 
+    /* --- requests as objects: a connection held on a promise ---
+       Request A's handler awaits something the host will complete
+       later; it returns to the host with the promise pending and is
+       left. Request B runs to completion meanwhile. The host then
+       re-enters A, resolves the promise from JS, pumps A's microtasks,
+       and reads the result. This is the model that replaces
+       next + reset for held connections. */
+    {
+        JSRequestArena *a = JS_NewRequest(rt, 4 * 1024 * 1024, NULL, JS_ARENA_REQ_MODE_GC);
+        JSRequestArena *b = JS_NewRequest(rt, 4 * 1024 * 1024, NULL, JS_ARENA_REQ_MODE_BUMP);
+        if (!a || !b) { fprintf(stderr, "JS_NewRequest failed\n"); return 1; }
+        JSRequestArena *r0 = JS_CurrentRequest(rt);
+        if (JS_EnterRequest(rt, a) < 0) { fprintf(stderr, "enter A failed\n"); return 1; }
+        if (eval_print(ctx,
+            "var got = 'pending';"
+            "var p = new Promise(res => { globalThis.complete = res; });"
+            "p.then(v => { got = 'resolved:' + v; });"
+            "got", "A-park")) return 1;
+        if (JS_IsJobPending(rt)) { fprintf(stderr, "A should have no jobs yet\n"); return 1; }
+        if (JS_LeaveRequest(rt) < 0) { fprintf(stderr, "leave A failed\n"); return 1; }
+        if (JS_CurrentRequest(rt) != NULL) { fprintf(stderr, "leave did not deselect\n"); return 1; }
+        /* B runs to completion while A is held */
+        if (JS_EnterRequest(rt, b) < 0) { fprintf(stderr, "enter B failed\n"); return 1; }
+        if (eval_print(ctx, "typeof got + '/' + typeof complete + '/' + (new Array(20000).fill(2).length)",
+                       "B-run")) return 1;
+        if (JS_FreeRequest(rt, b) < 0) { fprintf(stderr, "free B failed\n"); return 1; }
+        if (JS_CurrentRequest(rt) != NULL) { fprintf(stderr, "free did not deselect\n"); return 1; }
+        /* the host operation completes: resume A */
+        printf("held A: %zu B across %zu extents while parked\n",
+               js_request_arena_held(a), js_request_arena_extents(a));
+        if (JS_EnterRequest(rt, a) < 0) { fprintf(stderr, "re-enter A failed\n"); return 1; }
+        if (eval_print(ctx, "complete('io-done'); got", "A-resolve")) return 1;
+        if (!JS_IsJobPending(rt)) { fprintf(stderr, "A should have a reaction job\n"); return 1; }
+        {
+            JSContext *jc = NULL;
+            int n = 0, rc;
+            while ((rc = JS_ExecutePendingJob(rt, &jc)) > 0) n++;
+            if (rc < 0) { fprintf(stderr, "A job threw\n"); return 1; }
+            printf("pumped %d job(s)\n", n);
+        }
+        if (eval_print(ctx, "got", "A-done")) return 1;
+        if (JS_FreeRequest(rt, a) < 0) { fprintf(stderr, "free A failed\n"); return 1; }
+        /* back to the runtime's own request; the reset path still works */
+        if (JS_EnterRequest(rt, r0) < 0) { fprintf(stderr, "re-enter r0 failed\n"); return 1; }
+        JS_ResetRequestArena(rt);
+        if (eval_print(ctx, "GREET('after held requests')", "r0-reset")) return 1;
+    }
+
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
        (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
        etc.) are for the refcount-based default path. In arena mode the

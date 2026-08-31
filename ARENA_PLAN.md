@@ -1151,7 +1151,24 @@ get CHANGELOG entries):
   chokepoints only ever need "the arena receiving allocations".
   Contract: a fresh request arena's slot is uninitialised until
   `JS_RelocateReqState` runs with it selected; step 4 wraps that.
-- [ ] **4. Multi-request API.** `JS_NewRequest` / `JS_EnterRequest` /
-  `JS_LeaveRequest` / `JS_FreeRequest`; `JS_ResetRequestArena` becomes
-  Free+New on the head chunk so run-to-completion embedders are
-  unchanged.
+- [x] **4. Multi-request API.** `JS_NewRequest(rt, cap, prov, mode)` /
+  `JS_EnterRequest` / `JS_LeaveRequest` / `JS_CurrentRequest` /
+  `JS_FreeRequest` in quickjs.c (they need `current_stack_frame` for
+  the job-boundary check — enter/leave refuse from inside JS). With no
+  request entered the runtime's cell points at the base template
+  `rt->req_state` and allocation is refused, so a host touching request
+  values after leave shows up on the thermometer rather than
+  corrupting a parked request. `JS_ResetRequestArena` is unchanged
+  (reset + re-init of the entered request; no-op when none) — the
+  run-to-completion embedder never sees the new API. Reactor:
+  `arena_request_new/enter/leave/free/eval/pump/held` (+ `_r` instance
+  forms, WASM exports); CHANGELOG [Unreleased] carries the contract
+  entry. `arena-smoke` runs the held-connection model: A parks on a
+  pending promise, B runs to completion under bump mode and is freed,
+  A is re-entered, resolved from JS, pumped, read; the runtime's own
+  request still resets afterwards.
+
+Follow-ups (rove integration, not engine work): a module-entry form
+(`arena_request_run_module`) if replay needs held requests on the
+module path — `r->entry_module` is per-instance and would want to be
+per-request there; per-request trace state likewise.

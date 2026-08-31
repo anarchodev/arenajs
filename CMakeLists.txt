@@ -376,7 +376,7 @@ if(EMSCRIPTEN)
     # arenajs reactor: minimal browser-facing module that exports
     # arena_init/arena_run/arena_destroy. Consumed by rove's replay UI.
     # Tape host imports and trace-event emitter land in follow-ons.
-    set(ARENA_WASM_EXPORTS "_arena_init,_arena_init_open,_arena_eval_base,_arena_freeze,_arena_run,_arena_run_module,_arena_set_trace_mode,_arena_set_request_mode,_arena_snapshot_here,_arena_set_random_seed,_arena_set_date_now,_arena_oom_hit,_arena_oom_requested,_arena_oom_used,_arena_oom_limit,_arena_destroy,_malloc,_free")
+    set(ARENA_WASM_EXPORTS "_arena_init,_arena_init_open,_arena_eval_base,_arena_freeze,_arena_run,_arena_run_module,_arena_set_trace_mode,_arena_set_request_mode,_arena_snapshot_here,_arena_set_random_seed,_arena_set_date_now,_arena_oom_hit,_arena_oom_requested,_arena_oom_used,_arena_oom_limit,_arena_request_new,_arena_request_enter,_arena_request_leave,_arena_request_free,_arena_request_eval,_arena_request_pump,_arena_request_held,_arena_destroy,_malloc,_free")
     if(DEFINED ENV{ROVE_ARENA_LIB})
         # The embedder archive's cwrap-reachable exports ride the same list.
         string(APPEND ARENA_WASM_EXPORTS ",_rove_arena_set_budget_ms")

@@ -2785,6 +2785,8 @@ int JS_RelocateReqState(JSRuntime *rt)
     }
     JSRequestState *new_req =
         js_dual_arena_request_slot(JS_GetDualArena(rt));
+    if (!new_req)
+        return -1; /* no request entered */
     *new_req = rt->req_state;
     new_req->atom_overlay_base = rt->atom_size;
     new_req->atom_overlay_free_index = 0;
@@ -2828,6 +2830,84 @@ int JS_RelocateReqState(JSRuntime *rt)
     /* The cell is dual-arena heap memory, never base: storing here on
        every reset / request switch dirties nothing in the snapshot. */
     RT_REQ(rt) = new_req;
+    return 0;
+}
+
+/* ----- requests as objects (see qjs-arena.h) ----- */
+
+/* Point the runtime at `ra`'s state, or at the pristine template when
+   nothing is entered. Both stores hit the dual arena's heap cell. The
+   template is base memory: any engine write to it while no request is
+   entered is a host-contract violation, and the thermometer sees it. */
+static void js_select_request(JSRuntime *rt, JSRequestArena *ra)
+{
+    js_dual_arena_select_request(JS_GetDualArena(rt), ra);
+    if (!ra)
+        RT_REQ(rt) = &rt->req_state;
+}
+
+static bool js_at_job_boundary(JSRuntime *rt)
+{
+    return RT_REQ(rt)->current_stack_frame == NULL;
+}
+
+JSRequestArena *JS_NewRequest(JSRuntime *rt, size_t request_cap,
+                              const JSArenaChunkProvider *prov,
+                              JSArenaReqMode mode)
+{
+    if (!rt->is_arena)
+        return NULL;
+    JSDualArena *da = JS_GetDualArena(rt);
+    JSRequestArena *prev = js_dual_arena_current_request(da);
+    JSRequestArena *ra = js_request_arena_new(da, request_cap, prov);
+    if (!ra)
+        return NULL;
+    /* Bind the allocator regime, then initialise the state in place.
+       Done with `ra` selected because both operate on the selection;
+       the caller's request is re-entered before returning. */
+    js_dual_arena_select_request(da, ra);
+    js_dual_arena_set_request_mode(da, mode);
+    js_dual_arena_reset_request(da);
+    if (JS_RelocateReqState(rt) < 0) {
+        js_select_request(rt, prev);
+        js_request_arena_free(ra);
+        return NULL;
+    }
+    js_select_request(rt, prev);
+    return ra;
+}
+
+int JS_EnterRequest(JSRuntime *rt, JSRequestArena *req)
+{
+    if (!rt->is_arena || !req || !js_at_job_boundary(rt))
+        return -1;
+    if (js_request_arena_dual(req) != JS_GetDualArena(rt))
+        return -1;
+    js_select_request(rt, req);
+    return 0;
+}
+
+int JS_LeaveRequest(JSRuntime *rt)
+{
+    if (!rt->is_arena || !js_at_job_boundary(rt))
+        return -1;
+    js_select_request(rt, NULL);
+    return 0;
+}
+
+JSRequestArena *JS_CurrentRequest(JSRuntime *rt)
+{
+    return rt->is_arena ? js_dual_arena_current_request(JS_GetDualArena(rt))
+                        : NULL;
+}
+
+int JS_FreeRequest(JSRuntime *rt, JSRequestArena *req)
+{
+    if (!rt->is_arena || !req)
+        return -1;
+    if (JS_CurrentRequest(rt) == req && JS_LeaveRequest(rt) < 0)
+        return -1;
+    js_request_arena_free(req);
     return 0;
 }
 
