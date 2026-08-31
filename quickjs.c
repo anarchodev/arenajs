@@ -360,7 +360,7 @@ typedef struct JSValueLink {
    embedded `req_state` on JSRuntime is the storage and `req` points at
    it; reads/writes land on rt as before. In arena mode after freeze,
    JS_RelocateReqState allocates a fresh JSRequestState in the request
-   arena and re-points `rt->req` at it, so subsequent mutations of
+   arena and re-points `RT_REQ(rt)` at it, so subsequent mutations of
    these fields no longer dirty base pages.
 
    Discipline: this struct is for genuinely tiny per-request state. Do
@@ -548,24 +548,31 @@ struct JSRuntime {
 
     /* arena: fields formerly here (current_exception, in_out_of_memory,
        in_build_stack_trace, current_stack_frame, parent_promise) live
-       in JSRequestState now; access via rt->req. The embedded req_state
-       below is the backing for non-arena mode. */
+       in JSRequestState now; access via RT_REQ(rt), which reads the
+       JSRequestState* out of *req_cell. Non-arena mode: req_cell points
+       at req_vanilla, which points at the embedded req_state. Arena
+       mode: at freeze req_cell is pointed (the one base write) at a
+       heap cell owned by the dual arena, and every later request
+       switch or reset rewrites THAT cell — the JSRuntime, which is
+       base memory and may be hardened read-only, is never written
+       again. */
     JSRequestState req_state;
-    JSRequestState *req;
+    JSRequestState *req_vanilla;
+    JSRequestState **req_cell;
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
-    /* parent_promise moved to JSRequestState (rt->req->parent_promise);
+    /* parent_promise moved to JSRequestState (RT_REQ(rt)->parent_promise);
        smuggles the parent promise from js_promise_then to
        js_promise_constructor */
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
 
-    /* job_list moved to JSRequestState (rt->req->job_list) so request-
+    /* job_list moved to JSRequestState (RT_REQ(rt)->job_list) so request-
        side promise/microtask enqueues don't dirty base. */
 
     bool module_normalize_has_attr;
@@ -606,6 +613,8 @@ struct JSRuntime {
 #endif
     JSRuntimeFinalizerState *finalizers;
 };
+
+#define RT_REQ(rt) (*(rt)->req_cell)
 
 #if ARENA_TRACE_ENABLED
 /* Patch-site check: trace state resolved per-runtime. NULL slot (no
@@ -1944,7 +1953,7 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
     if (rt->is_arena) {
-        if (!rt->req->gc_mode)
+        if (!RT_REQ(rt)->gc_mode)
             return; /* bump mode: no reclaim, no trigger */
 #ifdef FORCE_GC_AT_MALLOC
         JS_RunGC(rt);
@@ -1957,15 +1966,15 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
            seed threshold never pay a single collection. */
         JSDualArena *da = (JSDualArena *)rt->malloc_state.opaque;
         size_t used = js_dual_arena_request_used(da);
-        if (unlikely(used + size > rt->req->gc_threshold)) {
+        if (unlikely(used + size > RT_REQ(rt)->gc_threshold)) {
             JS_RunGC(rt);
             /* Ratchet: 1.5x the surviving live set, floored at the
                seed so a tiny live set can't re-trigger every alloc.
                Both stores land in request memory. */
             used = js_dual_arena_request_used(da);
-            rt->req->gc_threshold = used + (used >> 1);
-            if (rt->req->gc_threshold < rt->malloc_gc_threshold)
-                rt->req->gc_threshold = rt->malloc_gc_threshold;
+            RT_REQ(rt)->gc_threshold = used + (used >> 1);
+            if (RT_REQ(rt)->gc_threshold < rt->malloc_gc_threshold)
+                RT_REQ(rt)->gc_threshold = rt->malloc_gc_threshold;
         }
 #endif
         return;
@@ -2636,6 +2645,14 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
 void js_runtime_mark_arena(JSRuntime *rt)
 {
     rt->is_arena = true;
+    /* Move the state pointer off the JSRuntime (base) into the dual
+       arena's heap cell. This is the one and only base write of the
+       arena lifecycle; JS_RelocateReqState and every request switch
+       write the cell. Bridge it to the embedded template until
+       JS_RelocateReqState installs the request-resident state. */
+    void **cell = js_dual_arena_state_cell(JS_GetDualArena(rt));
+    *cell = &rt->req_state;
+    rt->req_cell = (JSRequestState **)cell;
 }
 
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
@@ -2662,10 +2679,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     js_arena_init(rt);
     rt->malloc_gc_threshold = 256 * 1024;
 
-    /* arena: req points at the embedded backing until JS_FreezeRuntime
-       (in arena mode) repoints it at a fresh JSRequestState in the
-       request arena. */
-    rt->req = &rt->req_state;
+    /* arena: the state pointer cell lives on the runtime until
+       JS_FreezeRuntime (in arena mode) moves it to the dual arena's
+       heap cell (js_runtime_mark_arena). */
+    rt->req_vanilla = &rt->req_state;
+    rt->req_cell = &rt->req_vanilla;
     /* atom_overlay_base = UINT32_MAX disables the overlay dispatch path
        pre-freeze; JS_RelocateReqState lowers it to rt->atom_size. */
     rt->req_state.atom_overlay_base = UINT32_MAX;
@@ -2684,7 +2702,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     init_list_head(&rt->string_list);
 #endif
-    init_list_head(&rt->req->job_list);
+    init_list_head(&RT_REQ(rt)->job_list);
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2715,7 +2733,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     JS_UpdateStackTop(rt);
 
-    rt->req->current_exception = JS_UNINITIALIZED;
+    RT_REQ(rt)->current_exception = JS_UNINITIALIZED;
 
     return rt;
  fail:
@@ -2741,22 +2759,23 @@ void *JS_GetMallocOpaque(JSRuntime *rt)
 /* arena: at freeze time the dual-arena flips to request mode, so a
    js_calloc here lands in the request arena. We copy the embedded
    req_state contents (whatever transient state the snapshot left
-   behind, almost certainly clean) and re-point rt->req. From here
+   behind, almost certainly clean) and re-point RT_REQ(rt). From here
    on, every read/write of one of these fields hits the request
    arena instead of dirtying the JSRuntime page in base. */
 int JS_RelocateReqState(JSRuntime *rt)
 {
-    /* Re-initializes the JSRequestState in the arena's fixed head
-       slot. Called once at JS_FreezeRuntime (sets rt->req — the one
-       base write) and on every JS_ResetRequestArena (in-place re-init;
-       rt->req unchanged). */
+    /* Initializes the JSRequestState in the SELECTED request arena's
+       fixed head slot and points the runtime's state cell at it. Called
+       at JS_FreezeRuntime, on every JS_ResetRequestArena (in-place
+       re-init), and on a freshly created request arena once it is
+       selected. Zero base writes: the cell it stores to is heap. */
     /* JSRequestState lives in the arena's fixed head slot — reserved
        outside the allocator's territory, so its address is a constant
-       of the arena. rt->req is written once (freeze); resets re-init
+       of the arena. RT_REQ(rt) is written once (freeze); resets re-init
        the slot in place with zero base writes; and the address no
        longer depends on the request allocator's first-allocation
        behavior, which frees the allocator to change (or be selected
-       per reset) without re-pointing rt->req. */
+       per reset) without re-pointing RT_REQ(rt). */
     if (sizeof(JSRequestState) > JS_ARENA_REQUEST_SLOT_SIZE) {
         fprintf(stderr,
                 "JSRequestState (%zu B) exceeds JS_ARENA_REQUEST_SLOT_SIZE "
@@ -2806,12 +2825,9 @@ int JS_RelocateReqState(JSRuntime *rt)
     new_req->time_origin_req = 0;
     new_req->random_state_req = 0;
     new_req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
-    /* Same-value store guard: on reset new_req == rt->req (asserted
-       above), and skipping the store keeps reset at zero base writes —
-       an unconditional store dirties the JSRuntime page every reset,
-       which materializes a CoW page and pollutes the thermometer. */
-    if (rt->req != new_req)
-        rt->req = new_req;
+    /* The cell is dual-arena heap memory, never base: storing here on
+       every reset / request switch dirties nothing in the snapshot. */
+    RT_REQ(rt) = new_req;
     return 0;
 }
 
@@ -2828,7 +2844,7 @@ void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
     F(gc_obj_list);
     F(gc_zero_ref_count_list);
     F(req_state);
-    F(req);
+    F(req_cell);
     F(shape_hash);
 #undef F
     fprintf(out, "  --- backing buffers ---\n");
@@ -2840,12 +2856,12 @@ void JS_DumpRuntimeOffsets(JSRuntime *rt, void *out_FILE)
             (void *)rt->class_array, rt->class_count, sizeof(JSClass));
     fprintf(out, "  shape_hash   = %p (%d entries x 8B)\n",
             (void *)rt->shape_hash, rt->shape_hash_size);
-    fprintf(out, "  rt->req      = %p (sizeof JSRequestState = %zu)\n",
-            (void *)rt->req, sizeof(JSRequestState));
+    fprintf(out, "  RT_REQ(rt)      = %p (sizeof JSRequestState = %zu)\n",
+            (void *)RT_REQ(rt), sizeof(JSRequestState));
     fprintf(out, "  current_excn = %p (16B JSValue, in *req)\n",
-            (void *)&rt->req->current_exception);
+            (void *)&RT_REQ(rt)->current_exception);
     fprintf(out, "  cur_frame    = %p (8B ptr, in *req)\n",
-            (void *)&rt->req->current_stack_frame);
+            (void *)&RT_REQ(rt)->current_stack_frame);
     fprintf(out, "  gc_obj_list  = %p (16B list_head)\n",
             (void *)&rt->gc_obj_list);
 }
@@ -2967,19 +2983,19 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     for(i = 0; i < argc; i++) {
         e->argv[i] = js_dup(argv[i]);
     }
-    list_add_tail(&e->link, &rt->req->job_list);
+    list_add_tail(&e->link, &RT_REQ(rt)->job_list);
     return 0;
 }
 
 bool JS_IsJobPending(JSRuntime *rt)
 {
-    return !list_empty(&rt->req->job_list);
+    return !list_empty(&RT_REQ(rt)->job_list);
 }
 
 JSContext *JS_GetPendingJobContext(JSRuntime *rt)
 {
     if (JS_IsJobPending(rt)) {
-        return list_entry(rt->req->job_list.next, JSJobEntry, link)->ctx;
+        return list_entry(RT_REQ(rt)->job_list.next, JSJobEntry, link)->ctx;
     }
     return NULL;
 }
@@ -2993,13 +3009,13 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
-    if (list_empty(&rt->req->job_list)) {
+    if (list_empty(&RT_REQ(rt)->job_list)) {
         *pctx = NULL;
         return 0;
     }
 
     /* get the first pending job and execute it */
-    e = list_entry(rt->req->job_list.next, JSJobEntry, link);
+    e = list_entry(RT_REQ(rt)->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->ctx;
     res = e->job_func(e->ctx, e->argc, vc(e->argv));
@@ -3111,15 +3127,15 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
-    JS_FreeValueRT(rt, rt->req->current_exception);
+    JS_FreeValueRT(rt, RT_REQ(rt)->current_exception);
 
-    list_for_each_safe(el, el1, &rt->req->job_list) {
+    list_for_each_safe(el, el1, &RT_REQ(rt)->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
         js_free_rt(rt, e);
     }
-    init_list_head(&rt->req->job_list);
+    init_list_head(&RT_REQ(rt)->job_list);
 
     JS_RunGC(rt);
 
@@ -3624,7 +3640,7 @@ void JS_UpdateStackTop(JSRuntime *rt)
 
 static inline bool is_strict_mode(JSContext *ctx)
 {
-    JSStackFrame *sf = ctx->rt->req->current_stack_frame;
+    JSStackFrame *sf = RT_REQ(ctx->rt)->current_stack_frame;
     return sf && sf->is_strict_mode;
 }
 
@@ -3868,9 +3884,9 @@ static int JS_InitAtoms(JSRuntime *rt)
    Forward-declared above near JS_FreeAtomStruct. */
 static JSAtomStruct *js_atom_struct(JSRuntime *rt, uint32_t i)
 {
-    if (likely(i < rt->req->atom_overlay_base))
+    if (likely(i < RT_REQ(rt)->atom_overlay_base))
         return rt->atom_array[i];
-    return rt->req->atom_overlay[i - rt->req->atom_overlay_base];
+    return RT_REQ(rt)->atom_overlay[i - RT_REQ(rt)->atom_overlay_base];
 }
 
 /* arena: returns true if `i` is a valid atom index in either the base
@@ -3880,9 +3896,9 @@ static inline bool js_atom_in_range(JSRuntime *rt, uint32_t i)
 {
     if (i < rt->atom_size)
         return true;
-    if (rt->req->atom_overlay
-        && i >= rt->req->atom_overlay_base
-        && (i - rt->req->atom_overlay_base) < rt->req->atom_overlay_size)
+    if (RT_REQ(rt)->atom_overlay
+        && i >= RT_REQ(rt)->atom_overlay_base
+        && (i - RT_REQ(rt)->atom_overlay_base) < RT_REQ(rt)->atom_overlay_size)
         return true;
     return false;
 }
@@ -3890,22 +3906,22 @@ static inline bool js_atom_in_range(JSRuntime *rt, uint32_t i)
 #define ATOM_OVERLAY_INITIAL 64
 #define ATOM_HASH_OVERLAY_INITIAL 64
 
-/* Ensure rt->req->atom_overlay has a free slot; grow on demand.
+/* Ensure RT_REQ(rt)->atom_overlay has a free slot; grow on demand.
    Returns -1 on OOM. Slot 0 of the overlay is reserved (mirrors base
    atom_array's "0 = JS_ATOM_NULL" convention) so atom_overlay_free_index
    == 0 means "no free slot". */
 static int js_atom_overlay_ensure_slot(JSRuntime *rt)
 {
-    if (rt->req->atom_overlay_free_index != 0)
+    if (RT_REQ(rt)->atom_overlay_free_index != 0)
         return 0;
-    uint32_t old_size = rt->req->atom_overlay_size;
+    uint32_t old_size = RT_REQ(rt)->atom_overlay_size;
     uint32_t new_size = old_size == 0 ? ATOM_OVERLAY_INITIAL : old_size * 2;
-    JSAtomStruct **na = js_realloc_rt(rt, rt->req->atom_overlay,
+    JSAtomStruct **na = js_realloc_rt(rt, RT_REQ(rt)->atom_overlay,
                                       sizeof(JSAtomStruct *) * new_size);
     if (!na)
         return -1;
-    rt->req->atom_overlay = na;
-    rt->req->atom_overlay_size = new_size;
+    RT_REQ(rt)->atom_overlay = na;
+    RT_REQ(rt)->atom_overlay_size = new_size;
     uint32_t start = old_size == 0 ? 1 : old_size;
     for (uint32_t k = start; k < new_size; k++) {
         uint32_t next = (k == new_size - 1) ? 0 : k + 1;
@@ -3913,20 +3929,20 @@ static int js_atom_overlay_ensure_slot(JSRuntime *rt)
     }
     if (old_size == 0)
         na[0] = NULL; /* slot 0 unused */
-    rt->req->atom_overlay_free_index = start;
+    RT_REQ(rt)->atom_overlay_free_index = start;
     return 0;
 }
 
 /* Ensure atom_hash_overlay is allocated. */
 static int js_atom_hash_overlay_ensure(JSRuntime *rt)
 {
-    if (rt->req->atom_hash_overlay)
+    if (RT_REQ(rt)->atom_hash_overlay)
         return 0;
-    rt->req->atom_hash_overlay =
+    RT_REQ(rt)->atom_hash_overlay =
         js_mallocz_rt(rt, sizeof(uint32_t) * ATOM_HASH_OVERLAY_INITIAL);
-    if (!rt->req->atom_hash_overlay)
+    if (!RT_REQ(rt)->atom_hash_overlay)
         return -1;
-    rt->req->atom_hash_overlay_size = ATOM_HASH_OVERLAY_INITIAL;
+    RT_REQ(rt)->atom_hash_overlay_size = ATOM_HASH_OVERLAY_INITIAL;
     return 0;
 }
 
@@ -4027,10 +4043,10 @@ static inline uint32_t js_shadow_hash(const void *p, uint32_t mask)
 
 static JSObject *js_object_shadow_lookup(JSRuntime *rt, JSObject *p)
 {
-    JSObjectShadow *tab = rt->req->shadow_tab;
+    JSObjectShadow *tab = RT_REQ(rt)->shadow_tab;
     if (!tab)
         return NULL;
-    uint32_t mask = rt->req->shadow_tab_size - 1;
+    uint32_t mask = RT_REQ(rt)->shadow_tab_size - 1;
     uint32_t i = js_shadow_hash(p, mask);
     for (;;) {
         JSObject *b = tab[i].base;
@@ -4056,7 +4072,7 @@ static void js_shadow_tab_put(JSObjectShadow *tab, uint32_t mask,
 /* Ensure room for one more entry (keep load factor <= 1/2). */
 static int js_shadow_tab_reserve(JSContext *ctx)
 {
-    JSRequestState *req = ctx->rt->req;
+    JSRequestState *req = RT_REQ(ctx->rt);
     if (req->shadow_tab && (req->shadow_tab_count + 1) * 2 <= req->shadow_tab_size)
         return 0;
     uint32_t new_size = req->shadow_tab_size ? req->shadow_tab_size * 2
@@ -4095,9 +4111,9 @@ static JSObject *js_object_base_identity(JSRuntime *rt, JSObject *p)
        where the old linked list was O(live entries) of pointer chasing.
        Not worth a second pointer-keyed table until a caller makes it
        hot. */
-    JSObjectShadow *tab = rt->req->shadow_tab;
-    uint32_t seen = 0, live = rt->req->shadow_tab_count;
-    for (uint32_t i = 0; i < rt->req->shadow_tab_size && seen < live; i++) {
+    JSObjectShadow *tab = RT_REQ(rt)->shadow_tab;
+    uint32_t seen = 0, live = RT_REQ(rt)->shadow_tab_count;
+    for (uint32_t i = 0; i < RT_REQ(rt)->shadow_tab_size && seen < live; i++) {
         if (!tab[i].base)
             continue;
         seen++;
@@ -4135,9 +4151,9 @@ static JSObject *js_object_for_write(JSContext *ctx, JSObject *p)
     shadow = js_clone_jsobject_for_write(ctx, p);
     if (!shadow)
         return NULL;
-    js_shadow_tab_put(ctx->rt->req->shadow_tab,
-                      ctx->rt->req->shadow_tab_size - 1, p, shadow);
-    ctx->rt->req->shadow_tab_count++;
+    js_shadow_tab_put(RT_REQ(ctx->rt)->shadow_tab,
+                      RT_REQ(ctx->rt)->shadow_tab_size - 1, p, shadow);
+    RT_REQ(ctx->rt)->shadow_tab_count++;
     return shadow;
 }
 
@@ -4190,10 +4206,10 @@ static void *JS_GetOpaqueForWrite(JSContext *ctx, JSValueConst obj,
 
 static JSVarRef *js_var_ref_shadow_lookup(JSRuntime *rt, JSVarRef *vr)
 {
-    JSVarRefShadow *tab = rt->req->varref_tab;
+    JSVarRefShadow *tab = RT_REQ(rt)->varref_tab;
     if (!tab)
         return NULL;
-    uint32_t mask = rt->req->varref_tab_size - 1;
+    uint32_t mask = RT_REQ(rt)->varref_tab_size - 1;
     uint32_t i = js_shadow_hash(vr, mask);
     for (;;) {
         JSVarRef *b = tab[i].base;
@@ -4217,7 +4233,7 @@ static void js_varref_tab_put(JSVarRefShadow *tab, uint32_t mask,
 
 static int js_varref_tab_reserve(JSContext *ctx)
 {
-    JSRequestState *req = ctx->rt->req;
+    JSRequestState *req = RT_REQ(ctx->rt);
     if (req->varref_tab && (req->varref_tab_count + 1) * 2 <= req->varref_tab_size)
         return 0;
     uint32_t new_size = req->varref_tab_size ? req->varref_tab_size * 2
@@ -4269,9 +4285,9 @@ static JSVarRef *js_var_ref_for_write(JSContext *ctx, JSVarRef *vr)
        no-op for them and correct for anything else. */
     s->value = js_dup(*vr->pvalue);
     s->pvalue = &s->value;
-    js_varref_tab_put(ctx->rt->req->varref_tab,
-                      ctx->rt->req->varref_tab_size - 1, vr, s);
-    ctx->rt->req->varref_tab_count++;
+    js_varref_tab_put(RT_REQ(ctx->rt)->varref_tab,
+                      RT_REQ(ctx->rt)->varref_tab_size - 1, vr, s);
+    RT_REQ(ctx->rt)->varref_tab_count++;
     return s;
 }
 
@@ -4281,7 +4297,7 @@ static JSVarRef *js_var_ref_for_write(JSContext *ctx, JSVarRef *vr)
    Array.prototype (the write went to a per-request flag, base is clean). */
 static inline bool js_std_array_prototype_active(JSContext *ctx)
 {
-    return ctx->std_array_prototype && !ctx->rt->req->std_array_prototype_dirty;
+    return ctx->std_array_prototype && !RT_REQ(ctx->rt)->std_array_prototype_dirty;
 }
 
 /* arena: read ctx->error_back_trace through the per-request shadow.
@@ -4290,8 +4306,8 @@ static inline bool js_std_array_prototype_active(JSContext *ctx)
 static inline JSValueConst js_error_back_trace_active(JSContext *ctx)
 {
     if (ctx->rt->is_arena
-        && !JS_IsUndefined(ctx->rt->req->error_back_trace_req))
-        return ctx->rt->req->error_back_trace_req;
+        && !JS_IsUndefined(RT_REQ(ctx->rt)->error_back_trace_req))
+        return RT_REQ(ctx->rt)->error_back_trace_req;
     return ctx->error_back_trace;
 }
 
@@ -4301,7 +4317,7 @@ static inline JSValueConst js_error_back_trace_active(JSContext *ctx)
 static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
 {
     if (ctx->rt->is_arena)
-        ctx->rt->req->error_back_trace_req = val;
+        RT_REQ(ctx->rt)->error_back_trace_req = val;
     else
         ctx->error_back_trace = val;
 }
@@ -4318,16 +4334,16 @@ static inline void js_error_back_trace_set(JSContext *ctx, JSValue val)
    if it is undefined. */
 static inline JSValueConst js_error_prepare_stack_active(JSContext *ctx)
 {
-    if (ctx->rt->is_arena && ctx->rt->req->error_prepare_stack_set)
-        return ctx->rt->req->error_prepare_stack_req;
+    if (ctx->rt->is_arena && RT_REQ(ctx->rt)->error_prepare_stack_set)
+        return RT_REQ(ctx->rt)->error_prepare_stack_req;
     return ctx->error_prepare_stack;
 }
 static inline void js_error_prepare_stack_store(JSContext *ctx, JSValue val)
 {
     if (ctx->rt->is_arena) {
-        JS_FreeValue(ctx, ctx->rt->req->error_prepare_stack_req);
-        ctx->rt->req->error_prepare_stack_req = val;
-        ctx->rt->req->error_prepare_stack_set = true;
+        JS_FreeValue(ctx, RT_REQ(ctx->rt)->error_prepare_stack_req);
+        RT_REQ(ctx->rt)->error_prepare_stack_req = val;
+        RT_REQ(ctx->rt)->error_prepare_stack_set = true;
     } else {
         JS_FreeValue(ctx, ctx->error_prepare_stack);
         ctx->error_prepare_stack = val;
@@ -4335,16 +4351,16 @@ static inline void js_error_prepare_stack_store(JSContext *ctx, JSValue val)
 }
 static inline JSValueConst js_error_stack_limit_active(JSContext *ctx)
 {
-    if (ctx->rt->is_arena && ctx->rt->req->error_stack_trace_limit_set)
-        return ctx->rt->req->error_stack_trace_limit_req;
+    if (ctx->rt->is_arena && RT_REQ(ctx->rt)->error_stack_trace_limit_set)
+        return RT_REQ(ctx->rt)->error_stack_trace_limit_req;
     return ctx->error_stack_trace_limit;
 }
 static inline void js_error_stack_limit_store(JSContext *ctx, JSValue val)
 {
     if (ctx->rt->is_arena) {
-        JS_FreeValue(ctx, ctx->rt->req->error_stack_trace_limit_req);
-        ctx->rt->req->error_stack_trace_limit_req = val;
-        ctx->rt->req->error_stack_trace_limit_set = true;
+        JS_FreeValue(ctx, RT_REQ(ctx->rt)->error_stack_trace_limit_req);
+        RT_REQ(ctx->rt)->error_stack_trace_limit_req = val;
+        RT_REQ(ctx->rt)->error_stack_trace_limit_set = true;
     } else {
         /* upstream leaks the previous value here; its sibling
            js_error_set_prepareStackTrace frees first. */
@@ -4365,7 +4381,7 @@ static inline JSValue js_error_back_trace_take(JSContext *ctx)
 static inline void js_std_array_prototype_mark_dirty(JSContext *ctx)
 {
     if (ctx->rt->is_arena)
-        ctx->rt->req->std_array_prototype_dirty = true;
+        RT_REQ(ctx->rt)->std_array_prototype_dirty = true;
     else
         ctx->std_array_prototype = false;
 }
@@ -4442,9 +4458,9 @@ static JSAtom js_get_atom_index(JSRuntime *rt, JSAtomStruct *p)
         JSAtomStruct *p1;
         /* arena: overlay atoms live in the overlay hash chain only;
            base atoms live in the base hash chain only. */
-        if (rt->req->atom_hash_overlay && !js_arena_ptr_is_base(p)) {
-            i = rt->req->atom_hash_overlay[p->hash &
-                (rt->req->atom_hash_overlay_size - 1)];
+        if (RT_REQ(rt)->atom_hash_overlay && !js_arena_ptr_is_base(p)) {
+            i = RT_REQ(rt)->atom_hash_overlay[p->hash &
+                (RT_REQ(rt)->atom_hash_overlay_size - 1)];
         } else {
             i = rt->atom_hash[p->hash & (rt->atom_hash_size - 1)];
         }
@@ -4482,9 +4498,9 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         h &= JS_ATOM_HASH_MASK;
         /* arena: walk the request-side overlay chain first; new atoms
            interned during the request live there. */
-        if (rt->req->atom_hash_overlay) {
-            uint32_t h1o = h & (rt->req->atom_hash_overlay_size - 1);
-            i = rt->req->atom_hash_overlay[h1o];
+        if (RT_REQ(rt)->atom_hash_overlay) {
+            uint32_t h1o = h & (RT_REQ(rt)->atom_hash_overlay_size - 1);
+            i = RT_REQ(rt)->atom_hash_overlay[h1o];
             while (i != 0) {
                 p = js_atom_struct(rt, i);
                 if (p->hash == h &&
@@ -4625,12 +4641,12 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
     if (rt->is_arena) {
         if (js_atom_overlay_ensure_slot(rt) < 0)
             goto fail;
-        uint32_t rel = (uint32_t)rt->req->atom_overlay_free_index;
-        rt->req->atom_overlay_free_index =
-            (int)atom_get_free(rt->req->atom_overlay[rel]);
-        rt->req->atom_overlay[rel] = p;
-        rt->req->atom_overlay_count++;
-        i = rt->req->atom_overlay_base + rel;
+        uint32_t rel = (uint32_t)RT_REQ(rt)->atom_overlay_free_index;
+        RT_REQ(rt)->atom_overlay_free_index =
+            (int)atom_get_free(RT_REQ(rt)->atom_overlay[rel]);
+        RT_REQ(rt)->atom_overlay[rel] = p;
+        RT_REQ(rt)->atom_overlay_count++;
+        i = RT_REQ(rt)->atom_overlay_base + rel;
     } else {
         /* use an already free entry */
         i = rt->atom_free_index;
@@ -4652,9 +4668,9 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
                base atom_hash. */
             if (js_atom_hash_overlay_ensure(rt) < 0)
                 goto fail;
-            uint32_t h1o = h & (rt->req->atom_hash_overlay_size - 1);
-            p->hash_next = rt->req->atom_hash_overlay[h1o];
-            rt->req->atom_hash_overlay[h1o] = i;
+            uint32_t h1o = h & (RT_REQ(rt)->atom_hash_overlay_size - 1);
+            p->hash_next = RT_REQ(rt)->atom_hash_overlay[h1o];
+            RT_REQ(rt)->atom_hash_overlay[h1o] = i;
         } else {
             p->hash_next = rt->atom_hash[h1];
             rt->atom_hash[h1] = i;
@@ -4698,9 +4714,9 @@ static JSAtom __JS_FindAtom(JSRuntime *rt, const char *str, size_t len,
     h = hash_string8((const uint8_t *)str, len, JS_ATOM_TYPE_STRING);
     h &= JS_ATOM_HASH_MASK;
     /* arena: walk the request-side overlay chain first. */
-    if (rt->req->atom_hash_overlay) {
-        uint32_t h1o = h & (rt->req->atom_hash_overlay_size - 1);
-        i = rt->req->atom_hash_overlay[h1o];
+    if (RT_REQ(rt)->atom_hash_overlay) {
+        uint32_t h1o = h & (RT_REQ(rt)->atom_hash_overlay_size - 1);
+        i = RT_REQ(rt)->atom_hash_overlay[h1o];
         while (i != 0) {
             p = js_atom_struct(rt, i);
             if (p->hash == h &&
@@ -6766,16 +6782,16 @@ static int resize_shape_hash(JSRuntime *rt, int new_shape_hash_bits)
    per-request shape hash; grows by doubling. Lives in JSRequestState. */
 #define JS_SHAPE_OVERLAY_INITIAL 32
 
-/* arena: ensure rt->req->shape_overlay is allocated. Returns -1 on OOM. */
+/* arena: ensure RT_REQ(rt)->shape_overlay is allocated. Returns -1 on OOM. */
 static int js_shape_overlay_ensure(JSRuntime *rt)
 {
-    if (likely(rt->req->shape_overlay))
+    if (likely(RT_REQ(rt)->shape_overlay))
         return 0;
     size_t bytes = sizeof(JSShape *) * JS_SHAPE_OVERLAY_INITIAL;
-    rt->req->shape_overlay = js_mallocz_rt(rt, bytes);
-    if (!rt->req->shape_overlay)
+    RT_REQ(rt)->shape_overlay = js_mallocz_rt(rt, bytes);
+    if (!RT_REQ(rt)->shape_overlay)
         return -1;
-    rt->req->shape_overlay_size = JS_SHAPE_OVERLAY_INITIAL;
+    RT_REQ(rt)->shape_overlay_size = JS_SHAPE_OVERLAY_INITIAL;
     return 0;
 }
 
@@ -6794,10 +6810,10 @@ static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
     if (rt->is_arena && !js_arena_ptr_is_base(sh)) {
         if (js_shape_overlay_ensure(rt) < 0)
             return;  /* on OOM, skip linking; lookups won't find this shape */
-        h = js_shape_overlay_bucket(sh->hash, rt->req->shape_overlay_size);
-        sh->shape_hash_next = rt->req->shape_overlay[h];
-        rt->req->shape_overlay[h] = sh;
-        rt->req->shape_overlay_count++;
+        h = js_shape_overlay_bucket(sh->hash, RT_REQ(rt)->shape_overlay_size);
+        sh->shape_hash_next = RT_REQ(rt)->shape_overlay[h];
+        RT_REQ(rt)->shape_overlay[h] = sh;
+        RT_REQ(rt)->shape_overlay_count++;
         return;
     }
     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
@@ -6817,14 +6833,14 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     if (rt->is_arena && js_arena_ptr_is_base(sh))
         return;
     /* arena: request-arena shape lives in the overlay. */
-    if (rt->is_arena && rt->req->shape_overlay) {
-        h = js_shape_overlay_bucket(sh->hash, rt->req->shape_overlay_size);
-        psh = &rt->req->shape_overlay[h];
+    if (rt->is_arena && RT_REQ(rt)->shape_overlay) {
+        h = js_shape_overlay_bucket(sh->hash, RT_REQ(rt)->shape_overlay_size);
+        psh = &RT_REQ(rt)->shape_overlay[h];
         while (*psh && *psh != sh)
             psh = &(*psh)->shape_hash_next;
         if (*psh) {
             *psh = sh->shape_hash_next;
-            rt->req->shape_overlay_count--;
+            RT_REQ(rt)->shape_overlay_count--;
         }
         return;
     }
@@ -6875,7 +6891,7 @@ static no_inline JSShape *js_new_shape2(JSContext *ctx, JSObject *proto,
 
     /* resize the shape hash table if necessary */
     /* arena: same hazard as the atom array — post-freeze, hashed shapes
-       link into rt->req->shape_overlay and rt->shape_hash_count is
+       link into RT_REQ(rt)->shape_overlay and rt->shape_hash_count is
        frozen, so a resize here would relocate the base table into the
        request arena for no benefit and leave it dangling after reset. */
     if (!rt->is_arena
@@ -7049,7 +7065,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         memcpy(sh, old_sh, sizeof(JSShape));  /* props copied below */
         /* arena: new storage registers in the request-side list. */
         if (ctx->rt->is_arena)
-            list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
+            list_add_tail(&sh->header.link, &RT_REQ(ctx->rt)->gc_obj_list);
         else
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
         /* arena+upstream: the GC/refcount fields live in the block header,
@@ -7093,12 +7109,12 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
             if (!ctx->rt->is_arena)
                 list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
             else if (arena_was_linked)
-                list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
+                list_add_tail(&sh->header.link, &RT_REQ(ctx->rt)->gc_obj_list);
             return -1;
         }
         sh = get_shape_from_alloc(sh_alloc, new_hash_size);
         if (ctx->rt->is_arena)
-            list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
+            list_add_tail(&sh->header.link, &RT_REQ(ctx->rt)->gc_obj_list);
         else
             list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
     }
@@ -7143,7 +7159,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
         if (!js_arena_ptr_is_base(old_sh))
             list_del(&old_sh->header.link);
         memcpy(sh, old_sh, sizeof(JSShape));
-        list_add_tail(&sh->header.link, &ctx->rt->req->gc_obj_list);
+        list_add_tail(&sh->header.link, &RT_REQ(ctx->rt)->gc_obj_list);
     } else {
         list_del(&old_sh->header.link);
         memcpy(sh, old_sh, sizeof(JSShape));
@@ -7246,9 +7262,9 @@ static JSShape *find_hashed_shape_proto(JSRuntime *rt, JSObject *proto)
 
     h = shape_initial_hash(proto);
     /* arena: check the per-request overlay first (newer transitions). */
-    if (rt->req->shape_overlay) {
-        h1 = js_shape_overlay_bucket(h, rt->req->shape_overlay_size);
-        for (sh1 = rt->req->shape_overlay[h1]; sh1; sh1 = sh1->shape_hash_next) {
+    if (RT_REQ(rt)->shape_overlay) {
+        h1 = js_shape_overlay_bucket(h, RT_REQ(rt)->shape_overlay_size);
+        for (sh1 = RT_REQ(rt)->shape_overlay[h1]; sh1; sh1 = sh1->shape_hash_next) {
             if (sh1->hash == h &&
                 sh1->proto == proto &&
                 sh1->prop_count == 0) {
@@ -7279,9 +7295,9 @@ static JSShape *find_hashed_shape_prop(JSRuntime *rt, JSShape *sh,
     h = shape_hash(h, atom);
     h = shape_hash(h, prop_flags);
     /* arena: check the per-request overlay first (newer transitions). */
-    if (rt->req->shape_overlay) {
-        h1 = js_shape_overlay_bucket(h, rt->req->shape_overlay_size);
-        for (sh1 = rt->req->shape_overlay[h1]; sh1; sh1 = sh1->shape_hash_next) {
+    if (RT_REQ(rt)->shape_overlay) {
+        h1 = js_shape_overlay_bucket(h, RT_REQ(rt)->shape_overlay_size);
+        for (sh1 = RT_REQ(rt)->shape_overlay[h1]; sh1; sh1 = sh1->shape_hash_next) {
             if (sh1->hash == h &&
                 sh1->proto == sh->proto &&
                 sh1->prop_count == ((n = sh->prop_count) + 1)) {
@@ -7854,16 +7870,16 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
         for(i = argc; i < arg_count; i++)
             arg_buf[i] = JS_UNDEFINED;
     }
-    prev_sf = rt->req->current_stack_frame;
+    prev_sf = RT_REQ(rt)->current_stack_frame;
     sf->prev_frame = prev_sf;
-    rt->req->current_stack_frame = sf;
+    RT_REQ(rt)->current_stack_frame = sf;
     // TODO(bnoordhuis) switch realms like js_call_c_function does
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
-    rt->req->current_stack_frame = sf->prev_frame;
+    RT_REQ(rt)->current_stack_frame = sf->prev_frame;
     return ret;
 }
 
@@ -7980,16 +7996,16 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
             arg_buf[i] = JS_UNDEFINED;
     }
 
-    prev_sf = rt->req->current_stack_frame;
+    prev_sf = RT_REQ(rt)->current_stack_frame;
     sf->prev_frame = prev_sf;
-    rt->req->current_stack_frame = sf;
+    RT_REQ(rt)->current_stack_frame = sf;
     // TODO(bnoordhuis) switch realms like js_call_c_function does
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
-    rt->req->current_stack_frame = sf->prev_frame;
+    RT_REQ(rt)->current_stack_frame = sf->prev_frame;
 
     return ret;
 }
@@ -8288,29 +8304,29 @@ static void js_for_in_iterator_mark(JSRuntime *rt, JSValueConst val,
    selectors keep the collector and free paths shared between the two. */
 static inline struct list_head *gc_obj_list_head(JSRuntime *rt)
 {
-    return rt->is_arena ? &rt->req->gc_obj_list : &rt->gc_obj_list;
+    return rt->is_arena ? &RT_REQ(rt)->gc_obj_list : &rt->gc_obj_list;
 }
 
 static inline struct list_head *gc_tmp_obj_list_head(JSRuntime *rt)
 {
-    return rt->is_arena ? &rt->req->tmp_obj_list : &rt->tmp_obj_list;
+    return rt->is_arena ? &RT_REQ(rt)->tmp_obj_list : &rt->tmp_obj_list;
 }
 
 static inline struct list_head *gc_zero_list_head(JSRuntime *rt)
 {
-    return rt->is_arena ? &rt->req->gc_zero_ref_count_list
+    return rt->is_arena ? &RT_REQ(rt)->gc_zero_ref_count_list
                         : &rt->gc_zero_ref_count_list;
 }
 
 static inline JSGCPhaseEnum gc_phase_get(JSRuntime *rt)
 {
-    return rt->is_arena ? rt->req->gc_phase : rt->gc_phase;
+    return rt->is_arena ? RT_REQ(rt)->gc_phase : rt->gc_phase;
 }
 
 static inline void gc_phase_set(JSRuntime *rt, JSGCPhaseEnum phase)
 {
     if (rt->is_arena)
-        rt->req->gc_phase = phase;
+        RT_REQ(rt)->gc_phase = phase;
     else
         rt->gc_phase = phase;
 }
@@ -8394,14 +8410,14 @@ static void free_zero_refcount(JSRuntime *rt)
 }
 
 /* arena: request-side twin of free_zero_refcount, draining
-   rt->req->gc_zero_ref_count_list with rt->req->gc_phase as the
+   RT_REQ(rt)->gc_zero_ref_count_list with RT_REQ(rt)->gc_phase as the
    re-entrancy latch. Children whose refcounts hit zero while an object
    is being freed are appended to the list by js_free_value_rt (which
    sees gc_phase != NONE) and picked up by this loop — constant stack
    depth for arbitrarily deep teardowns, zero base writes. */
 static void free_zero_refcount_req(JSRuntime *rt)
 {
-    JSRequestState *req = rt->req;
+    JSRequestState *req = RT_REQ(rt);
     struct list_head *el;
     JSGCObjectHeader *p;
 
@@ -8466,10 +8482,10 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
                    never touches base memory. During REMOVE_CYCLES the
                    object is in the collector's hands — do nothing,
                    same as vanilla, or it gets freed twice. */
-                if (rt->req->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
+                if (RT_REQ(rt)->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                     list_del(&p->link);
-                    list_add(&p->link, &rt->req->gc_zero_ref_count_list);
-                    if (rt->req->gc_phase == JS_GC_PHASE_NONE)
+                    list_add(&p->link, &RT_REQ(rt)->gc_zero_ref_count_list);
+                    if (RT_REQ(rt)->gc_phase == JS_GC_PHASE_NONE)
                         free_zero_refcount_req(rt);
                 }
             } else if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
@@ -8534,8 +8550,8 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
            linking and unlinking never writes base. In bump mode the
            collector never runs: self-loop instead (list_del stays
            safe) and skip the registry's four stores per allocation. */
-        if (likely(rt->req->gc_mode))
-            list_add_tail(&h->link, &rt->req->gc_obj_list);
+        if (likely(RT_REQ(rt)->gc_mode))
+            list_add_tail(&h->link, &RT_REQ(rt)->gc_obj_list);
         else
             init_list_head(&h->link);
         return;
@@ -8831,10 +8847,10 @@ void JS_RunGC(JSRuntime *rt)
     /* arena, bump mode: frees are no-ops and objects skipped registry
        linkage — collecting would run finalizers without reclaiming a
        byte. No-op, matching master's bump-only semantics. */
-    if (rt->is_arena && !rt->req->gc_mode)
+    if (rt->is_arena && !RT_REQ(rt)->gc_mode)
         return;
     /* arena: the collector runs against the request-side registry
-       (rt->req->gc_obj_list) — exactly the post-freeze collectible
+       (RT_REQ(rt)->gc_obj_list) — exactly the post-freeze collectible
        set. Base objects are reachable only as children and the
        gc_child_is_base guards skip them: immortal leaves. Cycles that
        pass through a shadowed base object stay uncollectible by
@@ -9358,8 +9374,8 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
-    JS_FreeValue(ctx, rt->req->current_exception);
-    rt->req->current_exception = obj;
+    JS_FreeValue(ctx, RT_REQ(rt)->current_exception);
+    RT_REQ(rt)->current_exception = obj;
     return JS_EXCEPTION;
 }
 
@@ -9368,14 +9384,14 @@ JSValue JS_GetException(JSContext *ctx)
 {
     JSValue val;
     JSRuntime *rt = ctx->rt;
-    val = rt->req->current_exception;
-    rt->req->current_exception = JS_UNINITIALIZED;
+    val = RT_REQ(rt)->current_exception;
+    RT_REQ(rt)->current_exception = JS_UNINITIALIZED;
     return val;
 }
 
 bool JS_HasException(JSContext *ctx)
 {
-    return !JS_IsUninitialized(ctx->rt->req->current_exception);
+    return !JS_IsUninitialized(RT_REQ(ctx->rt)->current_exception);
 }
 
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
@@ -9519,7 +9535,7 @@ int js_arena_trace_bc_resolve_line(JSContext *ctx, JSFunctionBytecode *b,
    live frames + locals when the host requests inspection. */
 JSStackFrame *js_arena_trace_top_frame(JSContext *ctx)
 {
-    return ctx->rt->req->current_stack_frame;
+    return RT_REQ(ctx->rt)->current_stack_frame;
 }
 JSStackFrame *js_arena_trace_prev_frame(JSStackFrame *sf)
 {
@@ -9703,9 +9719,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     int stack_trace_limit;
 
     rt = ctx->rt;
-    if (rt->req->in_build_stack_trace)
+    if (RT_REQ(rt)->in_build_stack_trace)
         return;
-    rt->req->in_build_stack_trace = true;
+    RT_REQ(rt)->in_build_stack_trace = true;
     error_obj = js_dup(error_val);
 
     // Save exception because conversion to double may fail.
@@ -9759,7 +9775,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     if (filename && (backtrace_flags & JS_BACKTRACE_FLAG_SINGLE_LEVEL))
         goto done;
 
-    sf_start = rt->req->current_stack_frame;
+    sf_start = RT_REQ(rt)->current_stack_frame;
 
     /* Find the frame we want to start from. Note that when a filter is used the filter
        function will be the first, but we also specify we want to skip the first one. */
@@ -9894,7 +9910,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     }
 
     JS_FreeValue(ctx, error_obj);
-    rt->req->in_build_stack_trace = false;
+    RT_REQ(rt)->in_build_stack_trace = false;
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -9965,8 +9981,8 @@ JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
     bool add_backtrace;
 
     /* the backtrace is added later if called from a bytecode function */
-    sf = rt->req->current_stack_frame;
-    add_backtrace = !rt->req->in_out_of_memory &&
+    sf = RT_REQ(rt)->current_stack_frame;
+    add_backtrace = !RT_REQ(rt)->in_out_of_memory &&
         (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
     return JS_ThrowError2(ctx, error_num, add_backtrace, fmt, ap);
 }
@@ -10061,10 +10077,10 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
 JSValue JS_ThrowOutOfMemory(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
-    if (!rt->req->in_out_of_memory) {
-        rt->req->in_out_of_memory = true;
+    if (!RT_REQ(rt)->in_out_of_memory) {
+        RT_REQ(rt)->in_out_of_memory = true;
         JS_ThrowInternalError(ctx, "out of memory");
-        rt->req->in_out_of_memory = false;
+        RT_REQ(rt)->in_out_of_memory = false;
     }
     return JS_EXCEPTION;
 }
@@ -10149,7 +10165,7 @@ static JSValue JS_ThrowTypeErrorInvalidClass(JSContext *ctx, int class_id)
 static void JS_ThrowInterrupted(JSContext *ctx)
 {
     JS_ThrowInternalError(ctx, "interrupted");
-    JS_SetUncatchableError(ctx, ctx->rt->req->current_exception);
+    JS_SetUncatchableError(ctx, RT_REQ(ctx->rt)->current_exception);
 }
 
 static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
@@ -10159,7 +10175,7 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
        the per-request shadow on JSRequestState, vanilla uses the base
        ctx field). */
     if (rt->is_arena)
-        rt->req->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
+        RT_REQ(rt)->interrupt_counter_req = JS_INTERRUPT_COUNTER_INIT;
     else
         ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
     if (rt->interrupt_handler) {
@@ -10178,7 +10194,7 @@ static inline __exception int js_poll_interrupts(JSContext *ctx)
        base ctx page. Vanilla path uses ctx->interrupt_counter as
        before. */
     int *counter = ctx->rt->is_arena
-        ? &ctx->rt->req->interrupt_counter_req
+        ? &RT_REQ(ctx->rt)->interrupt_counter_req
         : &ctx->interrupt_counter;
     if (unlikely(--*counter <= 0)) {
         return __js_poll_interrupts(ctx);
@@ -14012,7 +14028,7 @@ void JS_ClearUncatchableError(JSContext *ctx, JSValueConst val)
 
 void JS_ResetUncatchableError(JSContext *ctx)
 {
-    js_set_uncatchable_error(ctx, ctx->rt->req->current_exception, false);
+    js_set_uncatchable_error(ctx, RT_REQ(ctx->rt)->current_exception, false);
 }
 
 int JS_SetOpaque(JSValueConst obj, void *opaque)
@@ -18634,7 +18650,7 @@ static JSValue js_build_mapped_arguments(JSContext *ctx, int argc,
 
     props[0].u.value = js_int32(argc); /* length */
     props[1].u.value = js_dup(ctx->array_proto_values); /* Symbol.iterator */
-    props[2].u.value = js_dup(ctx->rt->req->current_stack_frame->cur_func); /* callee */
+    props[2].u.value = js_dup(RT_REQ(ctx->rt)->current_stack_frame->cur_func); /* callee */
 
     val = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->mapped_arguments_shape),
                                 JS_CLASS_MAPPED_ARGUMENTS, props);
@@ -18997,8 +19013,8 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
     int res;
 
     if (is_exception_pending) {
-        ex_obj = ctx->rt->req->current_exception;
-        ctx->rt->req->current_exception = JS_UNINITIALIZED;
+        ex_obj = RT_REQ(ctx->rt)->current_exception;
+        RT_REQ(ctx->rt)->current_exception = JS_UNINITIALIZED;
         res = -1;
     } else {
         ex_obj = JS_UNDEFINED;
@@ -19401,7 +19417,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
 /* only valid inside C functions */
 static JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
-    return ctx->rt->req->current_stack_frame->cur_func;
+    return RT_REQ(ctx->rt)->current_stack_frame->cur_func;
 }
 
 /* create a detached var ref */
@@ -19795,9 +19811,9 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     if (js_check_stack_overflow(rt, sizeof(arg_buf[0]) * arg_count))
         return JS_ThrowStackOverflow(ctx);
 
-    prev_sf = rt->req->current_stack_frame;
+    prev_sf = RT_REQ(rt)->current_stack_frame;
     sf->prev_frame = prev_sf;
-    rt->req->current_stack_frame = sf;
+    RT_REQ(rt)->current_stack_frame = sf;
     ctx = p->u.cfunc.realm; /* change the current realm */
 
     sf->is_strict_mode = false;
@@ -19901,7 +19917,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         abort();
     }
 
-    rt->req->current_stack_frame = sf->prev_frame;
+    RT_REQ(rt)->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
 
@@ -20024,8 +20040,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sp = sf->cur_sp;
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
-            sf->prev_frame = rt->req->current_stack_frame;
-            rt->req->current_stack_frame = sf;
+            sf->prev_frame = RT_REQ(rt)->current_stack_frame;
+            RT_REQ(rt)->current_stack_frame = sf;
             /* Async/generator resume re-enters JS_CallInternal without
                going through the normal frame-setup path that fires
                FUNC_ENTER below; fire it here too so events stay
@@ -20102,8 +20118,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     pc = b->byte_code_buf;
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
-    sf->prev_frame = rt->req->current_stack_frame;
-    rt->req->current_stack_frame = sf;
+    sf->prev_frame = RT_REQ(rt)->current_stack_frame;
+    RT_REQ(rt)->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -22901,13 +22917,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
-    if (needs_backtrace(rt->req->current_exception)
+    if (needs_backtrace(RT_REQ(rt)->current_exception)
     || JS_IsUndefined(js_error_back_trace_active(ctx))) {
         sf->cur_pc = pc;
-        build_backtrace(ctx, rt->req->current_exception, JS_UNDEFINED,
+        build_backtrace(ctx, RT_REQ(rt)->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
     }
-    if (!JS_IsUncatchableError(rt->req->current_exception)) {
+    if (!JS_IsUncatchableError(RT_REQ(rt)->current_exception)) {
         while (sp > stack_buf) {
             JSValue val = *--sp;
             JS_FreeValue(ctx, val);
@@ -22919,8 +22935,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
-                    *sp++ = rt->req->current_exception;
-                    rt->req->current_exception = JS_UNINITIALIZED;
+                    *sp++ = RT_REQ(rt)->current_exception;
+                    RT_REQ(rt)->current_exception = JS_UNINITIALIZED;
                     JS_FreeValueRT(rt, js_error_back_trace_take(ctx));
                     pc = b->byte_code_buf + pos;
                     goto restart;
@@ -22947,7 +22963,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, *pval);
         }
     }
-    rt->req->current_stack_frame = sf->prev_frame;
+    RT_REQ(rt)->current_stack_frame = sf->prev_frame;
     if (unlikely(arena_trace_mode_of(ctx) != ARENA_TRACE_OFF))
         arena_trace_func_exit(ctx);
     return ret_val;
@@ -23489,7 +23505,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
     func_ret = async_func_resume(ctx, &s->func_state);
     if (JS_IsException(func_ret)) {
     fail:
-        if (unlikely(JS_IsUncatchableError(ctx->rt->req->current_exception))) {
+        if (unlikely(JS_IsUncatchableError(RT_REQ(ctx->rt)->current_exception))) {
             is_success = false;
         } else {
             JSValue error = JS_GetException(ctx);
@@ -23498,7 +23514,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
             JS_FreeValue(ctx, error);
         resolved:
             if (unlikely(JS_IsException(ret2))) {
-                if (JS_IsUncatchableError(ctx->rt->req->current_exception)) {
+                if (JS_IsUncatchableError(RT_REQ(ctx->rt)->current_exception)) {
                     is_success = false;
                 } else {
                     abort(); /* BUG */
@@ -24567,7 +24583,7 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
     int err_col_num = s->token.col_num;
     if (s->token.ptr && s->token.ptr >= s->token.line_start)
         err_col_num = (int)(s->token.ptr - s->token.line_start) + 1;
-    build_backtrace(ctx, ctx->rt->req->current_exception, JS_UNDEFINED, s->filename,
+    build_backtrace(ctx, RT_REQ(ctx->rt)->current_exception, JS_UNDEFINED, s->filename,
                     s->token.line_num, err_col_num, backtrace_flags);
     return -1;
 }
@@ -29123,7 +29139,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 backtrace_flags = 0;
                 if (s->cur_func && s->cur_func->backtrace_barrier)
                     backtrace_flags = JS_BACKTRACE_FLAG_SINGLE_LEVEL;
-                build_backtrace(s->ctx, s->ctx->rt->req->current_exception, JS_UNDEFINED,
+                build_backtrace(s->ctx, RT_REQ(s->ctx->rt)->current_exception, JS_UNDEFINED,
                                 s->filename,
                                 s->token.line_num,
                                 s->token.col_num,
@@ -33746,7 +33762,7 @@ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
     /* XXX: currently we just use the filename of the englobing
        function. It does not work for eval(). Need to add a
        ScriptOrModule info in JSFunctionBytecode */
-    sf = ctx->rt->req->current_stack_frame;
+    sf = RT_REQ(ctx->rt)->current_stack_frame;
     if (!sf)
         return JS_ATOM_NULL;
     while (n_stack_levels-- > 0) {
@@ -40175,7 +40191,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     m = NULL;
     if (eval_type == JS_EVAL_TYPE_DIRECT) {
         JSObject *p;
-        sf = ctx->rt->req->current_stack_frame;
+        sf = RT_REQ(ctx->rt)->current_stack_frame;
         assert(sf != NULL);
         assert(JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT);
         p = JS_VALUE_GET_OBJ(sf->cur_func);
@@ -40280,7 +40296,7 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    if (!rt->req->current_stack_frame) {
+    if (!RT_REQ(rt)->current_stack_frame) {
         /* arena: route through the per-request shadow so we don't touch
            the base ctx field. */
         JSValue cur = js_error_back_trace_take(ctx);
@@ -51113,7 +51129,7 @@ static void js_random_init(JSContext *ctx)
 static inline uint64_t *js_random_state_active(JSContext *ctx)
 {
     if (ctx->rt->is_arena)
-        return &ctx->rt->req->random_state_req;
+        return &RT_REQ(ctx->rt)->random_state_req;
     return &ctx->random_state;
 }
 
@@ -57982,7 +57998,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     }
     is_reject = JS_IsException(res);
     if (is_reject) {
-        if (unlikely(JS_IsUncatchableError(ctx->rt->req->current_exception)))
+        if (unlikely(JS_IsUncatchableError(RT_REQ(ctx->rt)->current_exception)))
             return JS_EXCEPTION;
         res = JS_GetException(ctx);
     }
@@ -58290,8 +58306,8 @@ static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target,
     rt = ctx->rt;
     if (rt->promise_hook) {
         JSValueConst parent_promise = JS_UNDEFINED;
-        if (rt->req->parent_promise)
-            parent_promise = rt->req->parent_promise->value;
+        if (RT_REQ(rt)->parent_promise)
+            parent_promise = RT_REQ(rt)->parent_promise->value;
         rt->promise_hook(ctx, JS_PROMISE_HOOK_INIT, obj, parent_promise,
                          rt->promise_hook_opaque);
     }
@@ -58415,12 +58431,12 @@ JSValue JS_PromiseThen(JSContext *ctx, JSValueConst promise,
            it is per-request state and the rt field is in base. This is new
            upstream code (JS_PromiseThen) written against the pre-arena
            layout; it auto-merged without a conflict. */
-        link = (JSValueLink){rt->req->parent_promise, promise};
-        rt->req->parent_promise = &link;
+        link = (JSValueLink){RT_REQ(rt)->parent_promise, promise};
+        RT_REQ(rt)->parent_promise = &link;
     }
     result_promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (have_promise_hook)
-        rt->req->parent_promise = link.next;
+        RT_REQ(rt)->parent_promise = link.next;
     if (JS_IsException(result_promise))
         return result_promise;
 
@@ -58905,12 +58921,12 @@ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
     // always restore, even if js_new_promise_capability callee removes hook
     have_promise_hook = (rt->promise_hook != NULL);
     if (have_promise_hook) {
-        link = (JSValueLink){rt->req->parent_promise, this_val};
-        rt->req->parent_promise = &link;
+        link = (JSValueLink){RT_REQ(rt)->parent_promise, this_val};
+        RT_REQ(rt)->parent_promise = &link;
     }
     result_promise = js_new_promise_capability(ctx, resolving_funcs, ctor);
     if (have_promise_hook)
-        rt->req->parent_promise = link.next;
+        RT_REQ(rt)->parent_promise = link.next;
     JS_FreeValue(ctx, ctor);
     if (JS_IsException(result_promise))
         return result_promise;
@@ -60059,14 +60075,14 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
 static inline int64_t *js_date_now_pinned_active(JSContext *ctx)
 {
     if (ctx->rt->is_arena)
-        return &ctx->rt->req->date_now_pinned_req;
+        return &RT_REQ(ctx->rt)->date_now_pinned_req;
     return &ctx->date_now_pinned;
 }
 
 static inline double *js_time_origin_active(JSContext *ctx)
 {
     if (ctx->rt->is_arena)
-        return &ctx->rt->req->time_origin_req;
+        return &RT_REQ(ctx->rt)->time_origin_req;
     return &ctx->time_origin;
 }
 
@@ -67653,7 +67669,7 @@ bool JS_DetectModule(const char *input, size_t input_len)
     val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>", 1,
                             JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1);
     if (JS_IsException(val)) {
-        const char *msg = JS_ToCString(ctx, rt->req->current_exception);
+        const char *msg = JS_ToCString(ctx, RT_REQ(rt)->current_exception);
         // gruesome hack to recognize exceptions from import statements;
         // necessary because we don't pass in a module loader
         is_module = !!strstr(msg, "ReferenceError: could not load module");

@@ -1131,8 +1131,26 @@ get CHANGELOG entries):
   allocation its own extent, and checks a refused allocation latches
   OOM with the budget as limit and leaves the runtime usable.
   Bench flat; harnesses + ASan + WASM build + test262 both regimes.
-- [ ] **3. `rt->req` indirection + split `JSDualArena`.** Host-heap
-  `req_cur` slot; `JSRequestArena` as its own object; `req->arena`.
+- [x] **3. `rt->req` indirection + split `JSDualArena`.**
+  `JSRequestArena` is its own object: extents, provider, mspace/bump
+  state, OOM latch, mode. A `JSDualArena` owns one base and any number
+  of request arenas; exactly one is *selected*
+  (`js_dual_arena_select_request`) and receives allocations, while free
+  / realloc / usable_size route by the pointer's owning arena (chunk-set
+  value), so a value that crossed requests by host error is freed into
+  the right mspace rather than corrupting one. `rt->req` became
+  `RT_REQ(rt) = *rt->req_cell`: vanilla runtimes point the cell at an
+  embedded field; at freeze `js_runtime_mark_arena` points it (the one
+  base write) at the dual arena's heap `state_cell`, which
+  `select_request` and `JS_RelocateReqState` rewrite — zero base writes
+  per switch or reset, verified by the thermometer across a
+  park / run-another / resume / free sequence in `arena-smoke`. Cost:
+  one dependent load on the call path, ~2.5% on bench D (100x push +
+  reduce); A/B/C and shadow depth flat. No `req->arena` field after
+  all: the selected arena is the single source of truth and the
+  chokepoints only ever need "the arena receiving allocations".
+  Contract: a fresh request arena's slot is uninitialised until
+  `JS_RelocateReqState` runs with it selected; step 4 wraps that.
 - [ ] **4. Multi-request API.** `JS_NewRequest` / `JS_EnterRequest` /
   `JS_LeaveRequest` / `JS_FreeRequest`; `JS_ResetRequestArena` becomes
   Free+New on the head chunk so run-to-completion embedders are

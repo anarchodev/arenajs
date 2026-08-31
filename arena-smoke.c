@@ -70,7 +70,7 @@ int main(void)
     {
         void *req_p = js_malloc_rt(rt, 64);
         void *libc_p = malloc(64);
-        if (js_arena_ptr_request_owner(req_p) != da ||
+        if (js_arena_ptr_request_owner(req_p) != js_dual_arena_current_request(da) ||
             js_arena_ptr_is_request(rt) ||
             js_arena_ptr_is_request(libc_p) ||
             !js_arena_ptr_is_base(rt)) {
@@ -363,6 +363,56 @@ int main(void)
         }
         /* The runtime is still usable after a refused allocation. */
         if (eval_print(ctx, "GREET('after oom')", "post-oom")) return 1;
+    }
+
+    /* --- two request arenas on one runtime ---
+       A request parks (its arena stays allocated, its JSRequestState
+       stays in its head slot) while another runs; switching back finds
+       its globals, shadows and objects intact. Selecting an arena
+       rewrites the dual arena's heap cell, never the JSRuntime — the
+       thermometer must see zero base pages across the whole dance. */
+    {
+        JSRequestArena *ra1 = js_dual_arena_current_request(da);
+        JSRequestArena *ra2 = js_request_arena_new(da, 4 * 1024 * 1024, NULL);
+        if (!ra2) { fprintf(stderr, "js_request_arena_new failed\n"); return 1; }
+        if (js_arena_thermometer_enable() < 0) {
+            fprintf(stderr, "thermometer enable failed\n"); return 1;
+        }
+        js_arena_thermometer_reset();
+        /* request 1: fresh, leaves state behind and parks */
+        JS_ResetRequestArena(rt);
+        if (eval_print(ctx, "globalThis.who = 'one'; var keep = [1,2,3]; who",
+                       "ra1-start")) return 1;
+        /* request 2: fresh arena, fresh state — sees none of request 1 */
+        js_dual_arena_select_request(da, ra2);
+        JS_RelocateReqState(rt);
+        if (eval_print(ctx, "typeof who + '/' + typeof keep", "ra2-fresh")) return 1;
+        if (eval_print(ctx, "globalThis.who = 'two'; var big = new Array(50000).fill(1); who",
+                       "ra2-run")) return 1;
+        size_t ra2_ext = js_request_arena_extents(ra2);
+        /* back to request 1: parked state intact, request 2's invisible */
+        js_dual_arena_select_request(da, ra1);
+        if (eval_print(ctx, "who + keep.length + '/' + typeof big", "ra1-resume")) return 1;
+        /* and request 2 again, still holding its extents */
+        js_dual_arena_select_request(da, ra2);
+        if (eval_print(ctx, "who + big.length", "ra2-resume")) return 1;
+        if (js_request_arena_extents(ra2) != ra2_ext || ra2_ext < 2) {
+            fprintf(stderr, "parked arena did not keep its extents (%zu -> %zu)\n",
+                    ra2_ext, js_request_arena_extents(ra2)); return 1;
+        }
+        printf("two requests: ra1 held=%zu ra2 held=%zu extents=%zu\n",
+               js_request_arena_held(ra1), js_request_arena_held(ra2), ra2_ext);
+        /* free the parked-then-finished request 2; request 1 continues */
+        js_dual_arena_select_request(da, ra1);
+        js_request_arena_free(ra2);
+        if (eval_print(ctx, "who + keep.length", "ra1-after-free")) return 1;
+        size_t two_pages = js_arena_thermometer_pages();
+        js_arena_thermometer_disable();
+        printf("  thermometer across request switches: %zu base pages dirtied\n",
+               two_pages);
+        if (two_pages != 0) {
+            fprintf(stderr, "request switching wrote base\n"); return 1;
+        }
     }
 
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
