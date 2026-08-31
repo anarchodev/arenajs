@@ -41,6 +41,19 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.6.0] - 2026-08-31
+
+The **requests-as-objects release**. Request memory is no longer one
+fixed buffer that the next request rewinds: it is an object the host
+owns, grown in extents on demand, and a frozen runtime can hold any
+number of them while running one at a time. That is what lets an
+embedder model a held connection as a promise the request is parked on,
+instead of the next + reset loop. Four steps, each verified on the full
+arena harness set, ASan, the WASM build and the test262 walker on both
+allocator regimes; contract details below.
+
 ### Added (MINOR)
 
 **Requests as objects.** A frozen runtime can now hold any number of
