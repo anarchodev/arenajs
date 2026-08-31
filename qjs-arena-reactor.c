@@ -566,6 +566,102 @@ int arena_run_module_r(ArenaReactor *r, const char *entry_name,
     return arena_oom_override(r, drain_pending_jobs(r), "arena_run_module");
 }
 
+/* ── requests held across host operations (see the header) ── */
+
+ARENA_API
+ArenaRequest *arena_request_new_r(ArenaReactor *r, int request_kb, int mode)
+{
+    if (!r || !r->rt || !r->ctx)
+        return NULL;
+    size_t cap = (request_kb > 0 ? (size_t)request_kb : 4096) * 1024;
+    ArenaRequest *req = JS_NewRequest(r->rt, cap, NULL,
+                                      mode == 0 ? JS_ARENA_REQ_MODE_GC
+                                                : JS_ARENA_REQ_MODE_BUMP);
+    if (!req)
+        return NULL;
+    /* The sticky pins are per-request state: apply them to the new
+       request the way arena_run does after its reset, then put the
+       caller's request back. */
+    ArenaRequest *prev = JS_CurrentRequest(r->rt);
+    if (JS_EnterRequest(r->rt, req) == 0) {
+        arena_reapply_pins(r);
+        if (prev)
+            JS_EnterRequest(r->rt, prev);
+        else
+            JS_LeaveRequest(r->rt);
+    }
+    return req;
+}
+
+ARENA_API
+int arena_request_enter_r(ArenaReactor *r, ArenaRequest *req)
+{
+    if (!r || !r->rt || !req)
+        return ARENA_RC_ERROR;
+    return JS_EnterRequest(r->rt, req) == 0 ? ARENA_RC_OK : ARENA_RC_ERROR;
+}
+
+ARENA_API
+int arena_request_leave_r(ArenaReactor *r)
+{
+    if (!r || !r->rt)
+        return ARENA_RC_ERROR;
+    return JS_LeaveRequest(r->rt) == 0 ? ARENA_RC_OK : ARENA_RC_ERROR;
+}
+
+ARENA_API
+int arena_request_free_r(ArenaReactor *r, ArenaRequest *req)
+{
+    if (!r || !r->rt || !req)
+        return ARENA_RC_ERROR;
+    return JS_FreeRequest(r->rt, req) == 0 ? ARENA_RC_OK : ARENA_RC_ERROR;
+}
+
+ARENA_API
+int arena_request_eval_r(ArenaReactor *r, const char *src)
+{
+    if (!r || !r->rt || !r->ctx || !src || !JS_CurrentRequest(r->rt))
+        return ARENA_RC_ERROR;
+#ifdef ROVE_ARENA
+    rove_arena_run_begin();
+#endif
+    JSValue v = JS_Eval(r->ctx, src, strlen(src), "<arena>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(v)) {
+        JSValue exc = JS_GetException(r->ctx);
+        if (js_dual_arena_oom_hit(JS_GetDualArena(r->rt))) {
+            JS_FreeValue(r->ctx, exc);
+            JS_FreeValue(r->ctx, v);
+            return arena_oom_override(r, ARENA_RC_ERROR, "arena_request_eval");
+        }
+        diagnose_exception(r->ctx, exc, "arena_request_eval");
+        JS_FreeValue(r->ctx, exc);
+        JS_FreeValue(r->ctx, v);
+        return ARENA_RC_ERROR;
+    }
+    const char *s = JS_ToCString(r->ctx, v);
+    if (s) {
+        printf("%s\n", s);
+        JS_FreeCString(r->ctx, s);
+    }
+    JS_FreeValue(r->ctx, v);
+    return arena_oom_override(r, ARENA_RC_OK, "arena_request_eval");
+}
+
+ARENA_API
+int arena_request_pump_r(ArenaReactor *r)
+{
+    if (!r || !r->rt || !JS_CurrentRequest(r->rt))
+        return ARENA_RC_ERROR;
+    return arena_oom_override(r, drain_pending_jobs(r), "arena_request_pump");
+}
+
+ARENA_API
+size_t arena_request_held_r(ArenaReactor *r, ArenaRequest *req)
+{
+    (void)r;
+    return req ? js_request_arena_held(req) : 0;
+}
+
 ARENA_API
 void arena_set_trace_mode_r(ArenaReactor *r, int mode)
 {
@@ -692,6 +788,48 @@ ARENA_EXPORT
 int arena_run(const char *src)
 {
     return arena_run_r(g_default, src);
+}
+
+ARENA_EXPORT
+ArenaRequest *arena_request_new(int request_kb, int mode)
+{
+    return arena_request_new_r(g_default, request_kb, mode);
+}
+
+ARENA_EXPORT
+int arena_request_enter(ArenaRequest *req)
+{
+    return arena_request_enter_r(g_default, req);
+}
+
+ARENA_EXPORT
+int arena_request_leave(void)
+{
+    return arena_request_leave_r(g_default);
+}
+
+ARENA_EXPORT
+int arena_request_free(ArenaRequest *req)
+{
+    return arena_request_free_r(g_default, req);
+}
+
+ARENA_EXPORT
+int arena_request_eval(const char *src)
+{
+    return arena_request_eval_r(g_default, src);
+}
+
+ARENA_EXPORT
+int arena_request_pump(void)
+{
+    return arena_request_pump_r(g_default);
+}
+
+ARENA_EXPORT
+double arena_request_held(ArenaRequest *req)
+{
+    return (double)arena_request_held_r(g_default, req);
 }
 
 ARENA_EXPORT

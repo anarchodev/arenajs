@@ -144,6 +144,33 @@ int arena_run_r(ArenaReactor *r, const char *src);
 int arena_run_module_r(ArenaReactor *r, const char *entry_name,
                        const char *entry_src);
 
+/* ── requests held across host operations ──────────────────────────
+ * arena_run* run one request to completion over the instance's default
+ * request memory (reset, eval, done). A host that models a held
+ * connection as a promise instead creates a request, enters it, evals
+ * the handler (which returns to the host with a promise pending), and
+ * leaves; when the host operation completes it enters the request
+ * again, resolves the promise from JS, pumps the request's microtasks,
+ * and eventually frees it. Any number of requests may be held; one is
+ * entered at a time, and enter/leave happen only between JS runs.
+ * Values never cross requests. Request memory is budgeted per request
+ * (request_kb; 0 = the instance default) and grows in extents on
+ * demand — arena_request_held reports the bytes a parked request holds.
+ * `mode` is the allocator regime for the request (0 = GC, 1 = bump),
+ * bound at creation. Returns NULL / ARENA_RC_ERROR on misuse (enter or
+ * leave from inside JS, a request of another instance). */
+typedef struct JSRequestArena ArenaRequest;
+ArenaRequest *arena_request_new_r(ArenaReactor *r, int request_kb, int mode);
+int    arena_request_enter_r(ArenaReactor *r, ArenaRequest *req);
+int    arena_request_leave_r(ArenaReactor *r);
+int    arena_request_free_r(ArenaReactor *r, ArenaRequest *req);
+/* Eval `src` as a classic script in the ENTERED request — no reset, no
+   drain — printing the completion value like arena_run. ARENA_RC_*. */
+int    arena_request_eval_r(ArenaReactor *r, const char *src);
+/* Drain the entered request's microtasks until quiet. ARENA_RC_*. */
+int    arena_request_pump_r(ArenaReactor *r);
+size_t arena_request_held_r(ArenaReactor *r, ArenaRequest *req);
+
 /* Trace emitter mode for this instance (ARENA_TRACE_OFF/SCAN/DRILL,
    qjs-arena-trace.h). Takes effect immediately — hooks read the live
    value — and is sticky across runs. */
@@ -194,6 +221,13 @@ void arena_set_request_mode(int mode);
 void arena_set_random_seed(uint32_t seed_lo, uint32_t seed_hi);
 void arena_set_date_now(uint32_t lo, uint32_t hi);
 int  arena_snapshot_here(void);   /* only from inside a trace callback */
+ArenaRequest *arena_request_new(int request_kb, int mode);
+int    arena_request_enter(ArenaRequest *req);
+int    arena_request_leave(void);
+int    arena_request_free(ArenaRequest *req);
+int    arena_request_eval(const char *src);
+int    arena_request_pump(void);
+double arena_request_held(ArenaRequest *req);
 int    arena_oom_hit(void);
 double arena_oom_requested(void);
 double arena_oom_used(void);

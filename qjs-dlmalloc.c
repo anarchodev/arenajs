@@ -6,15 +6,31 @@
  *
  *   ONLY_MSPACES  — export only the mspace_* API; no malloc/free
  *                   replacements, so the system allocator is untouched.
- *   HAVE_MMAP=0 + HAVE_MORECORE=0
- *                 — the mspace can never grow beyond the buffer handed to
- *                   create_mspace_with_base; exhaustion returns NULL.
+ *   HAVE_MMAP=0 + HAVE_MORECORE=1 (MORECORE = js_arena_morecore)
+ *                 — the mspace starts over the request region's head
+ *                   extent and grows only through the arena's provider;
+ *                   a refused extent makes the allocation return NULL.
  *   USE_LOCKS=0   — arena runtimes are single-threaded by contract
  *                   (see the TLS range list in qjs-arena.h).
  */
+#include "qjs-arena.h"   /* js_arena_morecore, JS_ARENA_CHUNK_SIZE */
+
 #define ONLY_MSPACES 1
 #define HAVE_MMAP 0
-#define HAVE_MORECORE 0
+/* Growth goes through MORECORE, which the arena answers with provider
+   extents (see js_arena_morecore in qjs-arena.h). The extents are not
+   contiguous with each other, so dlmalloc takes its noncontiguous
+   sys_alloc path and chains them as segments; MORECORE(0) reports the
+   end of the extent just handed out, which is all that path needs.
+   Trimming would hand memory back mid-request, which the arena does not
+   do (everything returns at reset) — refuse it at compile time. */
+#define HAVE_MORECORE 1
+#define MORECORE js_arena_morecore
+#define MORECORE_CONTIGUOUS 0
+#define MORECORE_CANNOT_TRIM 1
+/* Ask MORECORE in chunk multiples; the arena rounds up to its extent
+   policy. dlmalloc's default here would be 64k, which merely over-asks. */
+#define DEFAULT_GRANULARITY JS_ARENA_CHUNK_SIZE
 /* HAVE_MREMAP 0 explicitly: dlmalloc otherwise takes its `#ifndef HAVE_MREMAP
    / #ifdef linux` branch, which sets HAVE_MREMAP 1 and #defines _GNU_SOURCE to
    expose mremap(). Every build here already passes -D_GNU_SOURCE, so that is a

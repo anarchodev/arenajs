@@ -244,7 +244,10 @@ of the embedder contract** (see [`CHANGELOG.md`](CHANGELOG.md)).
   under Emscripten with `ARENA_TRACE_ENABLED=1` and
   `-sALLOW_MEMORY_GROWTH=1`. Exposes `arena_init`, `arena_run_module`,
   `arena_set_trace_mode`, `arena_snapshot_here`, the `arena_oom_*`
-  query functions, and `arena_destroy`. By default the native worker
+  query functions, the `arena_request_*` lifecycle (`new` / `enter` /
+  `leave` / `free` / `eval` / `pump` / `held` — a request held across a
+  host operation, parked on a pending promise, instead of running
+  next + reset; see CHANGELOG), and `arena_destroy`. By default the native worker
   build has the trace machinery compiled out (zero overhead); it can be
   turned on for a native build too — see **Native tracing** below.
 - **Trace modes** (`arena_set_trace_mode`): `OFF` (0), `SCAN` (1) —

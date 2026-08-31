@@ -63,6 +63,25 @@ int main(void)
     JS_FreezeRuntime(rt);
     printf("frozen=%d\n", js_dual_arena_is_frozen(da));
 
+    /* Request-chunk membership: a post-freeze allocation is request
+       memory owned by this arena; the runtime struct (base) and a libc
+       pointer are not. Both must hold or js_malloc_usable_size
+       dispatches to the wrong size function. */
+    {
+        void *req_p = js_malloc_rt(rt, 64);
+        void *libc_p = malloc(64);
+        if (js_arena_ptr_request_owner(req_p) != js_dual_arena_current_request(da) ||
+            js_arena_ptr_is_request(rt) ||
+            js_arena_ptr_is_request(libc_p) ||
+            !js_arena_ptr_is_base(rt)) {
+            fprintf(stderr, "request chunk membership wrong\n"); return 1;
+        }
+        printf("chunk_tab: %u chunks registered (%zu B request)\n",
+               js_arena_chunk_count, js_dual_arena_request_used(da));
+        free(libc_p);
+        js_free_rt(rt, req_p);
+    }
+
     if (js_arena_thermometer_enable() < 0) {
         fprintf(stderr, "thermometer enable failed\n"); return 1;
     }
@@ -271,6 +290,179 @@ int main(void)
            js_dual_arena_request_mode(da) == JS_ARENA_REQ_MODE_GC ? "GC" : "BUMP");
     if (bump_used == 0) { fprintf(stderr, "bump accounting broken\n"); return 1; }
 
+    /* --- request-region growth across provider extents ---
+       The head extent is JS_ARENA_REQ_EXTENT_DEFAULT (256 KiB); a request
+       that outgrows it pulls more from the provider (through MORECORE in
+       GC mode, directly on the bump path) and reset hands them back. */
+    {
+        const char *grow =
+            "var big = []; for (let i = 0; i < 8000; i++) "
+            "big.push({ i, s: 'item-' + i }); big.length";
+        size_t head_held = js_dual_arena_request_held(da);
+        if (js_dual_arena_request_extents(da) != 1) {
+            fprintf(stderr, "expected 1 extent after reset\n"); return 1;
+        }
+        /* GC mode */
+        if (eval_print(ctx, grow, "grow-gc")) return 1;
+        size_t ext_gc = js_dual_arena_request_extents(da);
+        size_t held_gc = js_dual_arena_request_held(da);
+        printf("grow-gc: extents=%zu held=%zu live=%zu\n",
+               ext_gc, held_gc, js_dual_arena_request_used(da));
+        if (ext_gc < 2 || held_gc <= head_held) {
+            fprintf(stderr, "GC-mode request did not grow past the head\n"); return 1;
+        }
+        /* One allocation bigger than the policy extent gets its own. */
+        if (eval_print(ctx, "new ArrayBuffer(1 << 20).byteLength", "grow-big")) return 1;
+        if (js_dual_arena_request_extents(da) != ext_gc + 1 ||
+            js_dual_arena_request_held(da) < held_gc + (1 << 20)) {
+            fprintf(stderr, "oversize allocation did not get its own extent\n"); return 1;
+        }
+        JS_ResetRequestArena(rt);
+        if (js_dual_arena_request_extents(da) != 1 ||
+            js_dual_arena_request_held(da) != head_held ||
+            js_dual_arena_request_used(da) != 0) {
+            fprintf(stderr, "reset did not release extents\n"); return 1;
+        }
+        /* Bump mode */
+        js_dual_arena_set_request_mode(da, JS_ARENA_REQ_MODE_BUMP);
+        JS_ResetRequestArena(rt);
+        if (eval_print(ctx, grow, "grow-bump")) return 1;
+        printf("grow-bump: extents=%zu held=%zu cumulative=%zu\n",
+               js_dual_arena_request_extents(da), js_dual_arena_request_held(da),
+               js_dual_arena_request_used(da));
+        if (js_dual_arena_request_extents(da) < 2) {
+            fprintf(stderr, "bump-mode request did not grow past the head\n"); return 1;
+        }
+        js_dual_arena_set_request_mode(da, JS_ARENA_REQ_MODE_GC);
+        JS_ResetRequestArena(rt);
+        if (js_dual_arena_request_extents(da) != 1) {
+            fprintf(stderr, "bump reset did not release extents\n"); return 1;
+        }
+        /* Budget: request_cap (4 MiB here) bounds what a request may hold.
+           A single allocation that cannot fit is refused, throws, and
+           latches the OOM record with the budget as the limit. */
+        JSValue v = JS_Eval(ctx, "new ArrayBuffer(8 << 20)", 23, "oom",
+                            JS_EVAL_TYPE_GLOBAL);
+        if (!JS_IsException(v)) {
+            fprintf(stderr, "8 MiB allocation should exceed the 4 MiB budget\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        if (!js_dual_arena_oom_hit(da) ||
+            js_dual_arena_oom_limit(da) != 4 * 1024 * 1024 - 16 - JS_ARENA_REQUEST_SLOT_SIZE) {
+            fprintf(stderr, "OOM record wrong: hit=%d limit=%zu\n",
+                    js_dual_arena_oom_hit(da), js_dual_arena_oom_limit(da));
+            return 1;
+        }
+        printf("budget: refused %zu B at %zu live (limit %zu), extents=%zu\n",
+               js_dual_arena_oom_requested(da), js_dual_arena_oom_used(da),
+               js_dual_arena_oom_limit(da), js_dual_arena_request_extents(da));
+        JS_ResetRequestArena(rt);
+        if (js_dual_arena_oom_hit(da)) {
+            fprintf(stderr, "reset did not clear the OOM latch\n"); return 1;
+        }
+        /* The runtime is still usable after a refused allocation. */
+        if (eval_print(ctx, "GREET('after oom')", "post-oom")) return 1;
+    }
+
+    /* --- two request arenas on one runtime ---
+       A request parks (its arena stays allocated, its JSRequestState
+       stays in its head slot) while another runs; switching back finds
+       its globals, shadows and objects intact. Selecting an arena
+       rewrites the dual arena's heap cell, never the JSRuntime — the
+       thermometer must see zero base pages across the whole dance. */
+    {
+        JSRequestArena *ra1 = js_dual_arena_current_request(da);
+        JSRequestArena *ra2 = js_request_arena_new(da, 4 * 1024 * 1024, NULL);
+        if (!ra2) { fprintf(stderr, "js_request_arena_new failed\n"); return 1; }
+        if (js_arena_thermometer_enable() < 0) {
+            fprintf(stderr, "thermometer enable failed\n"); return 1;
+        }
+        js_arena_thermometer_reset();
+        /* request 1: fresh, leaves state behind and parks */
+        JS_ResetRequestArena(rt);
+        if (eval_print(ctx, "globalThis.who = 'one'; var keep = [1,2,3]; who",
+                       "ra1-start")) return 1;
+        /* request 2: fresh arena, fresh state — sees none of request 1 */
+        js_dual_arena_select_request(da, ra2);
+        JS_RelocateReqState(rt);
+        if (eval_print(ctx, "typeof who + '/' + typeof keep", "ra2-fresh")) return 1;
+        if (eval_print(ctx, "globalThis.who = 'two'; var big = new Array(50000).fill(1); who",
+                       "ra2-run")) return 1;
+        size_t ra2_ext = js_request_arena_extents(ra2);
+        /* back to request 1: parked state intact, request 2's invisible */
+        js_dual_arena_select_request(da, ra1);
+        if (eval_print(ctx, "who + keep.length + '/' + typeof big", "ra1-resume")) return 1;
+        /* and request 2 again, still holding its extents */
+        js_dual_arena_select_request(da, ra2);
+        if (eval_print(ctx, "who + big.length", "ra2-resume")) return 1;
+        if (js_request_arena_extents(ra2) != ra2_ext || ra2_ext < 2) {
+            fprintf(stderr, "parked arena did not keep its extents (%zu -> %zu)\n",
+                    ra2_ext, js_request_arena_extents(ra2)); return 1;
+        }
+        printf("two requests: ra1 held=%zu ra2 held=%zu extents=%zu\n",
+               js_request_arena_held(ra1), js_request_arena_held(ra2), ra2_ext);
+        /* free the parked-then-finished request 2; request 1 continues */
+        js_dual_arena_select_request(da, ra1);
+        js_request_arena_free(ra2);
+        if (eval_print(ctx, "who + keep.length", "ra1-after-free")) return 1;
+        size_t two_pages = js_arena_thermometer_pages();
+        js_arena_thermometer_disable();
+        printf("  thermometer across request switches: %zu base pages dirtied\n",
+               two_pages);
+        if (two_pages != 0) {
+            fprintf(stderr, "request switching wrote base\n"); return 1;
+        }
+    }
+
+    /* --- requests as objects: a connection held on a promise ---
+       Request A's handler awaits something the host will complete
+       later; it returns to the host with the promise pending and is
+       left. Request B runs to completion meanwhile. The host then
+       re-enters A, resolves the promise from JS, pumps A's microtasks,
+       and reads the result. This is the model that replaces
+       next + reset for held connections. */
+    {
+        JSRequestArena *a = JS_NewRequest(rt, 4 * 1024 * 1024, NULL, JS_ARENA_REQ_MODE_GC);
+        JSRequestArena *b = JS_NewRequest(rt, 4 * 1024 * 1024, NULL, JS_ARENA_REQ_MODE_BUMP);
+        if (!a || !b) { fprintf(stderr, "JS_NewRequest failed\n"); return 1; }
+        JSRequestArena *r0 = JS_CurrentRequest(rt);
+        if (JS_EnterRequest(rt, a) < 0) { fprintf(stderr, "enter A failed\n"); return 1; }
+        if (eval_print(ctx,
+            "var got = 'pending';"
+            "var p = new Promise(res => { globalThis.complete = res; });"
+            "p.then(v => { got = 'resolved:' + v; });"
+            "got", "A-park")) return 1;
+        if (JS_IsJobPending(rt)) { fprintf(stderr, "A should have no jobs yet\n"); return 1; }
+        if (JS_LeaveRequest(rt) < 0) { fprintf(stderr, "leave A failed\n"); return 1; }
+        if (JS_CurrentRequest(rt) != NULL) { fprintf(stderr, "leave did not deselect\n"); return 1; }
+        /* B runs to completion while A is held */
+        if (JS_EnterRequest(rt, b) < 0) { fprintf(stderr, "enter B failed\n"); return 1; }
+        if (eval_print(ctx, "typeof got + '/' + typeof complete + '/' + (new Array(20000).fill(2).length)",
+                       "B-run")) return 1;
+        if (JS_FreeRequest(rt, b) < 0) { fprintf(stderr, "free B failed\n"); return 1; }
+        if (JS_CurrentRequest(rt) != NULL) { fprintf(stderr, "free did not deselect\n"); return 1; }
+        /* the host operation completes: resume A */
+        printf("held A: %zu B across %zu extents while parked\n",
+               js_request_arena_held(a), js_request_arena_extents(a));
+        if (JS_EnterRequest(rt, a) < 0) { fprintf(stderr, "re-enter A failed\n"); return 1; }
+        if (eval_print(ctx, "complete('io-done'); got", "A-resolve")) return 1;
+        if (!JS_IsJobPending(rt)) { fprintf(stderr, "A should have a reaction job\n"); return 1; }
+        {
+            JSContext *jc = NULL;
+            int n = 0, rc;
+            while ((rc = JS_ExecutePendingJob(rt, &jc)) > 0) n++;
+            if (rc < 0) { fprintf(stderr, "A job threw\n"); return 1; }
+            printf("pumped %d job(s)\n", n);
+        }
+        if (eval_print(ctx, "got", "A-done")) return 1;
+        if (JS_FreeRequest(rt, a) < 0) { fprintf(stderr, "free A failed\n"); return 1; }
+        /* back to the runtime's own request; the reset path still works */
+        if (JS_EnterRequest(rt, r0) < 0) { fprintf(stderr, "re-enter r0 failed\n"); return 1; }
+        JS_ResetRequestArena(rt);
+        if (eval_print(ctx, "GREET('after held requests')", "r0-reset")) return 1;
+    }
+
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
        (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
        etc.) are for the refcount-based default path. In arena mode the
@@ -278,5 +470,8 @@ int main(void)
        runtime, contexts, and everything they own live in arena pages
        that vanish in one munmap. */
     js_dual_arena_free(da);
+    if (js_arena_chunk_tab != NULL || js_arena_chunk_count != 0) {
+        fprintf(stderr, "request chunk table not released\n"); return 1;
+    }
     return 0;
 }

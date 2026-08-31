@@ -41,7 +41,40 @@ safe consumer pattern spelled out.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added (MINOR)
+
+**Requests as objects.** A frozen runtime can now hold any number of
+requests and run one at a time, so a host models a held connection as
+a promise instead of next + reset: create a request, enter it, eval
+the handler (it returns with a promise pending), leave; when the host
+operation completes, enter it again, resolve from JS, pump its
+microtasks, free it. Enter and leave happen only between JS runs (at a
+job boundary — the C stack is empty there; there is no stack capture).
+Values never cross requests: only base is shared.
+
+New reactor exports (all `_r` instance forms have singleton twins):
+`arena_request_new(request_kb, mode)` -> handle (`mode` 0 = GC, 1 =
+bump, bound at creation), `arena_request_enter(h)`,
+`arena_request_leave()`, `arena_request_free(h)`,
+`arena_request_eval(src)` (in the entered request, no reset),
+`arena_request_pump()` (drain its microtasks), `arena_request_held(h)`
+(bytes a parked request holds). Return codes are the existing
+`ARENA_RC_*`; misuse (enter/leave from inside JS, a handle of another
+instance) is `ARENA_RC_ERROR`. C API: `JS_NewRequest`,
+`JS_EnterRequest`, `JS_LeaveRequest`, `JS_CurrentRequest`,
+`JS_FreeRequest` in `qjs-arena.h`.
+
+`arena_run` / `arena_run_module` are unchanged and keep running one
+request to completion over the instance's default request memory;
+`arena_set_request_mode` still governs those (it binds at their
+reset) — held requests take their mode from `arena_request_new`.
+
+Underneath (not contract, recorded for embedders sizing memory):
+request memory is no longer one fixed buffer but a 256 KiB head plus
+extents acquired on demand and returned when the request resets or is
+freed, budgeted by `request_kb` exactly as before (`arena_oom_limit`
+reports the same number). A steady-state request loop maps nothing;
+a parked request costs what `arena_request_held` reports.
 
 ## [0.5.0] - 2026-08-23
 

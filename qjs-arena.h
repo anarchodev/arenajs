@@ -10,15 +10,24 @@
  *     allocator's ceiling was cumulative allocation, this one's is peak
  *     live set).
  *
- * Each region owns a single contiguous buffer of fixed capacity, sized at
- * js_dual_arena_new() time. Allocations beyond capacity return NULL (which
- * propagates as JS OOM); neither buffer ever grows.
+ * The base region is a single contiguous buffer of fixed capacity, sized
+ * at js_dual_arena_new() time; it never grows.
+ *
+ * The request region is a list of chunk-aligned extents pulled from a
+ * provider on demand (see JSArenaChunkProvider). A head extent, acquired
+ * at creation, holds the fixed per-request state slot and is never
+ * released; further extents are acquired as the request grows — by
+ * dlmalloc through MORECORE in GC mode, by the bump path when its
+ * current extent fills — and handed back at reset. A total byte budget
+ * (`request_cap`) bounds what a request may hold; a refused acquisition
+ * returns NULL (which propagates as JS OOM) and latches the OOM record.
  *
  * The active region is selected by a mode flag flipped via
- * js_dual_arena_freeze(), which also creates the mspace over the request
- * buffer. Reset stays O(1): stomp a fresh mspace header over the same
- * (dirty) buffer — all allocator state lives inside it, so every prior
- * allocation is forgotten in constant time and pages stay resident.
+ * js_dual_arena_freeze(), which also creates the mspace over the head
+ * extent. Reset releases the non-head extents and stomps a fresh mspace
+ * header over the head — every prior allocation is forgotten, and the
+ * default provider caches released extents so a steady-state request
+ * loop makes no system calls.
  */
 #ifndef QUICKJS_ARENA_H
 #define QUICKJS_ARENA_H
@@ -34,21 +43,110 @@ extern "C" {
 #endif
 
 typedef struct JSDualArena JSDualArena;
+/* One request's memory: its extents, allocator state, OOM record and
+ * mode. A JSDualArena owns one base region and any number of these;
+ * exactly one (or none) is *selected* at a time and receives new
+ * allocations. Frees and reallocs route to the arena that owns the
+ * pointer regardless of selection. The fixed JSRequestState slot lives
+ * in each request arena's head extent, so selecting a request arena is
+ * also what puts its state in front of the runtime (see
+ * js_dual_arena_state_cell). */
+typedef struct JSRequestArena JSRequestArena;
 
-/* Fixed capacities for the two arenas. Pass 0 for a 16 MiB default. */
+/* Source of request-region extents. `acquire` returns a block of
+ * exactly `size` bytes (a multiple of JS_ARENA_CHUNK_SIZE) aligned to
+ * JS_ARENA_CHUNK_SIZE, or NULL to refuse — refusal is the host's
+ * capacity policy and surfaces as a JS OOM plus the oom_* record.
+ * `release` takes back a block previously returned by `acquire`, with
+ * the same `size`. Both are called on the runtime's thread, synchronously
+ * from inside an allocation (acquire) or from reset / teardown
+ * (release). A provider that hands out cached blocks must not zero
+ * them; the arena treats every byte past its own bookkeeping as dirty. */
+typedef struct JSArenaChunkProvider {
+    void *(*acquire)(void *opaque, size_t size);
+    void  (*release)(void *opaque, void *block, size_t size);
+    void  *opaque;
+} JSArenaChunkProvider;
+
+/* Extent size the arena asks the provider for when it needs more than
+ * it holds, unless a single allocation needs more (then that, rounded
+ * up to a chunk). The head extent is this size too, capped at
+ * request_cap. */
+#define JS_ARENA_REQ_EXTENT_DEFAULT ((size_t)256 << 10)
+
+/* base_size: fixed base capacity. request_cap: the most request memory
+ * a single request may hold across all its extents (the pre-chunking
+ * `request_size`; oom_limit reports it). Pass 0 for a 16 MiB default in
+ * either; SIZE_MAX for an unbounded request budget (the provider is
+ * then the only limit). `prov` NULL selects the built-in provider:
+ * page-mapped extents with a per-dual-arena cache of released ones.
+ * Creates and selects one request arena with that budget/provider —
+ * the single-request embedding needs nothing more. */
+JS_EXTERN JSDualArena *js_dual_arena_new2(size_t base_size,
+                                          size_t request_cap,
+                                          const JSArenaChunkProvider *prov);
+/* js_dual_arena_new2(base_size, request_cap, NULL). */
 JS_EXTERN JSDualArena *js_dual_arena_new(size_t base_size,
-                                         size_t request_size);
+                                         size_t request_cap);
+/* Frees every request arena still owned, then the base. */
 JS_EXTERN void js_dual_arena_free(JSDualArena *da);
 
+/* ----- request arenas -----
+ *
+ * A request arena may be created before or after freeze; one created
+ * after freeze is immediately usable once selected. Freeing the
+ * selected arena deselects it (no allocation may happen until another
+ * is selected). Values never cross request arenas: only base memory is
+ * shared, so a pointer allocated under one request arena must not be
+ * reachable from JS run under another — that is the host's contract,
+ * exactly as it was between consecutive resets. A fresh arena's state
+ * slot is uninitialised until JS_RelocateReqState runs on it. */
+JS_EXTERN JSRequestArena *js_request_arena_new(JSDualArena *da,
+                                               size_t request_cap,
+                                               const JSArenaChunkProvider *prov);
+JS_EXTERN void js_request_arena_free(JSRequestArena *ra);
+JS_EXTERN JSDualArena *js_request_arena_dual(const JSRequestArena *ra);
+/* Make `ra` (NULL = none) the arena that receives allocations and
+ * whose state slot the runtime reads. Zero base writes. */
+JS_EXTERN void js_dual_arena_select_request(JSDualArena *da,
+                                            JSRequestArena *ra);
+JS_EXTERN JSRequestArena *js_dual_arena_current_request(const JSDualArena *da);
+/* Heap cell (never base, never request memory) holding the selected
+ * request's JSRequestState*. The runtime points its req_cell here at
+ * freeze — one base write, ever — and every later request switch
+ * rewrites this cell instead of the hardened JSRuntime. */
+JS_EXTERN void **js_dual_arena_state_cell(JSDualArena *da);
+JS_EXTERN void *js_request_arena_slot(JSRequestArena *ra);
+/* Per-request-arena forms of the js_dual_arena_* request calls below
+ * (which act on the selected arena). */
+JS_EXTERN void   js_request_arena_reset(JSRequestArena *ra);
+JS_EXTERN bool   js_request_arena_contains(const JSRequestArena *ra,
+                                           const void *ptr);
+JS_EXTERN size_t js_request_arena_used(const JSRequestArena *ra);
+JS_EXTERN size_t js_request_arena_held(const JSRequestArena *ra);
+JS_EXTERN size_t js_request_arena_extents(const JSRequestArena *ra);
+JS_EXTERN bool   js_request_arena_oom_hit(const JSRequestArena *ra);
+JS_EXTERN size_t js_request_arena_oom_requested(const JSRequestArena *ra);
+JS_EXTERN size_t js_request_arena_oom_used(const JSRequestArena *ra);
+JS_EXTERN size_t js_request_arena_oom_limit(const JSRequestArena *ra);
+
 JS_EXTERN void js_dual_arena_freeze(JSDualArena *da);
+/* Reset the SELECTED request arena. */
 JS_EXTERN void js_dual_arena_reset_request(JSDualArena *da);
 JS_EXTERN bool js_dual_arena_is_frozen(const JSDualArena *da);
 
 JS_EXTERN bool js_dual_arena_in_base(const JSDualArena *da, const void *ptr);
+/* True if `ptr` belongs to ANY request arena of `da`. */
 JS_EXTERN bool js_dual_arena_in_request(const JSDualArena *da, const void *ptr);
 
 JS_EXTERN size_t js_dual_arena_base_used(const JSDualArena *da);
+/* GC mode: live bytes. Bump mode: cumulative bytes allocated this request. */
 JS_EXTERN size_t js_dual_arena_request_used(const JSDualArena *da);
+/* Bytes of provider extents the request region currently holds (head
+ * included); what a parked request costs. Counts against request_cap. */
+JS_EXTERN size_t js_dual_arena_request_held(const JSDualArena *da);
+/* Number of extents currently held (>= 1 once created). */
+JS_EXTERN size_t js_dual_arena_request_extents(const JSDualArena *da);
 
 /* Request-arena exhaustion record. The bump allocator is the only
  * component that knows for certain we hit the ceiling — by the time
@@ -119,35 +217,84 @@ static inline bool js_arena_ptr_is_base(const void *p)
 JS_EXTERN int  js_arena_register_base(const uint8_t *lo, const uint8_t *hi);
 JS_EXTERN void js_arena_unregister_base(const uint8_t *lo, const uint8_t *hi);
 
-/* Same registry pattern for request-region ranges. Needed because
- * js_malloc_usable_size receives only the pointer — no opaque — and
- * must dispatch between mspace chunks (mspace_usable_size) and
- * bump-header allocations. Each entry carries a pointer to its arena's
- * CURRENT request mode: with per-reset allocator selection, whether a
- * request-range pointer is an mspace chunk or a bump allocation is a
- * property of the arena's mode this request — and every live request
- * pointer matches the current mode, because a reset (the only moment
- * the mode can change) kills all request allocations wholesale. */
-struct js_arena_req_range {
-    const uint8_t *lo, *hi;
-    const uint8_t *mode;   /* -> JSDualArena.req_mode (JSArenaReqMode) */
+/* Request-region membership: a per-thread hash set of chunk indices.
+ *
+ * Needed because js_malloc_usable_size receives only the pointer — no
+ * opaque — and must dispatch between mspace chunks (mspace_usable_size)
+ * and bump-header allocations; the owning arena's CURRENT request mode
+ * decides, and every live request pointer matches it because a reset
+ * (the only moment the mode can change) kills all request allocations
+ * wholesale.
+ *
+ * Unlike the base list above this is NOT a bounded range table: request
+ * memory is registered one JS_ARENA_CHUNK_SIZE chunk at a time, keyed on
+ * (addr >> JS_ARENA_CHUNK_SHIFT), so a request region can be any number
+ * of non-contiguous chunks and membership stays O(1) regardless of how
+ * many are registered. Request buffers are chunk-aligned and chunk-sized
+ * (arena_init rounds them) so the set is exact — no foreign heap pointer
+ * shares a chunk with request memory. Storage is libc-malloc'd, sized to
+ * keep the load factor <= 1/2; it lives outside base and outside any
+ * request region. Registering is O(chunks) and happens at freeze;
+ * lookups are a multiply, a mask and a probe. */
+#define JS_ARENA_CHUNK_SHIFT 12
+#define JS_ARENA_CHUNK_SIZE  ((size_t)1 << JS_ARENA_CHUNK_SHIFT)
+struct js_arena_chunk {
+    uintptr_t      key;    /* chunk index + 1; 0 = empty slot */
+    JSRequestArena *owner;
 };
-extern __thread struct js_arena_req_range js_arena_req_ranges[JS_ARENA_RANGES_MAX];
-extern __thread int                       js_arena_req_range_count;
+extern JS_EXTERN __thread struct js_arena_chunk *js_arena_chunk_tab;
+extern JS_EXTERN __thread uint32_t               js_arena_chunk_mask;  /* size - 1; 0 = no table */
+extern JS_EXTERN __thread uint32_t               js_arena_chunk_count;
+
+static inline uint32_t js_arena_chunk_hash(uintptr_t key, uint32_t mask)
+{
+    uint64_t v = (uint64_t)key * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(v >> 32) & mask;
+}
+
+/* Owning request arena of a pointer, or NULL for anything else (base,
+ * pre-freeze, vanilla heap). */
+static inline JSRequestArena *js_arena_ptr_request_owner(const void *p)
+{
+    struct js_arena_chunk *tab = js_arena_chunk_tab;
+    if (!tab)
+        return NULL;
+    uintptr_t key = ((uintptr_t)p >> JS_ARENA_CHUNK_SHIFT) + 1;
+    uint32_t mask = js_arena_chunk_mask;
+    uint32_t i = js_arena_chunk_hash(key, mask);
+    for (;;) {
+        uintptr_t k = tab[i].key;
+        if (k == 0)
+            return NULL;
+        if (k == key)
+            return tab[i].owner;
+        i = (i + 1) & mask;
+    }
+}
 
 static inline bool js_arena_ptr_is_request(const void *p)
 {
-    const uint8_t *b = (const uint8_t *)p;
-    for (int i = 0; i < js_arena_req_range_count; i++) {
-        if (b >= js_arena_req_ranges[i].lo && b < js_arena_req_ranges[i].hi)
-            return true;
-    }
-    return false;
+    return js_arena_ptr_request_owner(p) != NULL;
 }
 
+/* Register every chunk of [lo, hi) — both chunk-aligned — as owned by
+ * `owner`. Returns 0, or -1 if the table could not grow (malloc failure);
+ * on -1 nothing was registered. Unregister drops every chunk owned by
+ * `owner` and frees the table when it empties. */
 JS_EXTERN int  js_arena_register_request(const uint8_t *lo, const uint8_t *hi,
-                                         const uint8_t *mode);
-JS_EXTERN void js_arena_unregister_request(const uint8_t *lo, const uint8_t *hi);
+                                         JSRequestArena *owner);
+/* Drop the chunks of [lo, hi) — an extent going back to the provider.
+ * O(chunks in the range); the table is freed when it empties. */
+JS_EXTERN void js_arena_unregister_request_range(const uint8_t *lo,
+                                                 const uint8_t *hi);
+JS_EXTERN void js_arena_unregister_request(JSRequestArena *owner);
+
+/* dlmalloc's MORECORE for the request mspace (qjs-dlmalloc.c wires it
+ * in). sbrk protocol: n > 0 acquires an extent of at least n bytes from
+ * the request arena currently allocating and returns its start; n == 0 returns
+ * the end of the extent most recently handed out; n < 0 (trim) is
+ * refused. Returns (void *)-1 on refusal, as dlmalloc expects. */
+JS_EXTERN void *js_arena_morecore(ptrdiff_t n);
 
 /* Fixed per-request state slot. The first JS_ARENA_REQUEST_SLOT_SIZE
  * bytes of the request region (after the 16-byte cursor prefix) are
@@ -226,8 +373,37 @@ JS_EXTERN int JS_ScanSnapshotHazards(JSRuntime *rt, void *out_FILE);
    throw TypeError ("ArrayBuffer is immutable"); copy explicitly
    (new Uint8Array(BASE_TA)) to get a mutable per-request one. */
 JS_EXTERN int JS_MarkAllBaseArrayBuffersImmutable(JSRuntime *rt);
+/* Reset the CURRENT request (no-op if none is entered), then re-init its
+ * state: the run-to-completion path. */
 JS_EXTERN void JS_ResetRequestArena(JSRuntime *rt);
 JS_EXTERN JSDualArena *JS_GetDualArena(JSRuntime *rt);
+
+/* ----- requests as objects -----
+ *
+ * A frozen runtime runs one request at a time but may hold any number:
+ * a request that returned to the host with work pending (a promise
+ * awaiting a host operation, jobs not yet drained) keeps its memory
+ * and its state until the host enters it again. Enter and leave only
+ * ever happen at a job boundary — with no JS frame live — which is
+ * where the C stack is empty; JS_EnterRequest / JS_LeaveRequest refuse
+ * (-1) if called from inside JS. Values never cross requests: only
+ * base is shared. With no request entered the runtime reads the
+ * pristine template state and accepts no allocation.
+ *
+ * JS_NewRequest creates a request arena with the given budget /
+ * provider (see js_dual_arena_new2) and allocator mode, and initialises
+ * its state; the entered request, if any, is left entered. The request
+ * created by JS_NewRuntimeArena is entered at freeze, so a
+ * single-request embedder never sees this API. */
+JS_EXTERN JSRequestArena *JS_NewRequest(JSRuntime *rt, size_t request_cap,
+                                        const JSArenaChunkProvider *prov,
+                                        JSArenaReqMode mode);
+JS_EXTERN int  JS_EnterRequest(JSRuntime *rt, JSRequestArena *req);
+JS_EXTERN int  JS_LeaveRequest(JSRuntime *rt);
+JS_EXTERN JSRequestArena *JS_CurrentRequest(JSRuntime *rt);
+/* Frees the request's memory. Leaves it first if it is entered; refuses
+ * (-1) from inside JS. */
+JS_EXTERN int  JS_FreeRequest(JSRuntime *rt, JSRequestArena *req);
 
 /* Internal: marks a runtime as arena-backed. Set by JS_NewRuntimeArena;
    defined in quickjs.c so it can reach the JSRuntime struct. */
