@@ -290,6 +290,81 @@ int main(void)
            js_dual_arena_request_mode(da) == JS_ARENA_REQ_MODE_GC ? "GC" : "BUMP");
     if (bump_used == 0) { fprintf(stderr, "bump accounting broken\n"); return 1; }
 
+    /* --- request-region growth across provider extents ---
+       The head extent is JS_ARENA_REQ_EXTENT_DEFAULT (256 KiB); a request
+       that outgrows it pulls more from the provider (through MORECORE in
+       GC mode, directly on the bump path) and reset hands them back. */
+    {
+        const char *grow =
+            "var big = []; for (let i = 0; i < 8000; i++) "
+            "big.push({ i, s: 'item-' + i }); big.length";
+        size_t head_held = js_dual_arena_request_held(da);
+        if (js_dual_arena_request_extents(da) != 1) {
+            fprintf(stderr, "expected 1 extent after reset\n"); return 1;
+        }
+        /* GC mode */
+        if (eval_print(ctx, grow, "grow-gc")) return 1;
+        size_t ext_gc = js_dual_arena_request_extents(da);
+        size_t held_gc = js_dual_arena_request_held(da);
+        printf("grow-gc: extents=%zu held=%zu live=%zu\n",
+               ext_gc, held_gc, js_dual_arena_request_used(da));
+        if (ext_gc < 2 || held_gc <= head_held) {
+            fprintf(stderr, "GC-mode request did not grow past the head\n"); return 1;
+        }
+        /* One allocation bigger than the policy extent gets its own. */
+        if (eval_print(ctx, "new ArrayBuffer(1 << 20).byteLength", "grow-big")) return 1;
+        if (js_dual_arena_request_extents(da) != ext_gc + 1 ||
+            js_dual_arena_request_held(da) < held_gc + (1 << 20)) {
+            fprintf(stderr, "oversize allocation did not get its own extent\n"); return 1;
+        }
+        JS_ResetRequestArena(rt);
+        if (js_dual_arena_request_extents(da) != 1 ||
+            js_dual_arena_request_held(da) != head_held ||
+            js_dual_arena_request_used(da) != 0) {
+            fprintf(stderr, "reset did not release extents\n"); return 1;
+        }
+        /* Bump mode */
+        js_dual_arena_set_request_mode(da, JS_ARENA_REQ_MODE_BUMP);
+        JS_ResetRequestArena(rt);
+        if (eval_print(ctx, grow, "grow-bump")) return 1;
+        printf("grow-bump: extents=%zu held=%zu cumulative=%zu\n",
+               js_dual_arena_request_extents(da), js_dual_arena_request_held(da),
+               js_dual_arena_request_used(da));
+        if (js_dual_arena_request_extents(da) < 2) {
+            fprintf(stderr, "bump-mode request did not grow past the head\n"); return 1;
+        }
+        js_dual_arena_set_request_mode(da, JS_ARENA_REQ_MODE_GC);
+        JS_ResetRequestArena(rt);
+        if (js_dual_arena_request_extents(da) != 1) {
+            fprintf(stderr, "bump reset did not release extents\n"); return 1;
+        }
+        /* Budget: request_cap (4 MiB here) bounds what a request may hold.
+           A single allocation that cannot fit is refused, throws, and
+           latches the OOM record with the budget as the limit. */
+        JSValue v = JS_Eval(ctx, "new ArrayBuffer(8 << 20)", 23, "oom",
+                            JS_EVAL_TYPE_GLOBAL);
+        if (!JS_IsException(v)) {
+            fprintf(stderr, "8 MiB allocation should exceed the 4 MiB budget\n");
+            return 1;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        if (!js_dual_arena_oom_hit(da) ||
+            js_dual_arena_oom_limit(da) != 4 * 1024 * 1024 - 16 - JS_ARENA_REQUEST_SLOT_SIZE) {
+            fprintf(stderr, "OOM record wrong: hit=%d limit=%zu\n",
+                    js_dual_arena_oom_hit(da), js_dual_arena_oom_limit(da));
+            return 1;
+        }
+        printf("budget: refused %zu B at %zu live (limit %zu), extents=%zu\n",
+               js_dual_arena_oom_requested(da), js_dual_arena_oom_used(da),
+               js_dual_arena_oom_limit(da), js_dual_arena_request_extents(da));
+        JS_ResetRequestArena(rt);
+        if (js_dual_arena_oom_hit(da)) {
+            fprintf(stderr, "reset did not clear the OOM latch\n"); return 1;
+        }
+        /* The runtime is still usable after a refused allocation. */
+        if (eval_print(ctx, "GREET('after oom')", "post-oom")) return 1;
+    }
+
     /* arena: skip JS_FreeContext / JS_FreeRuntime entirely. Their walks
        (assert(list_empty(&rt->gc_obj_list)), per-atom JS_FreeAtomStruct,
        etc.) are for the refcount-based default path. In arena mode the

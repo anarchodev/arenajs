@@ -1114,12 +1114,23 @@ get CHANGELOG entries):
   path was 16-byte aligned) so the set is exact. `arena-smoke` asserts
   request/base/libc pointers classify correctly and that the table is
   released with the last arena.
-- [ ] **2. Chunked request arena behind the existing single-request
-  API.** Provider callback (`js_dual_arena_new` gains a provider; NULL =
-  today's fixed buffer as a one-extent provider). Bump mode over a chunk
-  list; GC mode via `MORECORE`. Reset returns all but the head chunk.
-  OOM latch records the provider's refusal. Soak: 46k corpus, both
-  regimes, ASan + hardened base.
+- [x] **2. Chunked request arena behind the existing single-request
+  API.** `js_dual_arena_new2(base, request_cap, provider)`;
+  `js_dual_arena_new` = built-in provider (page-mapped extents, per-arena
+  first-fit cache of released ones). The request region is a list of
+  `JSReqChunk` extents: a 256 KiB head (holds the state slot, never
+  released) plus extents acquired on demand — dlmalloc via
+  `HAVE_MORECORE=1` / `MORECORE=js_arena_morecore` (sbrk protocol, the
+  allocating arena parked in a TLS for the call; `MORECORE_CANNOT_TRIM`),
+  the bump path directly when its extent fills. Reset releases all but
+  the head — O(extents), measured 74→78 ns on the empty-request bench.
+  `request_cap` is the budget across extents (was `request_size`;
+  `oom_limit` reports it unchanged; `SIZE_MAX` = provider is the only
+  limit). New observers: `js_dual_arena_request_held` / `_extents`.
+  `arena-smoke` grows past the head in both regimes, gives an oversize
+  allocation its own extent, and checks a refused allocation latches
+  OOM with the budget as limit and leaves the runtime usable.
+  Bench flat; harnesses + ASan + WASM build + test262 both regimes.
 - [ ] **3. `rt->req` indirection + split `JSDualArena`.** Host-heap
   `req_cur` slot; `JSRequestArena` as its own object; `req->arena`.
 - [ ] **4. Multi-request API.** `JS_NewRequest` / `JS_EnterRequest` /
